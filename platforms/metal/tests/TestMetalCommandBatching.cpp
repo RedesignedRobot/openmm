@@ -61,7 +61,9 @@ public:
 static QueuePlatform platform;
 
 double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
-    const int gridSize = 10;
+    // NonbondedForce only uses a neighbor list for more than 3000 particles.
+
+    const int gridSize = 15;
     const double spacing = 0.4;
     System system;
     double boxSize = gridSize*spacing;
@@ -97,15 +99,16 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
 }
 
 void testCommitsPerStep() {
-    // Without a neighbor list, the forces are submitted once per step.  With one, the neighbor
-    // list and the nonbonded kernel are each submitted before the host waits for the interaction
-    // count, which adds two more.
+    // Without a neighbor list, each step is submitted once.  With one, the neighbor list is
+    // submitted with the event the host waits on for the interaction count, and the nonbonded
+    // kernel is submitted before that wait.  The rest of the step goes with the next step's
+    // neighbor list.
 
     double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
     double pme = measureCommitsPerStep(NonbondedForce::PME);
     cout << "Commits per step: NoCutoff " << noCutoff << ", PME " << pme << endl;
     ASSERT(noCutoff <= 1.1);
-    ASSERT(pme <= 3.1);
+    ASSERT(pme <= 2.1);
 }
 
 int main(int argc, char* argv[]) {
