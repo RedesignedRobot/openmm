@@ -154,6 +154,11 @@ DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
     } while(check != old);
 
     #endif
+#elif defined(__METAL_VERSION__)
+
+    // Metal only supports single precision, which has atomic floating-point addition
+    ATOMIC_ADD(target, value);
+
 #else
     #error "Internal error: atomicAddMixed is missing an implementation for this platform"
 #endif
