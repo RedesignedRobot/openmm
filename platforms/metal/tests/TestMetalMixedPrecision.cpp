@@ -231,22 +231,22 @@ void testVariableStep() {
 }
 
 /**
- * Constants in custom expressions that a float cannot hold exactly must keep double-float precision.
+ * Constants in per-DOF expressions that a float cannot hold exactly, and global variables they read, must
+ * keep double-float precision.  (ComputeGlobal steps are evaluated on the host in double, so they don't
+ * test the kernels.)
  */
 void testExpressionConstants() {
     System system;
     system.addParticle(1.0);
     CustomIntegrator integrator(0.001);
     integrator.addGlobalVariable("g", 1.3);
-    integrator.addComputeGlobal("g", "0.1*g+0.7");
-    integrator.addComputePerDof("v", "0.1*v+0.3");
+    integrator.addComputePerDof("v", "0.1*v+g");
     Context context(system, integrator, platform);
     context.setPositions({Vec3()});
     Vec3 velocity(1.1, -0.9, 0.35);
     context.setVelocities({velocity});
     integrator.step(1);
-    ASSERT_EQUAL_TOL(0.1*1.3+0.7, integrator.getGlobalVariable(0), 1e-12);
-    ASSERT_EQUAL_VEC(velocity*0.1+Vec3(0.3, 0.3, 0.3), context.getState(State::Velocities).getVelocities()[0], 1e-12);
+    ASSERT_EQUAL_VEC(velocity*0.1+Vec3(1.3, 1.3, 1.3), context.getState(State::Velocities).getVelocities()[0], 1e-12);
 }
 
 int main(int argc, char* argv[]) {
