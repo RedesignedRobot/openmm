@@ -55,17 +55,9 @@ public:
     static bool isPlatformSupported();
     const std::string& getPropertyValue(const Context& context, const std::string& property) const;
     void setPropertyValue(Context& context, const std::string& property, const std::string& value) const;
-    std::vector<std::map<std::string, std::string> > getDevices(const std::map<std::string, std::string>& filters={}) const;
     void contextCreated(ContextImpl& context, const std::map<std::string, std::string>& properties) const;
     void linkedContextCreated(ContextImpl& context, ContextImpl& originalContext) const;
     void contextDestroyed(ContextImpl& context) const;
-    /**
-     * This is the name of the parameter for selecting which Metal device to use.
-     */
-    static const std::string& MetalDeviceIndex() {
-        static const std::string key = "DeviceIndex";
-        return key;
-    }
     /**
      * This is the name of the parameter that reports the Metal device being used.
      */

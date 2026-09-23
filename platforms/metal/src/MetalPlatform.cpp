@@ -103,13 +103,11 @@ MetalPlatform::MetalPlatform() {
     registerKernelFactory(ApplyMonteCarloBarostatKernel::Name(), factory);
     registerKernelFactory(RemoveCMMotionKernel::Name(), factory);
     registerKernelFactory(CalcATMForceKernel::Name(), factory);
-    platformProperties.push_back(MetalDeviceIndex());
     platformProperties.push_back(MetalDeviceName());
     platformProperties.push_back(MetalPrecision());
     platformProperties.push_back(MetalUseCpuPme());
     platformProperties.push_back(MetalTempDirectory());
     platformProperties.push_back(MetalDeterministicForces());
-    setPropertyDefaultValue(MetalDeviceIndex(), "");
     setPropertyDefaultValue(MetalDeviceName(), "");
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
@@ -154,24 +152,7 @@ const string& MetalPlatform::getPropertyValue(const Context& context, const stri
 void MetalPlatform::setPropertyValue(Context& context, const string& property, const string& value) const {
 }
 
-vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>& filters) const {
-    vector<map<string, string> > results;
-    MTL::Device* device = MTL::CreateSystemDefaultDevice();
-    if (device == NULL)
-        return results;
-    string name = getDeviceName(device);
-    device->release();
-    if (filters.find(MetalDeviceIndex()) != filters.end() && filters.at(MetalDeviceIndex()) != "0")
-        return results;
-    if (filters.find(MetalDeviceName()) != filters.end() && filters.at(MetalDeviceName()) != name)
-        return results;
-    results.push_back({{MetalDeviceIndex(), "0"}, {MetalDeviceName(), name}});
-    return results;
-}
-
 void MetalPlatform::contextCreated(ContextImpl& context, const map<string, string>& properties) const {
-    const string& devicePropValue = (properties.find(MetalDeviceIndex()) == properties.end() ?
-            getPropertyDefaultValue(MetalDeviceIndex()) : properties.find(MetalDeviceIndex())->second);
     string precisionPropValue = (properties.find(MetalPrecision()) == properties.end() ?
             getPropertyDefaultValue(MetalPrecision()) : properties.find(MetalPrecision())->second);
     string cpuPmePropValue = (properties.find(MetalUseCpuPme()) == properties.end() ?
@@ -180,8 +161,6 @@ void MetalPlatform::contextCreated(ContextImpl& context, const map<string, strin
             getPropertyDefaultValue(MetalTempDirectory()) : properties.find(MetalTempDirectory())->second);
     string deterministicForcesValue = (properties.find(MetalDeterministicForces()) == properties.end() ?
             getPropertyDefaultValue(MetalDeterministicForces()) : properties.find(MetalDeterministicForces())->second);
-    if (devicePropValue != "" && devicePropValue != "0")
-        throw OpenMMException("Illegal value for DeviceIndex: "+devicePropValue);
     transform(precisionPropValue.begin(), precisionPropValue.end(), precisionPropValue.begin(), ::tolower);
     transform(cpuPmePropValue.begin(), cpuPmePropValue.end(), cpuPmePropValue.begin(), ::tolower);
     transform(deterministicForcesValue.begin(), deterministicForcesValue.end(), deterministicForcesValue.begin(), ::tolower);
@@ -222,7 +201,6 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
     contexts.push_back(new MetalContext(system, precisionProperty, tempProperty, *this, originalMetalContext));
     useCpuPme = (cpuPmeProperty == "true");
     deterministicForces = (deterministicForcesProperty == "true");
-    propertyValues[MetalPlatform::MetalDeviceIndex()] = "0";
     propertyValues[MetalPlatform::MetalDeviceName()] = getDeviceName(contexts[0]->getDevice());
     propertyValues[MetalPlatform::MetalPrecision()] = precisionProperty;
     propertyValues[MetalPlatform::MetalUseCpuPme()] = useCpuPme ? "true" : "false";

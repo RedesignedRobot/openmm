@@ -181,9 +181,7 @@ void testMultipleDevices() {
     map<string, string> props;
     try {
         string deviceIndex = platform.getPropertyValue(context, "DeviceIndex");
-        // A Metal context always uses a single device.
-        if (platform.getName() != "Metal")
-            props["DeviceIndex"] = deviceIndex+","+deviceIndex;
+        props["DeviceIndex"] = deviceIndex+","+deviceIndex;
     }
     catch (OpenMMException& ex) {
         // This platform doesn't have a DeviceIndex property.
