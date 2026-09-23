@@ -96,7 +96,9 @@ void MetalArray::copyTo(ArrayInterface& dest) const {
         throw OpenMMException("Error copying array "+name+" to "+dest.getName()+": The destination array does not match the size of the array");
     if (size == 0)
         return;
-    MTL::CommandBuffer* commandBuffer = context->getCurrentMetalQueue().getCommandBuffer();
+    MetalQueue& queue = context->getCurrentMetalQueue();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    MTL::CommandBuffer* commandBuffer = queue.getCommandBuffer();
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
     blit->copyFromBuffer(buffer, 0, context->unwrap(dest).getBuffer(), 0, size*elementSize);

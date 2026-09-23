@@ -27,6 +27,7 @@
  * -------------------------------------------------------------------------- */
 #include "openmm/common/ComputeQueue.h"
 #include <deque>
+#include <mutex>
 
 namespace MTL {
     class CommandBuffer;
@@ -42,6 +43,10 @@ namespace OpenMM {
  * are encoded into a single open command buffer, which is only committed when the host needs
  * to observe the results (a download, an event, or an explicit flush).  The compute encoder
  * uses serial dispatch, so every kernel sees the writes of the kernels encoded before it.
+ *
+ * Common code uploads arrays from its worker thread while the main thread encodes kernels, and
+ * an upload commits the open command buffer.  Anyone encoding a command must therefore hold the
+ * lock from getting the encoder or command buffer until the command is encoded.
  */
 
 class MetalQueue : public ComputeQueueImpl {
@@ -52,12 +57,19 @@ public:
         return queue;
     }
     /**
-     * Get the compute encoder of the open command buffer, creating both if necessary.
+     * Get the lock that serializes encoding and submission.
+     */
+    std::recursive_mutex& getLock() {
+        return lock;
+    }
+    /**
+     * Get the compute encoder of the open command buffer, creating both if necessary.  The
+     * caller must hold the lock.
      */
     MTL::ComputeCommandEncoder* getEncoder();
     /**
      * Get the open command buffer with no encoder active, so a different kind of command
-     * can be encoded into it.
+     * can be encoded into it.  The caller must hold the lock.
      */
     MTL::CommandBuffer* getCommandBuffer();
     /**
@@ -83,6 +95,7 @@ private:
     MTL::ComputeCommandEncoder* encoder;
     std::deque<MTL::CommandBuffer*> pending;
     long long commitCount;
+    std::recursive_mutex lock;
 };
 
 } // namespace OpenMM

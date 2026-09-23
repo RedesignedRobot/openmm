@@ -78,6 +78,7 @@ void MetalQueue::endEncoding() {
 }
 
 void MetalQueue::commit() {
+    lock_guard<recursive_mutex> guard(lock);
     if (openBuffer == NULL)
         return;
     endEncoding();
@@ -89,6 +90,7 @@ void MetalQueue::commit() {
 }
 
 void MetalQueue::finish() {
+    lock_guard<recursive_mutex> guard(lock);
     commit();
     for (MTL::CommandBuffer* buffer : pending)
         buffer->waitUntilCompleted();

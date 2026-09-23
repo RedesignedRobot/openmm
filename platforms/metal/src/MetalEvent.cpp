@@ -44,6 +44,7 @@ MetalEvent::~MetalEvent() {
 
 void MetalEvent::enqueue() {
     MetalQueue& queue = context.getCurrentMetalQueue();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     queue.getCommandBuffer()->encodeSignalEvent(event, ++value);
     queue.commit();
 }
@@ -53,5 +54,7 @@ void MetalEvent::wait() {
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
-    dynamic_cast<MetalQueue*>(queue.get())->getCommandBuffer()->encodeWait(event, value);
+    MetalQueue& metalQueue = dynamic_cast<MetalQueue&>(*queue);
+    std::lock_guard<std::recursive_mutex> guard(metalQueue.getLock());
+    metalQueue.getCommandBuffer()->encodeWait(event, value);
 }

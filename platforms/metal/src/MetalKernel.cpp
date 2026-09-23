@@ -62,7 +62,9 @@ void MetalKernel::execute(int threads, int blockSize) {
     int gridSize = min((threads+blockSize-1)/blockSize, context.getNumThreadBlocks());
     if (gridSize <= 0)
         return;
-    MTL::ComputeCommandEncoder* encoder = context.getCurrentMetalQueue().getEncoder();
+    MetalQueue& queue = context.getCurrentMetalQueue();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    MTL::ComputeCommandEncoder* encoder = queue.getEncoder();
     encoder->setComputePipelineState(pipeline);
     for (int i = 0; i < args.size(); i++) {
         if (args[i].array != NULL)

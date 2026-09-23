@@ -86,8 +86,10 @@ void MetalFFT3D::execFFT(ArrayInterface& in, ArrayInterface& out, bool forward) 
     }
     // VkFFT's Metal backend encodes only through commandEncoder, so the FFT is batched into the
     // open command buffer like any other kernel.
+    MetalQueue& queue = context.getCurrentMetalQueue();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     VkFFTLaunchParams params = {};
-    params.commandEncoder = context.getCurrentMetalQueue().getEncoder();
+    params.commandEncoder = queue.getEncoder();
     params.inputBuffer = &state->inputBuffer;
     params.buffer = &state->buffer;
     VkFFTResult result = VkFFTAppend(&state->app, forward ? -1 : 1, &params);
