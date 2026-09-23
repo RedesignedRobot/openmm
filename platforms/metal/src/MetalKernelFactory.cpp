@@ -52,12 +52,8 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
         return new CommonApplyConstraintsKernel(name, platform, mc);
     if (name == VirtualSitesKernel::Name())
         return new CommonVirtualSitesKernel(name, platform, mc);
-    if (name == MinimizeKernel::Name()) {
-        // In mixed precision the minimizer needs 64 bit floating point atomics, which Apple GPUs lack.
-        if (mc.getUseMixedPrecision())
-            throw OpenMMException("Energy minimization is not supported in mixed precision on the Metal platform.  Use single precision to minimize.");
+    if (name == MinimizeKernel::Name())
         return new CommonMinimizeKernel(name, platform, mc);
-    }
     if (name == CalcHarmonicBondForceKernel::Name())
         return new CommonCalcHarmonicBondForceKernel(name, platform, mc, context.getSystem());
     if (name == CalcCustomBondForceKernel::Name())

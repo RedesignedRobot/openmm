@@ -23,8 +23,3 @@ ENDFOREACH(TEST_PROG ${TEST_PROGS})
 # must fail with the error for that instead of running in single precision.
 SET_TESTS_PROPERTIES(TestMetalQTBIntegratorMixed PROPERTIES PASS_REGULAR_EXPRESSION
     "exception: Error compiling program: cos is called on a mixed precision value, which Metal can only evaluate in single precision")
-
-# Energy minimization needs 64 bit floating point atomics in mixed precision, which Apple GPUs lack, so
-# it must fail with the error for that.
-SET_TESTS_PROPERTIES(TestMetalLocalEnergyMinimizerMixed PROPERTIES PASS_REGULAR_EXPRESSION
-    "exception: Energy minimization is not supported in mixed precision on the Metal platform")
