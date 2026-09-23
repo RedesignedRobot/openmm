@@ -63,7 +63,7 @@ void verifySorting(vector<float> array, bool uniform) {
 
     System system;
     system.addParticle(0.0);
-    MetalPlatform::PlatformData platformData(NULL, system, "single", "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), "false", 1, NULL);
+    MetalPlatform::PlatformData platformData(NULL, system, "single", "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), 1, NULL);
     MetalContext& context = *platformData.contexts[0];
     context.initialize();
     MetalArray data(context, array.size(), sizeof(float), "sortData");

@@ -53,7 +53,7 @@ void testGaussian() {
     System system;
     for (int i = 0; i < numAtoms; i++)
         system.addParticle(1.0);
-    MetalPlatform::PlatformData platformData(NULL, system, "single", "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), "false", 1, NULL);
+    MetalPlatform::PlatformData platformData(NULL, system, "single", "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), 1, NULL);
     MetalContext& context = *platformData.contexts[0];
     context.initialize();
     context.getIntegrationUtilities().initRandomNumberGenerator(0);

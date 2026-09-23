@@ -86,25 +86,18 @@ public:
         static const std::string key = "TempDirectory";
         return key;
     }
-    /**
-     * This is the name of the parameter for requesting that force computations be fully deterministic.
-     */
-    static const std::string& MetalDeterministicForces() {
-        static const std::string key = "DeterministicForces";
-        return key;
-    }
 };
 
 class OPENMM_EXPORT_COMMON MetalPlatform::PlatformData {
 public:
     PlatformData(ContextImpl* context, const System& system, const std::string& precisionProperty, const std::string& cpuPmeProperty,
-            const std::string& tempProperty, const std::string& deterministicForcesProperty, int numThreads, ContextImpl* originalContext);
+            const std::string& tempProperty, int numThreads, ContextImpl* originalContext);
     ~PlatformData();
     void initializeContexts(const System& system);
     ContextImpl* context;
     std::vector<MetalContext*> contexts;
     std::vector<double> contextEnergy;
-    bool hasInitializedContexts, useCpuPme, deterministicForces;
+    bool hasInitializedContexts, useCpuPme;
     std::map<std::string, std::string> propertyValues;
     ThreadPool threads;
 };
