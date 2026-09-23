@@ -43,6 +43,7 @@
 #include "openmm/System.h"
 #include "openmm/VerletIntegrator.h"
 #include "sfmt/SFMT.h"
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -112,7 +113,8 @@ KERNEL void evaluate(GLOBAL mixed* values) {
 
 /**
  * In mixed precision, a function with no df64 version must fail to compile on a mixed value, not run in
- * single precision.  In single precision, the same program compiles.
+ * single precision, and the error must name the function and the line that calls it.  In single
+ * precision, the same program compiles.
  */
 void testUnsupportedFunctions(const string& precision) {
     System system;
@@ -120,12 +122,15 @@ void testUnsupportedFunctions(const string& precision) {
     MetalPlatform::PlatformData platformData(NULL, system, precision, "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), 1, NULL);
     MetalContext& context = *platformData.contexts[0];
     for (string call : {"SIN(x)", "COS(x)", "TAN(x)", "ASIN(x)", "ACOS(x)", "ATAN(x)", "atan2(x, x)", "sinh(x)", "cosh(x)", "tanh(x)", "ERF(x)", "ERFC(x)", "POW(x, x)"}) {
+        string function = call.substr(0, call.find('('));
+        transform(function.begin(), function.end(), function.begin(), ::tolower);
         bool threwException = false;
         try {
             context.compileProgram("KERNEL void evaluate(GLOBAL mixed* values) {\nmixed x = values[0];\nvalues[1] = "+call+";\n}\n");
         }
         catch (const OpenMMException& ex) {
-            ASSERT(string(ex.what()).find("Metal can only evaluate in single precision") != string::npos);
+            string message = ex.what();
+            ASSERT(message.find(function+" is called on a mixed precision value, which Metal can only evaluate in single precision, in: values[1] = "+call+";") != string::npos);
             threwException = true;
         }
         ASSERT_EQUAL(context.getUseMixedPrecision(), threwException);

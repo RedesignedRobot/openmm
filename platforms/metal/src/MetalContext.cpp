@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <regex>
 #include <sstream>
 
 using namespace OpenMM;
@@ -485,8 +486,15 @@ MTL::Library* MetalContext::createLibrary(const string& source, const map<string
     pool->release();
     if (library == NULL && log.find("no 'buffer' resource location available") != string::npos)
         throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
-    if (library == NULL && useMixedPrecision && log.find("call to deleted function") != string::npos)
-        throw OpenMMException("Error compiling program: a function is called on a mixed precision value that Metal can only evaluate in single precision.  "+log);
+    smatch deletedCall;
+    if (library == NULL && useMixedPrecision && regex_search(log, deletedCall, regex("program_source:(\\d+):\\d+: error: call to deleted function '(\\w+)'"))) {
+        stringstream lines(src.str());
+        string line;
+        for (int i = 0; i < stoi(deletedCall[1]); i++)
+            getline(lines, line);
+        line.erase(0, line.find_first_not_of(" \t"));
+        throw OpenMMException("Error compiling program: "+deletedCall[2].str()+" is called on a mixed precision value, which Metal can only evaluate in single precision, in: "+line+"\n"+log);
+    }
     if (library == NULL)
         throw OpenMMException("Error compiling program: "+log);
     return library;

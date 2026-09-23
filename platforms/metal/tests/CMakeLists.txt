@@ -18,3 +18,8 @@ FOREACH(TEST_PROG ${TEST_PROGS})
     ADD_TEST(${TEST_ROOT}Mixed ${EXECUTABLE_OUTPUT_PATH}/${TEST_ROOT} mixed)
 
 ENDFOREACH(TEST_PROG ${TEST_PROGS})
+
+# QTBIntegrator calls cos on mixed values, which Metal has no df64 version of, so in mixed precision it
+# must fail with the error for that instead of running in single precision.
+SET_TESTS_PROPERTIES(TestMetalQTBIntegratorMixed PROPERTIES PASS_REGULAR_EXPRESSION
+    "exception: Error compiling program: cos is called on a mixed precision value, which Metal can only evaluate in single precision")
