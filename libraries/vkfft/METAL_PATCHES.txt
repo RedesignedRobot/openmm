@@ -1,0 +1,12 @@
+include/vkFFT.h is VkFFT 1.2.33 with fixes to its Metal backend (VKFFT_BACKEND 5), which the
+Metal platform uses.  They belong upstream (https://github.com/DTolm/VkFFT).
+
+- NS::Error pointers passed to newLibrary() and newComputePipelineState() are initialized to
+  NULL, and are checked for NULL before their descriptions are printed.
+- MTL::CompileOptions objects are initialized with init(), not only allocated.
+- A shader compile has failed when newLibrary() returns no library.  A non-null error alone
+  does not mean failure, since compiler warnings set it too.
+- Objects that metal-cpp returns autoreleased (command buffers and encoders from
+  commandBuffer() and computeCommandEncoder()/blitCommandEncoder(), and strings from
+  NS::String::string()) are no longer released, which over-released them and crashed when the
+  autorelease pool drained.
