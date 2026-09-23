@@ -169,6 +169,12 @@ public:
      */
     ComputeProgram compileProgram(const std::string source, const std::map<std::string, std::string>& defines=std::map<std::string, std::string>());
     /**
+     * Convert a number to a string in a format suitable for including in a kernel.  Metal has no double
+     * precision literals, so when a double precision constant is requested in mixed precision mode and a
+     * float cannot hold the value exactly, this writes it as a df64: the sum of two floats.
+     */
+    std::string doubleToString(double value, bool mixedIsDouble=false) const;
+    /**
      * Convert an array to a MetalArray.  If the argument is already a MetalArray, this simply casts it.
      * If the argument is a ComputeArray that wraps a MetalArray, this returns the wrapped array.  For any
      * other argument, this throws an exception.

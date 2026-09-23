@@ -560,6 +560,13 @@ ComputeProgram MetalContext::compileProgram(const std::string source, const std:
     return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, createLibrary(source, defines)));
 }
 
+string MetalContext::doubleToString(double value, bool mixedIsDouble) const {
+    float hi = (float) value;
+    if (!useMixedPrecision || !mixedIsDouble || hi == value || !isfinite(hi))
+        return ComputeContext::doubleToString(value, mixedIsDouble);
+    return "df64("+ComputeContext::doubleToString(hi)+", "+ComputeContext::doubleToString((float) (value-hi))+")";
+}
+
 MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
     MetalArray* metalArray;
     ComputeArray* wrapper = dynamic_cast<ComputeArray*>(&array);
