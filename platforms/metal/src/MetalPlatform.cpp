@@ -45,7 +45,8 @@ extern "C" void registerMetalPlatform() {
 }
 #else
 extern "C" OPENMM_EXPORT_COMMON void registerPlatforms() {
-    Platform::registerPlatform(new MetalPlatform());
+    if (MetalPlatform::isPlatformSupported())
+        Platform::registerPlatform(new MetalPlatform());
 }
 #endif
 
@@ -120,6 +121,21 @@ MetalPlatform::MetalPlatform() {
 
 double MetalPlatform::getSpeed() const {
     return 100;
+}
+
+bool MetalPlatform::isPlatformSupported() {
+    // Compiling kernels needs macOS 15 (MTLCompileOptions.mathMode), and the kernels assume the
+    // 32 wide SIMD groups of Apple GPUs.
+
+    if (__builtin_available(macOS 15.0, *)) {
+        MTL::Device* device = MTL::CreateSystemDefaultDevice();
+        if (device == NULL)
+            return false;
+        bool supported = device->supportsFamily(MTL::GPUFamilyApple7);
+        device->release();
+        return supported;
+    }
+    return false;
 }
 
 bool MetalPlatform::supportsDoublePrecision() const {

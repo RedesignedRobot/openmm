@@ -236,6 +236,8 @@ MetalContext::MetalContext(const System& system, const string& precision, const 
     useDoublePrecision = false;
     useMixedPrecision = (precision == "mixed");
     contextIndex = platformData.contexts.size();
+    if (!MetalPlatform::isPlatformSupported())
+        throw OpenMMException("The Metal platform requires macOS 15 or later and an Apple GPU of family Apple7 (M1) or later");
     if (originalContext == NULL) {
         device = MTL::CreateSystemDefaultDevice();
         if (device == NULL)
@@ -504,6 +506,10 @@ MTL::ComputePipelineState* MetalContext::createPipeline(MTL::Library* library, c
     pool->release();
     if (pipeline == NULL)
         throw OpenMMException("Error creating kernel "+name+": "+log);
+    if (pipeline->threadExecutionWidth() != getSIMDWidth()) {
+        pipeline->release();
+        throw OpenMMException("Error creating kernel "+name+": the kernels require a SIMD width of "+intToString(getSIMDWidth()));
+    }
     return pipeline;
 }
 

@@ -48,6 +48,11 @@ public:
     }
     double getSpeed() const;
     bool supportsDoublePrecision() const;
+    /**
+     * Get whether this computer has what the platform needs: macOS 15 or later, and an Apple GPU
+     * of family Apple7 (M1) or later.
+     */
+    static bool isPlatformSupported();
     const std::string& getPropertyValue(const Context& context, const std::string& property) const;
     void setPropertyValue(Context& context, const std::string& property, const std::string& value) const;
     std::vector<std::map<std::string, std::string> > getDevices(const std::map<std::string, std::string>& filters={}) const;
