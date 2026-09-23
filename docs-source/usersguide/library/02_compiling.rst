@@ -56,12 +56,13 @@ changing, may contain bugs, and should never be used for production work.  If
 you want a stable, well tested version of OpenMM, you should download the source
 code for the latest release as described above.
 
-CUDA, OpenCL, or HIP Support
-----------------------------
+CUDA, OpenCL, HIP, or Metal Support
+-----------------------------------
 
 If you want to compile OpenMM with support for running on GPUs, you will need
-CUDA, HIP, or OpenCL.  MacOS comes with OpenCL built in, so nothing else needs to
-be installed.  For Linux, you need an appropriate SDK.
+CUDA, HIP, Metal, or OpenCL.  MacOS comes with OpenCL and Metal built in, so
+nothing else needs to be installed.  On a Mac with Apple silicon, the Metal
+platform is built by default.  For Linux, you need an appropriate SDK.
 
 The most recent CUDA Toolkit can be obtained from https://developer.nvidia.com/cuda-downloads.
 It includes the headers and libraries needed to compile both CUDA and OpenCL

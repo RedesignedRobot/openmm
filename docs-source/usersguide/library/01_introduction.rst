@@ -46,8 +46,8 @@ license.  This is a very permissive license which allows them to be used in
 almost any way, requiring only that you retain the copyright notice and
 disclaimer when distributing them.
 
-The CUDA, HIP, and OpenCL platforms are distributed under the GNU Lesser General
-Public License (LGPL).  This also allows you to use, modify, and distribute them
+The CUDA, HIP, Metal, and OpenCL platforms are distributed under the GNU Lesser
+General Public License (LGPL).  This also allows you to use, modify, and distribute them
 in any way you want, but it requires you to also distribute the source code for
 your modifications.  This restriction applies only to modifications to OpenMM
 itself; you need not distribute the source code to applications that use it.
@@ -336,6 +336,9 @@ performs calculations on ROCm-compatible AMD GPUs.
 **OpenCLPlatform**\ : This platform is implemented using the OpenCL language,
 and performs calculations on a variety of types of GPUs and CPUs.
 
+**MetalPlatform**\ : This platform is implemented using the Metal language, and
+performs calculations on the GPUs of Macs with Apple silicon.
+
 The choice of which platform to use for a simulation depends on various factors:
 
 #. The Reference platform is much slower than the others, and therefore is
@@ -348,6 +351,7 @@ The choice of which platform to use for a simulation depends on various factors:
    OpenCL platform running on the CPU.
 #. The CUDA platform can be used with NVIDIA GPUs.  For using an AMD GPU,
    use the HIP platform (or the OpenCL platform which is usually slower).  For
-   using an Intel or Apple GPU, use the OpenCL platform.
+   using the GPU of a Mac with Apple silicon, use the Metal platform.  For using
+   an Intel GPU or an older Mac, use the OpenCL platform.
 #. The AMOEBA force field works with all platforms, but the performance
    of the Reference and CPU platforms is usually too slow to be useful.
