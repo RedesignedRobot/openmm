@@ -8,8 +8,8 @@
  * See https://openmm.org/development.                                        *
  *                                                                            *
  * Portions copyright (c) 2009-2025 Stanford University and the Authors.      *
- * Portions copyright (c) 2026 the Authors.                                   *
- * Authors: Peter Eastman                                                     *
+ * Portions copyright (c) 2020-2023 Advanced Micro Devices, Inc.              *
+ * Authors: Peter Eastman, Nicholas Curtis                                    *
  * Contributors:                                                              *
  *                                                                            *
  * This program is free software: you can redistribute it and/or modify       *
@@ -28,22 +28,21 @@
 
 #include "openmm/System.h"
 #include "MetalArray.h"
-#include "openmm/common/ComputeEvent.h"
-#include "openmm/common/ComputeKernel.h"
+#include "MetalExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
+#include "openmm/common/ComputeEvent.h"
 #include "openmm/common/NonbondedUtilities.h"
-#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace OpenMM {
-    
+
 class MetalContext;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
- * ways.  First, it can be used to create Kernels that evaluate nonbonded interactions.  Clients
+ * ways.  First, it can be used to create kernels that evaluate nonbonded interactions.  Clients
  * only need to provide the code for evaluating a single interaction and the list of parameters it depends on.
  * A complete kernel is then synthesized using an appropriate algorithm to evaluate all interactions on all
  * atoms.
@@ -66,21 +65,21 @@ class MetalContext;
  * by ForceImpls during calcForcesAndEnergy().
  */
 
-class OPENMM_EXPORT_COMMON MetalNonbondedUtilities : public NonbondedUtilities {
+class OPENMM_EXPORT_COMMON MetalNonbondedUtilities : public NonbondedUtilities  {
 public:
     MetalNonbondedUtilities(MetalContext& context);
     ~MetalNonbondedUtilities();
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *
-     * @param usesCutoff     specifies whether a cutoff should be applied to this interaction
-     * @param usesPeriodic   specifies whether periodic boundary conditions should be applied to this interaction
-     * @param usesExclusions specifies whether this interaction uses exclusions.  If this is true, it must have identical exclusions to every other interaction.
-     * @param cutoffDistance the cutoff distance for this interaction (ignored if usesCutoff is false)
-     * @param exclusionList  for each atom, specifies the list of other atoms whose interactions should be excluded
-     * @param kernel         the code to evaluate the interaction
-     * @param forceGroup     the force group in which the interaction should be calculated
-     * @param useNeighborList  specifies whether a neighbor list should be used to optimize this interaction.  This should
+     * @param usesCutoff       specifies whether a cutoff should be applied to this interaction
+     * @param usesPeriodic     specifies whether periodic boundary conditions should be applied to this interaction
+     * @param usesExclusions   specifies whether this interaction uses exclusions.  If this is true, it must have identical exclusions to every other interaction.
+     * @param cutoffDistance   the cutoff distance for this interaction (ignored if usesCutoff is false)
+     * @param exclusionList    for each atom, specifies the list of other atoms whose interactions should be excluded
+     * @param kernel           the code to evaluate the interaction
+     * @param forceGroup       the force group in which the interaction should be calculated
+     * @param usesNeighborList specifies whether a neighbor list should be used to optimize this interaction.  This should
      *                         be viewed as only a suggestion.  Even when it is false, a neighbor list may be used anyway.
      * @param supportsPairList specifies whether this interaction can work with a neighbor list that uses a separate pair list
      */
@@ -98,7 +97,7 @@ public:
     /**
      * Register that the interaction kernel will be computing the derivative of the potential energy
      * with respect to a parameter.
-     * 
+     *
      * @param param   the name of the parameter
      * @return the variable that will be used to accumulate the derivative.  Any code you pass to addInteraction() should
      * add its contributions to this variable.
@@ -106,7 +105,7 @@ public:
     std::string addEnergyParameterDerivative(const std::string& param);
     /**
      * Specify the list of exclusions that an interaction outside the default kernel will depend on.
-     * 
+     *
      * @param exclusionList  for each atom, specifies the list of other atoms whose interactions should be excluded
      */
     void requestExclusions(const std::vector<std::vector<int> >& exclusionList);
@@ -118,7 +117,7 @@ public:
      * Get the number of force buffers required for nonbonded forces.
      */
     int getNumForceBuffers() const {
-        return 1;
+        return 0;
     }
     /**
      * Get the number of energy buffers required for nonbonded forces.
@@ -155,12 +154,6 @@ public:
      */
     double getMaxCutoffDistance();
     /**
-     * Get whether any interactions have been added.
-     */
-    bool getHasInteractions() {
-        return (groupCutoff.size() > 0);
-    }
-    /**
      * Given a nonbonded cutoff, get the padded cutoff distance used in computing
      * the neighbor list.
      */
@@ -171,7 +164,7 @@ public:
     void prepareInteractions(int forceGroups);
     /**
      * Compute the nonbonded interactions.
-     * 
+     *
      * @param forceGroups    the flags specifying which force groups to include
      * @param includeForces  whether to compute forces
      * @param includeEnergy  whether to compute the potential energy
@@ -212,6 +205,12 @@ public:
      */
     MetalArray& getInteractingAtoms() {
         return interactingAtoms;
+    }
+    /**
+     * Get the array containing single pairs in the neighbor list.
+     */
+    MetalArray& getSinglePairs() {
+        return singlePairs;
     }
     /**
      * Get the array containing exclusion flags.
@@ -272,7 +271,7 @@ public:
      * Create a Kernel for evaluating a nonbonded interaction.  Cutoffs and periodic boundary conditions
      * are assumed to be the same as those for the default interaction Kernel, since this kernel will use
      * the same neighbor list.
-     * 
+     *
      * @param source        the source code for evaluating the force and energy
      * @param params        the per-atom parameters this kernel may depend on
      * @param arguments     arrays (other than per-atom parameters) that should be passed as arguments to the kernel
@@ -282,20 +281,22 @@ public:
      * @param includeForces whether this kernel should compute forces
      * @param includeEnergy whether this kernel should compute potential energy
      */
-    ComputeKernel createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy);
+    metalFunction_t createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy);
     /**
      * Create the set of kernels that will be needed for a particular combination of force groups.
-     * 
+     *
      * @param groups    the set of force groups
      */
     void createKernelsForGroups(int groups);
     /**
-     * Set the source code for the main kernel.  It only needs to be changed in very unusual circumstances.
+     * Set the source code for the main kernel.  This defaults to the content of nonbonded.metal.  It only needs to be
+     * changed in very unusual circumstances.
      */
     void setKernelSource(const std::string& source);
 private:
     class KernelSet;
     class BlockSortTrait;
+    void initParamArgs();
     MetalContext& context;
     std::map<int, KernelSet> groupKernels;
     MetalArray exclusionTiles;
@@ -305,6 +306,8 @@ private:
     MetalArray interactingTiles;
     MetalArray interactingAtoms;
     MetalArray interactionCount;
+    MetalArray singlePairs;
+    MetalArray singlePairCount;
     MetalArray blockCenter;
     MetalArray blockBoundingBox;
     MetalArray sortedBlocks;
@@ -317,6 +320,9 @@ private:
     MetalArray rebuildNeighborList;
     ComputeSort blockSorter;
     ComputeEvent downloadCountEvent;
+    MTL::Buffer* pinnedCountDeviceMemory;
+    unsigned int* pinnedCountBuffer;
+    std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
     std::vector<ComputeParameterInfo> arguments;
@@ -324,10 +330,10 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
-    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, useLargeBlocks;
-    int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks;
-    int forceThreadBlockSize, interactingBlocksThreadBlockSize, groupFlags, numBlockSizes;
-    unsigned int tilesAfterReorder;
+    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
+    int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
+    int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
+    unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;
     std::string kernelSource;
 };
@@ -340,11 +346,12 @@ class MetalNonbondedUtilities::KernelSet {
 public:
     bool hasForces;
     std::string source;
-    ComputeKernel forceKernel, energyKernel, forceEnergyKernel;
-    ComputeKernel findBlockBoundsKernel;
-    ComputeKernel computeSortKeysKernel;
-    ComputeKernel sortBoxDataKernel;
-    ComputeKernel findInteractingBlocksKernel;
+    metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
+    metalFunction_t findBlockBoundsKernel;
+    metalFunction_t computeSortKeysKernel;
+    metalFunction_t sortBoxDataKernel;
+    metalFunction_t findInteractingBlocksKernel;
+    metalFunction_t copyInteractionCountsKernel;
 };
 
 } // namespace OpenMM

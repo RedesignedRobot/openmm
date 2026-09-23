@@ -540,7 +540,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     if (!defines.empty())
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
-    src << rewriteKernelSignatures(replaceWord(source, "thread", "_mmThread")) << endl;
+    // MSL has no long long.  Its long is 64 bits.
+    src << rewriteKernelSignatures(replaceWord(replaceWord(source, "thread", "_mmThread"), "long long", "long")) << endl;
 
     // Select names for the various temporary files.
 

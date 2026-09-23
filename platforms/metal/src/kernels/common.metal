@@ -17,6 +17,10 @@ uint3 gridDim [[threadgroups_per_grid]];
 #define __launch_bounds__(x)
 #define __clz clz
 #define __popc popcount
+#define __ffs(x) ((x) == 0 ? 0 : ctz(x)+1)
+#define __float_as_uint(x) as_type<uint>(x)
+#define __half half
+#define __half2float(x) float(x)
 
 #define KERNEL extern "C" __global__
 #define DEVICE __device__
@@ -68,6 +72,24 @@ inline unsigned long atomicAdd(device unsigned long* dest, unsigned long value) 
     if (upper != 0)
         atomic_fetch_add_explicit(&word[1], upper, memory_order_relaxed);
     return 0;
+}
+
+/**
+ * MSL has no float atomic min or max.  Non-negative floats order like their bit patterns as
+ * unsigned ints, and the kernels only use these on non-negative values.
+ */
+inline float atomicMin(device float* dest, float value) {
+    return as_type<float>(atomic_fetch_min_explicit((device atomic_uint*) dest, as_type<uint>(value), memory_order_relaxed));
+}
+
+inline float atomicMax(device float* dest, float value) {
+    return as_type<float>(atomic_fetch_max_explicit((device atomic_uint*) dest, as_type<uint>(value), memory_order_relaxed));
+}
+
+// MSL rounds float to half to nearest, so round up by hand.
+inline half __float2half_ru(float x) {
+    half h = half(x);
+    return (float(h) < x ? nextafter(h, half(INFINITY)) : h);
 }
 
 // MSL constructs vectors with constructors, not make_ functions.
