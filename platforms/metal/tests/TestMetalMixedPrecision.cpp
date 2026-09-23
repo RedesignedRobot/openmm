@@ -41,6 +41,7 @@
 #include "openmm/CustomIntegrator.h"
 #include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/System.h"
+#include "openmm/VariableVerletIntegrator.h"
 #include "openmm/VerletIntegrator.h"
 #include "sfmt/SFMT.h"
 #include <algorithm>
@@ -138,16 +139,12 @@ void testUnsupportedFunctions(const string& precision) {
 }
 
 /**
- * Take one step with Verlet and LangevinMiddle (at zero temperature, so without noise) and compare the
- * result to the exact step computed in double on the host.  The forces are constant and exactly
- * representable in fixed point, so all of the difference comes from the integration arithmetic, which
- * in mixed precision is about 1e-15 and in single precision about 1e-7.
+ * Create free particles with constant forces that are exactly representable in fixed point, so that a step
+ * computed exactly in double on the host differs from the platform's only by the integration arithmetic,
+ * which in mixed precision is about 1e-15 and in single precision about 1e-7.
  */
-void testIntegrationStep() {
+void createFreeParticles(System& system, vector<Vec3>& positions, vector<Vec3>& velocities, vector<Vec3>& forces) {
     const int numParticles = 20;
-    const double dt = 0.002;
-    const double friction = 1.0;
-    System system;
     CustomExternalForce* force = new CustomExternalForce("-fx*x-fy*y-fz*z");
     force->addPerParticleParameter("fx");
     force->addPerParticleParameter("fy");
@@ -155,7 +152,6 @@ void testIntegrationStep() {
     system.addForce(force);
     OpenMM_SFMT::SFMT sfmt;
     init_gen_rand(0, sfmt);
-    vector<Vec3> positions, velocities, forces;
     for (int i = 0; i < numParticles; i++) {
         system.addParticle(1.0+0.37*i);
         forces.push_back(Vec3((i%5)-2.25, 0.5*(i%3)-0.75, 1.5-0.125*i));
@@ -163,6 +159,19 @@ void testIntegrationStep() {
         positions.push_back(Vec3(genrand_real2(sfmt), genrand_real2(sfmt), genrand_real2(sfmt))*2);
         velocities.push_back(Vec3(genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5)*4);
     }
+}
+
+/**
+ * Take one step with Verlet and LangevinMiddle (at zero temperature, so without noise) and compare the
+ * result to the exact step computed in double on the host.
+ */
+void testIntegrationStep() {
+    const double dt = 0.002;
+    const double friction = 1.0;
+    System system;
+    vector<Vec3> positions, velocities, forces;
+    createFreeParticles(system, positions, velocities, forces);
+    const int numParticles = system.getNumParticles();
     VerletIntegrator verlet(dt);
     LangevinMiddleIntegrator langevin(0.0, friction, dt);
     for (Integrator* integrator : {(Integrator*) &verlet, (Integrator*) &langevin}) {
@@ -187,6 +196,37 @@ void testIntegrationStep() {
 
         if (integrator == &langevin)
             ASSERT_EQUAL_TOL(ke, state.getKineticEnergy(), 1e-12);
+    }
+}
+
+/**
+ * VariableVerletIntegrator chooses its step size by applying SQRT to mixed values.  Take one step and
+ * compare the step size and the result to the exact values computed in double on the host.  On the
+ * first step, the velocity advances by half the new step size.
+ */
+void testVariableStep() {
+    const double errorTol = 1e-6;
+    System system;
+    vector<Vec3> positions, velocities, forces;
+    createFreeParticles(system, positions, velocities, forces);
+    const int numParticles = system.getNumParticles();
+    VariableVerletIntegrator integrator(errorTol);
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    context.setVelocities(velocities);
+    integrator.step(1);
+    State state = context.getState(State::Positions | State::Velocities);
+    double error = 0.0;
+    for (int i = 0; i < numParticles; i++) {
+        Vec3 acceleration = forces[i]/system.getParticleMass(i);
+        error += acceleration.dot(acceleration);
+    }
+    double dt = sqrt(errorTol/sqrt(error/(3*numParticles)));
+    ASSERT_EQUAL_TOL(1.0, integrator.getStepSize()/dt, 1e-12);
+    for (int i = 0; i < numParticles; i++) {
+        Vec3 velocity = velocities[i]+forces[i]*(0.5*dt/system.getParticleMass(i));
+        ASSERT_EQUAL_VEC(positions[i]+velocity*dt, state.getPositions()[i], 1e-12);
+        ASSERT_EQUAL_VEC(velocity, state.getVelocities()[i], 1e-12);
     }
 }
 
@@ -217,6 +257,7 @@ int main(int argc, char* argv[]) {
         testUnsupportedFunctions(precision);
         if (precision == "mixed") {
             testIntegrationStep();
+            testVariableStep();
             testExpressionConstants();
         }
     }
