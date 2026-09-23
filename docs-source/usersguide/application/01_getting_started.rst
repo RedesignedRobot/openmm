@@ -58,6 +58,8 @@ modern drivers from your vendor.
     instructions at https://rocm.docs.amd.com.
   * On macOS, OpenCL is included with the operating system and is supported on
     macOS 10.10.3 or later.
+  * On a Mac with Apple silicon, the Metal platform needs no drivers.  It
+    requires macOS 15 or later and an M1 or newer GPU.
 
 3.a. To install with conda, open a command line terminal and type the following command
 ::

@@ -112,6 +112,47 @@ HIP Platform
 The HIP Platform recognizes exactly the same Platform-specific properties as
 the CUDA platform.
 
+Metal Platform
+**************
+
+The Metal Platform runs on the GPU of a Mac with Apple silicon.  It requires
+macOS 15 or later and an M1 or newer GPU (Apple GPU family 7).  On other Macs,
+use the OpenCL Platform instead.
+
+The Metal Platform recognizes the following Platform-specific properties:
+
+* Precision: This selects what numeric precision to use for calculations.
+  The allowed values are “single” and “mixed”.  Apple GPUs do not support double
+  precision, so “double” is not allowed.  If it is set to “single”, nearly all
+  calculations are done in single precision.  This is the fastest option.  If it
+  is set to “mixed”, forces are computed in single precision but integration is
+  done in double-single arithmetic, which represents each value as the sum of two
+  single precision numbers.  This gives about 48 bits of precision instead of the
+  53 bits of true double precision, and much better energy conservation than
+  single precision.
+* UseCpuPme: This selects whether to use the CPU-based PME implementation.
+  The allowed values are “true” or “false”.  Depending on your hardware, this
+  might (or might not) improve performance.
+* TempDirectory: This specifies a directory where the source code of each
+  kernel is written when the environment variable OPENMM_SAVE_TEMPS is set to
+  1.  Kernels are otherwise compiled in memory, so you rarely need to specify
+  this.
+* DeviceName: This reports the name of the GPU, such as “Apple M2”.  A Mac
+  with Apple silicon has only one GPU, so there is no DeviceIndex property.
+
+A few math functions are not available in double-single arithmetic: sin, cos,
+tan, asin, acos, atan, atan2, sinh, cosh, tanh, erf, erfc, and raising to a
+power that is not a constant integer.  In mixed precision, if a
+CustomIntegrator uses one of them in a per-DOF computation or a sum, OpenMM
+throws an exception that names the function.  Custom forces and global
+computations are not affected.  For the same reason, QTBIntegrator can only be
+used in single precision.
+
+Apple GPUs do not support 64 bit atomic operations.  In mixed precision, energy
+minimization therefore does its reductions in a single thread block.  The
+results are deterministic, but minimizing a large system is much slower than in
+single precision.
+
 CPU Platform
 ************
 
