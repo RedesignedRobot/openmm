@@ -30,6 +30,7 @@
 #include <cstdint>
 
 namespace MTL {
+    class CommandBuffer;
     class SharedEvent;
 }
 
@@ -39,7 +40,9 @@ class MetalContext;
 
 /**
  * This is the Metal implementation of the ComputeEventImpl interface.  Enqueueing it
- * commits the current queue's open command buffer with a signal at the end.
+ * commits the current queue's open command buffer with a signal at the end.  Waiting on the
+ * host waits for that command buffer, so a failure is reported instead of the signal never
+ * arriving.
  */
 
 class MetalEvent : public ComputeEventImpl {
@@ -52,6 +55,7 @@ public:
 private:
     MetalContext& context;
     MTL::SharedEvent* event;
+    MTL::CommandBuffer* buffer;
     uint64_t value;
 };
 

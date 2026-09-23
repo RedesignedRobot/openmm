@@ -28,29 +28,38 @@
 #include "MetalQueue.h"
 #include "openmm/OpenMMException.h"
 #include <Metal/Metal.hpp>
-#include <limits>
 
 using namespace OpenMM;
 
-MetalEvent::MetalEvent(MetalContext& context) : context(context), value(0) {
+MetalEvent::MetalEvent(MetalContext& context) : context(context), buffer(NULL), value(0) {
     event = context.getDevice()->newSharedEvent();
     if (event == NULL)
         throw OpenMMException("Error creating Metal event");
 }
 
 MetalEvent::~MetalEvent() {
+    if (buffer != NULL)
+        buffer->release();
     event->release();
 }
 
 void MetalEvent::enqueue() {
     MetalQueue& queue = context.getCurrentMetalQueue();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
-    queue.getCommandBuffer()->encodeSignalEvent(event, ++value);
+    if (buffer != NULL)
+        buffer->release();
+    buffer = queue.getCommandBuffer()->retain();
+    buffer->encodeSignalEvent(event, ++value);
     queue.commit();
 }
 
 void MetalEvent::wait() {
-    event->waitUntilSignaledValue(value, std::numeric_limits<uint64_t>::max());
+    if (buffer == NULL)
+        return;
+    buffer->waitUntilCompleted();
+    std::string failure = MetalQueue::getFailure(buffer);
+    if (!failure.empty())
+        throw OpenMMException("Error executing Metal command buffer: "+failure);
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
