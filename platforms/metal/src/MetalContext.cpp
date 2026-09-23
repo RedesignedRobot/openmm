@@ -254,7 +254,7 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     this->sharedMemPerBlock = device->maxThreadgroupMemoryLength();
 
     // METAL-TODO: find a good value here
-    int numThreadBlocksPerComputeUnit = 6;
+    int numThreadBlocksPerComputeUnit = 12;
 
     contextIsValid = true;
     ContextSelector selector(*this);
@@ -298,11 +298,11 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
 
     // Set defines based on the requested precision.
 
-    compilationDefines["SQRT"] = "sqrt";
-    compilationDefines["RSQRT"] = "rsqrt";
-    compilationDefines["RECIP(x)"] = useDoublePrecision ? "(1.0/(x))" : "(1.0f/(x))";
-    compilationDefines["EXP"] = "exp";
-    compilationDefines["LOG"] = "log";
+    compilationDefines["SQRT"] = useDoublePrecision ? "sqrt" : "__fsqrt_rn";
+    compilationDefines["RSQRT"] = useDoublePrecision ? "rsqrt" : "__frsqrt_rn";
+    compilationDefines["RECIP(x)"] = useDoublePrecision ? "(1.0/(x))" : "fast::divide(1.0f, (x))";
+    compilationDefines["EXP"] = useDoublePrecision ? "exp" : "__expf";
+    compilationDefines["LOG"] = useDoublePrecision ? "log" : "__logf";
     compilationDefines["POW"] = useDoublePrecision ? "pow" : "powf";
     compilationDefines["COS"] = useDoublePrecision ? "cos" : "cosf";
     compilationDefines["SIN"] = useDoublePrecision ? "sin" : "sinf";

@@ -129,6 +129,12 @@ inline half __float2half_ru(float x) {
 #define fabsf fabs
 #define truncf trunc
 
+// The library is compiled in safe math mode, so name the fast functions HIP uses.
+#define __fsqrt_rn precise::sqrt
+#define __frsqrt_rn fast::rsqrt
+#define __expf fast::exp
+#define __logf fast::log
+
 /**
  * MSL has no erfc.  This is a degree 7 rational approximation with a maximum relative error
  * of 1.5e-6 on [0, 4], computed directly rather than as 1-erf(x) to avoid cancellation.

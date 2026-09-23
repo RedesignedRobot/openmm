@@ -59,7 +59,7 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     downloadCountEvent = context.createEvent();
     pinnedCountDeviceMemory = context.getDevice()->newBuffer(2*sizeof(unsigned int), MTL::ResourceStorageModeShared);
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
-    numForceThreadBlocks = 5*4*context.getMultiprocessors();
+    numForceThreadBlocks = 10*4*context.getMultiprocessors();
     forceThreadBlockSize = 64;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
 
@@ -261,8 +261,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         if (maxTiles < 1)
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
-        // METAL-TODO: This may require tuning
-        numTilesInBatch = numAtomBlocks < 2000 ? 4 : 1;
+        // Batching tiles made systems under 2000 blocks slower on an M2.
+        numTilesInBatch = 1;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
