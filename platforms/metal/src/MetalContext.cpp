@@ -486,8 +486,12 @@ MTL::Library* MetalContext::createLibrary(const string& source, const map<string
     pool->release();
     if (library == NULL && log.find("no 'buffer' resource location available") != string::npos)
         throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
+    // Explain calls to deleted df64 functions, but only when they are the only errors.  Otherwise the cause
+    // may be something else, and the plain compiler log is clearer.
+    const regex anyError(": error: "), deletedCallError("program_source:(\\d+):\\d+: error: call to deleted function '(\\w+)'");
+    auto countMatches = [&log](const regex& pattern) { return distance(sregex_iterator(log.begin(), log.end(), pattern), sregex_iterator()); };
     smatch deletedCall;
-    if (library == NULL && useMixedPrecision && regex_search(log, deletedCall, regex("program_source:(\\d+):\\d+: error: call to deleted function '(\\w+)'"))) {
+    if (library == NULL && useMixedPrecision && countMatches(deletedCallError) == countMatches(anyError) && regex_search(log, deletedCall, deletedCallError)) {
         stringstream lines(src.str());
         string line;
         for (int i = 0; i < stoi(deletedCall[1]); i++)

@@ -115,7 +115,7 @@ KERNEL void evaluate(GLOBAL mixed* values) {
 /**
  * In mixed precision, a function with no df64 version must fail to compile on a mixed value, not run in
  * single precision, and the error must name the function and the line that calls it.  In single
- * precision, the same program compiles.
+ * precision, the same program compiles.  A program with other errors reports the plain compiler error.
  */
 void testUnsupportedFunctions(const string& precision) {
     System system;
@@ -135,6 +135,18 @@ void testUnsupportedFunctions(const string& precision) {
             threwException = true;
         }
         ASSERT_EQUAL(context.getUseMixedPrecision(), threwException);
+    }
+
+    // When the program has another error too, report the plain compiler error.
+
+    try {
+        context.compileProgram("KERNEL void evaluate(GLOBAL mixed* values) {\nmixed x = values[0];\nvalues[1] = SIN(x)+undefinedValue;\n}\n");
+        ASSERT(false);
+    }
+    catch (const OpenMMException& ex) {
+        string message = ex.what();
+        ASSERT(message.find("Error compiling program: program_source:") == 0);
+        ASSERT(message.find("undefinedValue") != string::npos);
     }
 }
 
