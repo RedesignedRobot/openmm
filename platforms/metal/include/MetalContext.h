@@ -175,6 +175,12 @@ public:
      */
     std::string doubleToString(double value, bool mixedIsDouble=false) const;
     /**
+     * Get the definitions of SQRT, RSQRT, RECIP, EXP, and LOG to compile programs with.  SQRT is always
+     * correctly rounded.  Each of the others uses the fast version if its flag is set, and the precise
+     * version otherwise.
+     */
+    static std::map<std::string, std::string> getMathFunctionDefines(bool fastRsqrt, bool fastRecip, bool fastExp, bool fastLog);
+    /**
      * Convert an array to a MetalArray.  If the argument is already a MetalArray, this simply casts it.
      * If the argument is a ComputeArray that wraps a MetalArray, this returns the wrapped array.  For any
      * other argument, this throws an exception.

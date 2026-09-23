@@ -283,11 +283,8 @@ MetalContext::MetalContext(const System& system, const string& precision, const 
         maxExpError = max(maxExpError, fabs(exp(v)-values[5*i+3])/values[5*i+3]);
         maxLogError = max(maxLogError, fabs(log(v)-values[5*i+4])/values[5*i+4]);
     }
-    compilationDefines["SQRT"] = "precise::sqrt";
-    compilationDefines["RSQRT"] = (maxRsqrtError < 1e-6) ? "fast::rsqrt" : "precise::rsqrt";
-    compilationDefines["RECIP(x)"] = (maxRecipError < 1e-6) ? "fast::divide(1.0f, (x))" : "(1.0f/(x))";
-    compilationDefines["EXP"] = (maxExpError < 1e-6) ? "fast::exp" : "precise::exp";
-    compilationDefines["LOG"] = (maxLogError < 1e-6) ? "fast::log" : "precise::log";
+    for (auto& define : getMathFunctionDefines(maxRsqrtError < 1e-6, maxRecipError < 1e-6, maxExpError < 1e-6, maxLogError < 1e-6))
+        compilationDefines[define.first] = define.second;
     compilationDefines["POW"] = "pow";
     compilationDefines["COS"] = "cos";
     compilationDefines["SIN"] = "sin";
@@ -565,6 +562,16 @@ string MetalContext::doubleToString(double value, bool mixedIsDouble) const {
     if (!useMixedPrecision || !mixedIsDouble || hi == value || !isfinite(hi))
         return ComputeContext::doubleToString(value, mixedIsDouble);
     return "df64("+ComputeContext::doubleToString(hi)+", "+ComputeContext::doubleToString((float) (value-hi))+")";
+}
+
+map<string, string> MetalContext::getMathFunctionDefines(bool fastRsqrt, bool fastRecip, bool fastExp, bool fastLog) {
+    map<string, string> defines;
+    defines["SQRT"] = "precise::sqrt";
+    defines["RSQRT"] = fastRsqrt ? "fast::rsqrt" : "precise::rsqrt";
+    defines["RECIP(x)"] = fastRecip ? "fast::divide(1.0f, (x))" : "(1.0f/(x))";
+    defines["EXP"] = fastExp ? "fast::exp" : "precise::exp";
+    defines["LOG"] = fastLog ? "fast::log" : "precise::log";
+    return defines;
 }
 
 MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
