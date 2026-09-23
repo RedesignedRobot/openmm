@@ -36,7 +36,15 @@ MetalQueue::MetalQueue(MTL::Device* device) : openBuffer(NULL), encoder(NULL), c
 }
 
 MetalQueue::~MetalQueue() {
-    finish();
+    // A destructor can't throw, so skip failed command buffers until all have completed.
+    while (true) {
+        try {
+            finish();
+            break;
+        }
+        catch (OpenMMException& ex) {
+        }
+    }
     stream->release();
 }
 
