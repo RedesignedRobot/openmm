@@ -17,6 +17,11 @@ FOREACH(framework Metal Foundation QuartzCore IOKit CoreFoundation)
     SET(METAL_LIBRARIES ${METAL_LIBRARIES} ${${framework}_FRAMEWORK})
 ENDFOREACH(framework)
 
+SET(OPENMM_BUILD_METAL_TESTS TRUE CACHE BOOL "Whether to build Metal test cases")
+IF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
+    SUBDIRS(tests)
+ENDIF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
+
 # The source is organized into subdirectories, but we handle them all from
 # this CMakeLists file rather than letting CMake visit them as SUBDIRS.
 SET(OPENMM_SOURCE_SUBDIRS . ../common)
