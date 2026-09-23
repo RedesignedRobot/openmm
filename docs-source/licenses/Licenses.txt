@@ -35,12 +35,13 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-2. CUDA and OpenCL Platforms
+2. CUDA, OpenCL, and Metal Platforms
 
-The CUDA Platform and OpenCL Platform may be used under the terms of the GNU
-Lesser General Public License.  A copy of this license may be found in the
-accompanying file "LGPL.txt".  It in turn incorporates the terms of the GNU
-General Public License, which may be found in the accompanying file "GPL.txt".
+The CUDA Platform, OpenCL Platform, and Metal Platform may be used under the
+terms of the GNU Lesser General Public License.  A copy of this license may be
+found in the accompanying file "LGPL.txt".  It in turn incorporates the terms of
+the GNU General Public License, which may be found in the accompanying file
+"GPL.txt".
 
 
 3. SIMD-oriented Fast Mersenne Twister (SFMT)
@@ -207,3 +208,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+10. metal-cpp
+
+The Metal Platform uses Apple's metal-cpp headers, which are copyright
+2020-2025 Apple Inc.  They may be used under the terms of the Apache License,
+Version 2.0.  A copy of this license may be found in the accompanying file
+"Apache-2.0.txt".
