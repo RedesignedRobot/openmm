@@ -526,6 +526,22 @@ inline df64 log(df64 x) {
     return (c - 0.5f * c.hi * c.hi) + y;
 }
 
+// These have no df64 versions yet. On a df64 argument the float versions would run silently on the
+// value narrowed to float, so calling them on a mixed value is a compile error instead.
+df64 sin(df64) = delete;
+df64 cos(df64) = delete;
+df64 tan(df64) = delete;
+df64 asin(df64) = delete;
+df64 acos(df64) = delete;
+df64 atan(df64) = delete;
+df64 atan2(df64, df64) = delete;
+df64 sinh(df64) = delete;
+df64 cosh(df64) = delete;
+df64 tanh(df64) = delete;
+df64 erf(df64) = delete;
+df64 erfc(df64) = delete;
+df64 pow(df64, df64) = delete;
+
 // A SIMD shuffle moves both words.
 inline df64 simd_shuffle(df64 v, ushort lane) { return df64(simd_shuffle(v.hi, lane), simd_shuffle(v.lo, lane)); }
 inline df64 simd_shuffle_down(df64 v, ushort delta) { return df64(simd_shuffle_down(v.hi, delta), simd_shuffle_down(v.lo, delta)); }
@@ -643,8 +659,8 @@ inline df64_3 trimTo3(df64_4 v) { return df64_3(v.x, v.y, v.z); }
 inline df64_4 cross(df64_4 a, df64_4 b) { return df64_4(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x, 0.0f); }
 
 // Custom expressions on double3 (CustomIntegrator per-DOF steps) call pow on vectors. Like pow on a
-// df64, which has no overload of its own, each component narrows to float.
-inline df64_3 pow(df64_3 a, df64_3 b) { return df64_3(pow(a.x, b.x), pow(a.y, b.y), pow(a.z, b.z)); }
+// df64, it has no df64 version yet.
+df64_3 pow(df64_3, df64_3) = delete;
 
 // The host maps SQRT, RSQRT, EXP, LOG and RECIP to metal::precise:: or metal::fast:: functions.
 // A qualified call only sees that namespace, so without these a df64 argument would narrow to float.
