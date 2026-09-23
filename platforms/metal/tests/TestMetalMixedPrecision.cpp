@@ -113,6 +113,66 @@ KERNEL void evaluate(GLOBAL mixed* values) {
 }
 
 /**
+ * Check that casting a mixed value to mm_long truncates it exactly as casting a double does, using both
+ * floats of the df64.  The minimizer converts constraint forces to fixed point this way.
+ */
+void testLongConversion() {
+    System system;
+    system.addParticle(1.0);
+    MetalPlatform::PlatformData platformData(NULL, system, "mixed", "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), 1, NULL);
+    MetalContext& context = *platformData.contexts[0];
+    const string source = R"(
+KERNEL void convert(GLOBAL mixed* values, GLOBAL mm_long* results, int numValues) {
+    for (int i = GLOBAL_ID; i < numValues; i += GLOBAL_SIZE) {
+        mixed x = values[i];
+        values[i] = x;
+        results[i] = (mm_long) x;
+    }
+}
+)";
+
+    // Values a df64 holds exactly, including ones whose integer part is only in the low float.
+    vector<double> exact = {0.0, 0.75, 1.5, 3.0-pow(2.0, -30), pow(2.0, 24)-0.5, pow(2.0, 31)+0.25, pow(2.0, 40)+0.75,
+            1234.5*pow(2.0, 32), pow(2.0, 52)-0.5, pow(2.0, 53)-1, pow(2.0, 53)+2, pow(2.0, 62)+pow(2.0, 40)};
+    vector<double> values;
+    for (double x : exact) {
+        values.push_back(x);
+        values.push_back(-x);
+    }
+    int numExact = values.size();
+    OpenMM_SFMT::SFMT sfmt;
+    init_gen_rand(0, sfmt);
+    for (int i = 0; i < 1000; i++)
+        values.push_back((genrand_real2(sfmt) < 0.5 ? -1 : 1)*(1+genrand_real2(sfmt))*pow(2.0, 61*genrand_real2(sfmt)));
+    int numValues = values.size();
+
+    MetalArray valuesArray, resultsArray;
+    valuesArray.initialize<double>(context, numValues, "values");
+    resultsArray.initialize<long long>(context, numValues, "results");
+    valuesArray.upload(values);
+    ComputeKernel kernel = context.compileProgram(source)->createKernel("convert");
+    kernel->addArg(valuesArray);
+    kernel->addArg(resultsArray);
+    kernel->addArg(numValues);
+    kernel->execute(numValues);
+    vector<double> stored;
+    vector<long long> results;
+    valuesArray.download(stored);
+    resultsArray.download(results);
+
+    // Other values are rounded to df64 when loaded, so compare with the cast of the value that was stored.
+    for (int i = 0; i < numValues; i++) {
+        if (i < numExact) {
+            ASSERT_EQUAL(values[i], stored[i]);
+        }
+        else {
+            ASSERT_EQUAL_TOL(values[i], stored[i], 1e-14);
+        }
+        ASSERT_EQUAL((long long) stored[i], results[i]);
+    }
+}
+
+/**
  * In mixed precision, a function with no df64 version must fail to compile on a mixed value, not run in
  * single precision, and the error must name the function and the line that calls it.  In single
  * precision, the same program compiles.  A program with other errors reports the plain compiler error.
@@ -268,6 +328,7 @@ int main(int argc, char* argv[]) {
         testMathFunctions(precision);
         testUnsupportedFunctions(precision);
         if (precision == "mixed") {
+            testLongConversion();
             testIntegrationStep();
             testVariableStep();
             testExpressionConstants();
