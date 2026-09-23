@@ -542,6 +542,8 @@ void atomicAdd(device df64* target, df64 value) = delete;
 #define DF64_VECTOR_COMPOUND(V, AS, ASSIGN, SCALE) \
     AS V& operator+=(V o) AS { ASSIGN(+=) return *this; } \
     AS V& operator-=(V o) AS { ASSIGN(-=) return *this; } \
+    AS V& operator*=(V o) AS { ASSIGN(*=) return *this; } \
+    AS V& operator/=(V o) AS { ASSIGN(/=) return *this; } \
     AS V& operator*=(df64 s) AS { SCALE(*=) return *this; } \
     AS V& operator/=(df64 s) AS { SCALE(/=) return *this; }
 #define DF64_VECTOR_ACCESS(V, INIT, ASSIGN, SCALE) \
@@ -608,9 +610,12 @@ struct df64_4 {
 inline df64_2 operator+(df64_2 a, df64_2 b) { return df64_2(a.x + b.x, a.y + b.y); }
 inline df64_2 operator-(df64_2 a, df64_2 b) { return df64_2(a.x - b.x, a.y - b.y); }
 inline df64_2 operator-(df64_2 a) { return df64_2(-a.x, -a.y); }
+inline df64_2 operator*(df64_2 a, df64_2 b) { return df64_2(a.x * b.x, a.y * b.y); }
 inline df64_2 operator*(df64_2 a, df64 s) { return df64_2(a.x * s, a.y * s); }
 inline df64_2 operator*(df64 s, df64_2 a) { return a * s; }
+inline df64_2 operator/(df64_2 a, df64_2 b) { return df64_2(a.x / b.x, a.y / b.y); }
 inline df64_2 operator/(df64_2 a, df64 s) { return df64_2(a.x / s, a.y / s); }
+inline df64_2 operator/(df64 s, df64_2 a) { return df64_2(s / a.x, s / a.y); }
 
 inline df64_3 operator+(df64_3 a, df64_3 b) { return df64_3(a.x + b.x, a.y + b.y, a.z + b.z); }
 inline df64_3 operator-(df64_3 a, df64_3 b) { return df64_3(a.x - b.x, a.y - b.y, a.z - b.z); }
@@ -618,7 +623,9 @@ inline df64_3 operator-(df64_3 a) { return df64_3(-a.x, -a.y, -a.z); }
 inline df64_3 operator*(df64_3 a, df64_3 b) { return df64_3(a.x * b.x, a.y * b.y, a.z * b.z); }
 inline df64_3 operator*(df64_3 a, df64 s) { return df64_3(a.x * s, a.y * s, a.z * s); }
 inline df64_3 operator*(df64 s, df64_3 a) { return a * s; }
+inline df64_3 operator/(df64_3 a, df64_3 b) { return df64_3(a.x / b.x, a.y / b.y, a.z / b.z); }
 inline df64_3 operator/(df64_3 a, df64 s) { return df64_3(a.x / s, a.y / s, a.z / s); }
+inline df64_3 operator/(df64 s, df64_3 a) { return df64_3(s / a.x, s / a.y, s / a.z); }
 inline df64 dot(df64_3 a, df64_3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline df64_3 cross(df64_3 a, df64_3 b) { return df64_3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 
@@ -628,10 +635,33 @@ inline df64_4 operator-(df64_4 a) { return df64_4(-a.x, -a.y, -a.z, -a.w); }
 inline df64_4 operator*(df64_4 a, df64_4 b) { return df64_4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
 inline df64_4 operator*(df64_4 a, df64 s) { return df64_4(a.x * s, a.y * s, a.z * s, a.w * s); }
 inline df64_4 operator*(df64 s, df64_4 a) { return a * s; }
+inline df64_4 operator/(df64_4 a, df64_4 b) { return df64_4(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
 inline df64_4 operator/(df64_4 a, df64 s) { return df64_4(a.x / s, a.y / s, a.z / s, a.w / s); }
+inline df64_4 operator/(df64 s, df64_4 a) { return df64_4(s / a.x, s / a.y, s / a.z, s / a.w); }
 inline df64 dot(df64_4 a, df64_4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 inline df64_3 trimTo3(df64_4 v) { return df64_3(v.x, v.y, v.z); }
 inline df64_4 cross(df64_4 a, df64_4 b) { return df64_4(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x, 0.0f); }
+
+// Custom expressions on double3 (CustomIntegrator per-DOF steps) call pow on vectors. Like pow on a
+// df64, which has no overload of its own, each component narrows to float.
+inline df64_3 pow(df64_3 a, df64_3 b) { return df64_3(pow(a.x, b.x), pow(a.y, b.y), pow(a.z, b.z)); }
+
+// The host maps SQRT, RSQRT, EXP, LOG and RECIP to metal::precise:: or metal::fast:: functions.
+// A qualified call only sees that namespace, so without these a df64 argument would narrow to float.
+#define DF64_QUALIFIED_MATH \
+    inline df64 sqrt(df64 x) { return ::sqrt(x); } \
+    inline df64 rsqrt(df64 x) { return ::rsqrt(x); } \
+    inline df64 exp(df64 x) { return ::exp(x); } \
+    inline df64 log(df64 x) { return ::log(x); } \
+    inline df64 divide(float x, df64 y) { return x / y; } \
+    inline df64_2 divide(float x, df64_2 y) { return df64(x) / y; } \
+    inline df64_3 divide(float x, df64_3 y) { return df64(x) / y; } \
+    inline df64_4 divide(float x, df64_4 y) { return df64(x) / y; }
+namespace metal {
+namespace precise { DF64_QUALIFIED_MATH }
+namespace fast { DF64_QUALIFIED_MATH }
+}
+#undef DF64_QUALIFIED_MATH
 
 #undef DF64_INTEGRAL
 #undef DF64_ARITHMETIC
