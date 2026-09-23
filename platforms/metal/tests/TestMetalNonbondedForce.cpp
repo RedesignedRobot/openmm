@@ -28,9 +28,28 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.                                     *
  * -------------------------------------------------------------------------- */
 
+#define NS_PRIVATE_IMPLEMENTATION
+#define MTL_PRIVATE_IMPLEMENTATION
+#include <Metal/Metal.hpp>
 #include "MetalTests.h"
 #include "TestNonbondedForce.h"
 
+bool canRunHugeTest() {
+    // Only run the huge test if the GPU can use at least 8 GB of memory.
+
+    MTL::Device* device = MTL::CreateSystemDefaultDevice();
+    long long memory = device->recommendedMaxWorkingSetSize();
+    device->release();
+    if (memory >= 8*(long long)(1<<30))
+        return true;
+    cout << "Skipping testHugeSystem: the GPU's recommended working set is " << memory/(1<<20) << " MB, less than 8 GB" << endl;
+    return false;
+}
+
 void runPlatformTests() {
     testReordering();
+    if (canRunHugeTest()) {
+        double tol = (platform.getPropertyDefaultValue("Precision") == "single" ? 1e-4 : 1e-5);
+        testHugeSystem(tol);
+    }
 }
