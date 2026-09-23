@@ -83,9 +83,7 @@ void CommonMinimizeKernel::execute(ContextImpl& context, double tolerance, int m
         // Load system and integrator information.
 
         mixedIsDouble = cc.getUseMixedPrecision() || cc.getUseDoublePrecision();
-        if (mixedIsDouble && !cc.getSupports64BitGlobalAtomics()) {
-            throw OpenMMException("Double precision is not supported on devices that do not support 64 bit atomic operations");
-        }
+        singleBlockReductions = mixedIsDouble && !cc.getSupports64BitGlobalAtomics();
         elementSize = mixedIsDouble ? sizeof(double) : sizeof(float);
         threadBlockSize = cc.getMaxThreadBlockSize();
         pinnedMemory = cc.getPinnedBuffer();
@@ -187,6 +185,11 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     defines["LBFGS_SCALE_UP"] = cc.doubleToString(stepScaleUp);
     defines["LBFGS_MIN_STEP"] = cc.doubleToString(minStep);
     defines["LBFGS_MAX_STEP"] = cc.doubleToString(maxStep);
+    if (singleBlockReductions) {
+        // Without 64 bit atomics, kernels that sum into a double run as one
+        // thread block, which can add to it without atomics.
+        defines["SINGLE_BLOCK_REDUCTIONS"] = "";
+    }
 
     ComputeProgram program = cc.compileProgram(CommonKernelSources::minimize, defines);
 
@@ -405,12 +408,12 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
         // Prepare for a line search.
 
         energyStart = energy;
-        lineSearchSetupKernel->execute(numVariables);
+        executeReduction(lineSearchSetupKernel, numVariables);
 
         // Take line search steps.
 
         for (int count = 0;; count++) {
-            lineSearchStepKernel->execute(numVariables);
+            executeReduction(lineSearchStepKernel, numVariables);
 
             if (count) {
                 int hostReturnFlag = downloadReturnFlagFinish();
@@ -482,7 +485,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
             getScaleKernel->execute(threadBlockSize, threadBlockSize);
         }
         else {
-            getScaleKernel->execute(numVariables);
+            executeReduction(getScaleKernel, numVariables);
         }
 
         int limit = min(numVectors, iteration++);
@@ -493,7 +496,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
         reinitializeDirKernel->setArg(8, vectorIndex);
         reinitializeDirKernel->setArg(9, (int) largeGrad);
-        reinitializeDirKernel->execute(numVariables);
+        executeReduction(reinitializeDirKernel, numVariables);
 
         for (int vector = 0; vector < limit; vector++) {
             if (vector && --vectorIndex < 0) {
@@ -502,12 +505,12 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
             if (vector < limit - 1) {
                 updateDirAlphaKernel->setArg(7, vectorIndex);
-                updateDirAlphaKernel->execute(numVariables);
+                executeReduction(updateDirAlphaKernel, numVariables);
             }
         }
 
         scaleDirKernel->setArg(7, vectorIndex);
-        scaleDirKernel->execute(numVariables);
+        executeReduction(scaleDirKernel, numVariables);
 
         for (int vector = 0; vector < limit - 1; vector++) {
             // scaleDirKernel puts its first result in alpha[numVectors], so for the
@@ -515,7 +518,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
             updateDirBetaKernel->setArg(7, vectorIndex);
             updateDirBetaKernel->setArg(8, vector ? vectorIndex : numVectors);
-            updateDirBetaKernel->execute(numVariables);
+            executeReduction(updateDirBetaKernel, numVariables);
 
             if (++vectorIndex >= numVectors) {
                 vectorIndex -= numVectors;
@@ -559,7 +562,7 @@ void CommonMinimizeKernel::evaluateGpu(ContextImpl& context) {
         else {
             getConstraintEnergyForcesKernel->setArg(8, (float) kRestraint);
         }
-        getConstraintEnergyForcesKernel->execute(numConstraints);
+        executeReduction(getConstraintEnergyForcesKernel, numConstraints);
     }
 
     // Convert the forces from fixed to floating point format.  If they are too
@@ -749,6 +752,15 @@ double CommonMinimizeKernel::downloadGradNormSync() {
     }
 }
 
+void CommonMinimizeKernel::executeReduction(ComputeKernel& kernel, int numThreads) {
+    if (singleBlockReductions) {
+        kernel->execute(threadBlockSize, threadBlockSize);
+    }
+    else {
+        kernel->execute(numThreads);
+    }
+}
+
 void CommonMinimizeKernel::runLineSearchKernels() {
     if (mixedIsDouble) {
         lineSearchDotKernel->setArg(6, isfinite(energy) ? energy - energyStart : (double) std::numeric_limits<float>::max());
@@ -756,6 +768,6 @@ void CommonMinimizeKernel::runLineSearchKernels() {
     else {
         lineSearchDotKernel->setArg(6, isfinite((float) energy) ? (float) (energy - energyStart) : std::numeric_limits<float>::max());
     }
-    lineSearchDotKernel->execute(numVariables);
+    executeReduction(lineSearchDotKernel, numVariables);
     lineSearchContinueKernel->execute(1);
 }

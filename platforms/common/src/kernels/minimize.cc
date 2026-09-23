@@ -124,7 +124,13 @@ DEVICE mixed reduceMax(mixed value, LOCAL_ARG volatile mixed* temp) {
 }
 
 DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
-#if defined(__CUDA_ARCH__) || defined(USE_HIP)
+#if defined(SINGLE_BLOCK_REDUCTIONS)
+
+    // The host runs every kernel that calls this as a single thread block, and
+    // only the first thread of a block calls it, so there is only one writer
+    *target += value;
+
+#elif defined(__CUDA_ARCH__) || defined(USE_HIP)
 
     // Do atomic addition of floating-point values directly
     atomicAdd(target, value);
