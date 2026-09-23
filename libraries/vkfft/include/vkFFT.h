@@ -35665,7 +35665,7 @@ static inline VkFFTResult VkFFTPlanR2CMultiUploadDecomposition(VkFFTApplication*
 			NS::String* str = NS::String::string(code0, NS::UTF8StringEncoding);
 			axis->library = app->configuration.device->newLibrary(str, compileOptions, &error);
 			if (!axis->library) {
-				printf("%s\n%s\n", error->debugDescription()->cString(NS::ASCIIStringEncoding), error->localizedDescription()->cString(NS::ASCIIStringEncoding));
+				if (error) printf("%s\n%s\n", error->debugDescription()->cString(NS::ASCIIStringEncoding), error->localizedDescription()->cString(NS::ASCIIStringEncoding));
 				free(code0);
 				code0 = 0;
 				deleteVkFFT(app);
@@ -38937,7 +38937,7 @@ static inline VkFFTResult VkFFTPlanAxis(VkFFTApplication* app, VkFFTPlan* FFTPla
 			NS::String* str = NS::String::string(code0, NS::UTF8StringEncoding);
 			axis->library = app->configuration.device->newLibrary(str, compileOptions, &error);
 			if (!axis->library) {
-				printf("%s\n%s\n", error->debugDescription()->cString(NS::ASCIIStringEncoding), error->localizedDescription()->cString(NS::ASCIIStringEncoding));
+				if (error) printf("%s\n%s\n", error->debugDescription()->cString(NS::ASCIIStringEncoding), error->localizedDescription()->cString(NS::ASCIIStringEncoding));
 				free(code0);
 				code0 = 0;
 				deleteVkFFT(app);
