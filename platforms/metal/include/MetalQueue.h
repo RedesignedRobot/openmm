@@ -28,6 +28,7 @@
 #include "openmm/common/ComputeQueue.h"
 #include <deque>
 #include <mutex>
+#include <string>
 
 namespace MTL {
     class CommandBuffer;
@@ -81,6 +82,10 @@ public:
      * completed.
      */
     void finish();
+    /**
+     * Get why a completed command buffer failed, or an empty string if it succeeded.
+     */
+    static std::string getFailure(MTL::CommandBuffer* buffer);
     /**
      * Get the number of command buffers this queue has committed.
      */

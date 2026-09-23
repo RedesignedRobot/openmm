@@ -101,12 +101,19 @@ void MetalQueue::releaseCompleted() {
     while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
         MTL::CommandBuffer* buffer = pending.front();
         pending.pop_front();
-        bool failed = (buffer->status() == MTL::CommandBufferStatusError);
-        string message;
-        if (failed && buffer->error() != NULL)
-            message = buffer->error()->localizedDescription()->utf8String();
+        string failure = getFailure(buffer);
         buffer->release();
-        if (failed)
-            throw OpenMMException("Error executing Metal command buffer: "+message);
+        if (!failure.empty())
+            throw OpenMMException("Error executing Metal command buffer: "+failure);
     }
+}
+
+string MetalQueue::getFailure(MTL::CommandBuffer* buffer) {
+    if (buffer->status() != MTL::CommandBufferStatusError)
+        return "";
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = buffer->error();
+    string message = (error == NULL ? "unknown error" : error->localizedDescription()->utf8String());
+    pool->release();
+    return message;
 }
