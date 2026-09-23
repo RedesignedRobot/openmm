@@ -255,16 +255,16 @@ MetalContext::MetalContext(const System& system, const string& precision, const 
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
     numThreadBlocks = 12*numCores;
 
-    // Decide whether the fast versions of sqrt(), rsqrt(), reciprocal, exp(), and log() are sufficiently
-    // accurate to use.
+    // Decide whether the fast versions of rsqrt(), reciprocal, exp(), and log() are sufficiently accurate
+    // to use.  sqrt() stays correctly rounded.
 
     ComputeArray valuesArray;
     const int numValues = 20;
-    valuesArray.initialize<float>(*this, 6*numValues, "values");
+    valuesArray.initialize<float>(*this, 5*numValues, "values");
     vector<float> values(valuesArray.getSize(), 0.0f);
     float nextValue = 1e-4f;
     for (int i = 0; i < numValues; i++) {
-        values[6*i] = nextValue;
+        values[5*i] = nextValue;
         nextValue *= (float) M_PI;
     }
     valuesArray.upload(values);
@@ -273,17 +273,15 @@ MetalContext::MetalContext(const System& system, const string& precision, const 
     accuracyKernel->addArg(numValues);
     accuracyKernel->execute(numValues);
     valuesArray.download(values);
-    double maxSqrtError = 0.0, maxRsqrtError = 0.0, maxRecipError = 0.0, maxExpError = 0.0, maxLogError = 0.0;
+    double maxRsqrtError = 0.0, maxRecipError = 0.0, maxExpError = 0.0, maxLogError = 0.0;
     for (int i = 0; i < numValues; i++) {
-        double v = values[6*i];
-        double correctSqrt = sqrt(v);
-        maxSqrtError = max(maxSqrtError, fabs(correctSqrt-values[6*i+1])/correctSqrt);
-        maxRsqrtError = max(maxRsqrtError, fabs(1.0/correctSqrt-values[6*i+2])*correctSqrt);
-        maxRecipError = max(maxRecipError, fabs(1.0/v-values[6*i+3])/values[6*i+3]);
-        maxExpError = max(maxExpError, fabs(exp(v)-values[6*i+4])/values[6*i+4]);
-        maxLogError = max(maxLogError, fabs(log(v)-values[6*i+5])/values[6*i+5]);
+        double v = values[5*i];
+        maxRsqrtError = max(maxRsqrtError, fabs(1.0/sqrt(v)-values[5*i+1])*sqrt(v));
+        maxRecipError = max(maxRecipError, fabs(1.0/v-values[5*i+2])/values[5*i+2]);
+        maxExpError = max(maxExpError, fabs(exp(v)-values[5*i+3])/values[5*i+3]);
+        maxLogError = max(maxLogError, fabs(log(v)-values[5*i+4])/values[5*i+4]);
     }
-    compilationDefines["SQRT"] = (maxSqrtError < 1e-6) ? "fast::sqrt" : "precise::sqrt";
+    compilationDefines["SQRT"] = "precise::sqrt";
     compilationDefines["RSQRT"] = (maxRsqrtError < 1e-6) ? "fast::rsqrt" : "precise::rsqrt";
     compilationDefines["RECIP(x)"] = (maxRecipError < 1e-6) ? "fast::divide(1.0f, (x))" : "(1.0f/(x))";
     compilationDefines["EXP"] = (maxExpError < 1e-6) ? "fast::exp" : "precise::exp";
