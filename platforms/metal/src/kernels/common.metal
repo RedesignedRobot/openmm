@@ -15,6 +15,7 @@ uint3 _mmNumGroups [[threadgroups_per_grid]];
 #define LOCAL threadgroup
 #define LOCAL_ARG threadgroup
 #define GLOBAL device
+#define PRIVATE thread
 #define RESTRICT
 #define LOCAL_ID _mmLocalId.x
 #define LOCAL_SIZE _mmLocalSize.x
@@ -129,8 +130,3 @@ inline float erf(float x) {
 inline long realToFixedPoint(real x) {
     return (long) (x*0x100000000);
 }
-
-// Common kernels use "thread" as a variable name, which is an address space qualifier in MSL.
-// This must come after everything that uses the qualifier.
-
-#define thread _mmThread

@@ -142,6 +142,16 @@ static size_t findWord(const string& source, const string& word, size_t start) {
     return string::npos;
 }
 
+static string replaceWord(const string& source, const string& word, const string& replacement) {
+    string result;
+    size_t pos = 0, found;
+    while ((found = findWord(source, word, pos)) != string::npos) {
+        result += source.substr(pos, found-pos)+replacement;
+        pos = found+word.size();
+    }
+    return result+source.substr(pos);
+}
+
 /**
  * Rewrite one kernel parameter if it is passed by value.  Metal only allows buffers,
  * textures, and constant references as kernel arguments, so "real4 box" becomes
@@ -453,15 +463,17 @@ MTL::Library* MetalContext::createLibrary(const string& source, const map<string
         src << singlePrecisionDefinitions << endl;
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
+    // Common kernels use "thread" as a variable name, but in MSL it is an address space.  Rename the
+    // variable in the text rather than with a macro, so that PRIVATE can still expand to the address space.
     for (auto& pair : defines) {
         src << "#define " << pair.first;
         if (!pair.second.empty())
-            src << " " << pair.second;
+            src << " " << replaceWord(pair.second, "thread", "_mmThread");
         src << endl;
     }
     if (!defines.empty())
         src << endl;
-    src << rewriteKernelSignatures(source) << endl;
+    src << rewriteKernelSignatures(replaceWord(source, "thread", "_mmThread")) << endl;
     const char* saveTemps = getenv("OPENMM_SAVE_TEMPS");
     if (saveTemps != NULL && string(saveTemps) == "1") {
         stringstream fileName;
