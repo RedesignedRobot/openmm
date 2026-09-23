@@ -40,7 +40,6 @@
 #include "MetalSort.h"
 #include "openmm/common/ComputeArray.h"
 #include "openmm/common/ContextSelector.h"
-#include "SHA1.h"
 #include "openmm/MonteCarloFlexibleBarostat.h"
 #include "openmm/Platform.h"
 #include "openmm/System.h"
@@ -59,40 +58,157 @@
 #include <thread>
 #include <typeinfo>
 #include <sys/stat.h>
-#include <metal/metalrtc.h>
-
-
-#define CHECK_RESULT(result) CHECK_RESULT2(result, errorMessage);
-#define CHECK_RESULT2(result, prefix) \
-    if (result != metalSuccess) { \
-        std::stringstream m; \
-        m<<prefix<<": "<<getErrorString(result)<<" ("<<result<<")"<<" at "<<__FILE__<<":"<<__LINE__; \
-        throw OpenMMException(m.str());\
-    }
-
-#define METALRTC_CHECK_RESULT(result, prefix) \
-    if (result != METALRTC_SUCCESS) { \
-        stringstream m; \
-        m<<prefix<<": "<<metalrtcGetErrorString(result)<<" ("<<result<<")"<<" at "<<__FILE__<<":"<<__LINE__; \
-        throw OpenMMException(m.str());\
-    }
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 
 using namespace OpenMM;
 using namespace std;
 
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
-bool MetalContext::hasInitializedMetal = false;
 
+/**
+ * Metal does not report the number of GPU cores, so read it from the IORegistry.
+ */
+static int getGpuCoreCount() {
+    int cores = 0;
+    io_iterator_t iterator;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"), &iterator) != KERN_SUCCESS)
+        return 0;
+    io_object_t entry;
+    while ((entry = IOIteratorNext(iterator)) != 0) {
+        CFTypeRef value = IORegistryEntryCreateCFProperty(entry, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+        if (value != NULL) {
+            if (CFGetTypeID(value) == CFNumberGetTypeID())
+                CFNumberGetValue((CFNumberRef) value, kCFNumberIntType, &cores);
+            CFRelease(value);
+        }
+        IOObjectRelease(entry);
+    }
+    IOObjectRelease(iterator);
+    return cores;
+}
+
+static bool isIdentifierChar(char c) {
+    return isalnum((unsigned char) c) || c == '_';
+}
+
+static size_t findWord(const string& source, const string& word, size_t start) {
+    size_t pos = source.find(word, start);
+    while (pos != string::npos) {
+        bool startsWord = (pos == 0 || !isIdentifierChar(source[pos-1]));
+        bool endsWord = (pos+word.size() == source.size() || !isIdentifierChar(source[pos+word.size()]));
+        if (startsWord && endsWord)
+            return pos;
+        pos = source.find(word, pos+1);
+    }
+    return string::npos;
+}
+
+static string replaceWord(const string& source, const string& word, const string& replacement) {
+    string result;
+    size_t pos = 0, found;
+    while ((found = findWord(source, word, pos)) != string::npos) {
+        result += source.substr(pos, found-pos)+replacement;
+        pos = found+word.size();
+    }
+    return result+source.substr(pos);
+}
+
+/**
+ * Rewrite one kernel parameter for Metal.  A pointer without an address space points to device
+ * memory.  A value becomes a constant reference, so "real4 box" becomes "constant real4& _in_box",
+ * and a statement copying it into a local variable with the original name is appended to the
+ * prologue.  executeKernel() passes the arguments whose names start with _in_ by value.
+ */
+static string rewriteParameter(const string& param, string& prologue) {
+    size_t first = param.find_first_not_of(" \t\r\n");
+    if (first == string::npos)
+        return param;
+    size_t last = param.find_last_not_of(" \t\r\n");
+    string declaration = param.substr(first, last-first+1);
+    if (declaration.find_first_of("&[") != string::npos)
+        return param;
+    stringstream tokenStream(declaration);
+    vector<string> tokens;
+    string token;
+    while (tokenStream >> token)
+        if (token != "const")
+            tokens.push_back(token);
+    if (declaration.find('*') != string::npos) {
+        for (string space : {"GLOBAL", "LOCAL", "LOCAL_ARG", "device", "threadgroup", "constant"})
+            if (find(tokens.begin(), tokens.end(), space) != tokens.end())
+                return param;
+        return param.substr(0, first)+"device "+param.substr(first);
+    }
+    if (tokens.size() < 2)
+        return param;
+    string type;
+    for (int i = 0; i < tokens.size()-1; i++)
+        type += (i == 0 ? "" : " ")+tokens[i];
+    const string& name = tokens.back();
+    prologue += "    "+type+" "+name+" = _in_"+name+";\n";
+    return param.substr(0, first)+"constant "+type+"& _in_"+name+param.substr(last+1);
+}
+
+/**
+ * Rewrite the parameters of every kernel in a source file (see rewriteParameter()).  Preprocessor
+ * directives inside a parameter list are copied into the prologue as well, so each copy statement
+ * is compiled exactly when the parameter it reads is.
+ */
+static string rewriteKernelSignatures(const string& source) {
+    string result;
+    size_t pos = 0;
+    size_t kernelStart;
+    while ((kernelStart = min(findWord(source, "KERNEL", pos), findWord(source, "__global__", pos))) != string::npos) {
+        size_t open = source.find('(', findWord(source, "void", kernelStart));
+        if (open == string::npos)
+            break;
+        result += source.substr(pos, open+1-pos);
+        string prologue, param;
+        size_t i = open+1;
+        int depth = 0;
+        for (; i < source.size(); i++) {
+            char c = source[i];
+            if (c == '#') {
+                size_t end = source.find('\n', i);
+                string directive = source.substr(i, end-i);
+                result += rewriteParameter(param, prologue)+directive;
+                prologue += directive+"\n";
+                param.clear();
+                i = end-1;
+            }
+            else if (c == '(') {
+                depth++;
+                param += c;
+            }
+            else if (c == ')' && depth > 0) {
+                depth--;
+                param += c;
+            }
+            else if (c == ')' || (c == ',' && depth == 0)) {
+                result += rewriteParameter(param, prologue)+c;
+                param.clear();
+                if (c == ')')
+                    break;
+            }
+            else
+                param += c;
+        }
+        size_t brace = source.find('{', i);
+        if (brace == string::npos)
+            throw OpenMMException("Error parsing kernel signature: "+source.substr(kernelStart, open-kernelStart));
+        result += source.substr(i+1, brace+1-(i+1))+"\n"+prologue;
+        pos = brace+1;
+    }
+    result += source.substr(pos);
+    return result;
+}
 
 MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
         useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false) {
-    if (!hasInitializedMetal) {
-        CHECK_RESULT2(metalInit(0), "Error initializing METAL");
-        hasInitializedMetal = true;
-    }
     if (precision == "single") {
         useDoublePrecision = false;
         useMixedPrecision = false;
@@ -107,118 +223,47 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     }
     else
         throw OpenMMException("Illegal value for Precision: "+precision);
-    char* cacheVariable = getenv("OPENMM_CACHE_DIR");
-    cacheDir = (cacheVariable == NULL ? tempDir : string(cacheVariable));
+    if (useDoublePrecision || useMixedPrecision)
+        throw OpenMMException("This device does not support double precision");
 #ifdef WIN32
     this->tempDir = tempDir+"\\";
-    cacheDir = cacheDir+"\\";
 #else
     this->tempDir = tempDir+"/";
-    cacheDir = cacheDir+"/";
 #endif
     contextIndex = platformData.contexts.size();
-    string errorMessage = "Error initializing Context";
     if (originalContext == NULL) {
-        isLinkedContext = false;
-        int numDevices;
-        CHECK_RESULT(metalGetDeviceCount(&numDevices));
+        // A Mac has one GPU.  MTL::CopyAllDevices() would return NULL here, because metal-cpp
+        // compiles it out below a 10.11 deployment target and OpenMM defaults to 10.7.
+
+        device = MTL::CreateSystemDefaultDevice();
+        int numDevices = (device == NULL ? 0 : 1);
         if (deviceIndex < -1 || deviceIndex >= numDevices)
             throw OpenMMException("Illegal value for DeviceIndex: "+intToString(deviceIndex));
-
-        vector<int> devicePrecedence;
-        if (deviceIndex == -1) {
-            devicePrecedence = getDevicePrecedence();
-        } else {
-            devicePrecedence.push_back(deviceIndex);
-        }
-
-        this->deviceIndex = -1;
-        for (int i = 0; i < static_cast<int>(devicePrecedence.size()); i++) {
-            int trialDeviceIndex = devicePrecedence[i];
-            CHECK_RESULT(metalDeviceGet(&device, trialDeviceIndex));
-            // try setting device
-            if (metalSetDevice(device) == metalSuccess) {
-                this->deviceIndex = trialDeviceIndex;
-                break;
-            }
-
-        }
-        if (this->deviceIndex == -1) {
-            if (deviceIndex != -1)
-                throw OpenMMException("The requested METAL device could not be loaded");
-            else
-                throw OpenMMException("No compatible METAL device is available");
-        }
-        defaultQueue = shared_ptr<ComputeQueueImpl>(new MetalQueue());
+        this->deviceIndex = 0;
+        defaultQueue = shared_ptr<ComputeQueueImpl>(new MetalQueue(device));
     }
     else {
-        isLinkedContext = true;
         this->deviceIndex = originalContext->deviceIndex;
-        this->device = originalContext->device;
+        this->device = originalContext->device->retain();
         defaultQueue = originalContext->defaultQueue;
     }
     currentQueue = defaultQueue;
 
-    metalDeviceProp_t props;
-    CHECK_RESULT(metalGetDeviceProperties(&props, device));
-
     // set device properties
-    this->simdWidth = props.warpSize;
-    this->sharedMemPerBlock = props.sharedMemPerBlock;
+    this->simdWidth = 32;
+    this->sharedMemPerBlock = device->maxThreadgroupMemoryLength();
 
-    gpuArchitecture = props.gcnArchName;
     // METAL-TODO: find a good value here
     int numThreadBlocksPerComputeUnit = 6;
 
-    // GPUs starting from CDNA1 and RDNA3 support atomic add for floats (global_atomic_add_f32),
-    // which can be used in PME. Older GPUs use fixed point charge spreading instead.
-    // RDNA4 also has this instruction but benchmarks show that it is very slow compared to
-    // global_atomic_add_u64.
-    this->supportsHardwareFloatGlobalAtomicAdd = false;
-    if (gpuArchitecture.find("gfx908") == 0 ||
-        gpuArchitecture.find("gfx90a") == 0 ||
-        gpuArchitecture.find("gfx94") == 0 ||
-        gpuArchitecture.find("gfx11") == 0) {
-        this->supportsHardwareFloatGlobalAtomicAdd = true;
-    }
-
-    hostMallocFlags = metalHostMallocDefault;
-#if !defined(WIN32)
-    // metalHostMallocNumaUser may not be allowed in some conditions, for example, if docker container
-    // is created without --security-opt seccomp=unconfined or --cap-add=SYS_NICE
-    int* tmpHostBuffer;
-    if(metalHostMalloc(&tmpHostBuffer, sizeof(*tmpHostBuffer), metalHostMallocNumaUser) == metalSuccess) {
-        CHECK_RESULT(metalHostFree(tmpHostBuffer));
-        hostMallocFlags = metalHostMallocNumaUser;
-    }
-#endif
-
     contextIsValid = true;
     ContextSelector selector(*this);
-    if (contextIndex > 0 && originalContext == NULL) {
-        int canAccess;
-        CHECK_RESULT(metalDeviceCanAccessPeer(&canAccess, getDevice(), platformData.contexts[0]->getDevice()));
-        if (canAccess) {
-            {
-                ContextSelector selector2(*platformData.contexts[0]);
-                metalError_t result = metalDeviceEnablePeerAccess(getDevice(), 0);
-                if (result != metalErrorPeerAccessAlreadyEnabled) {
-                    CHECK_RESULT(result);
-                }
-            }
-            metalError_t result = metalDeviceEnablePeerAccess(platformData.contexts[0]->getDevice(), 0);
-            if (result != metalErrorPeerAccessAlreadyEnabled) {
-                CHECK_RESULT(result);
-            }
-        }
-    }
     numAtoms = system.getNumParticles();
     paddedNumAtoms = TileSize*((numAtoms+TileSize-1)/TileSize);
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
-    CHECK_RESULT(metalDeviceGetAttribute(&multiprocessors, metalDeviceAttributeMultiprocessorCount, device));
-    // For RDNA GPUs metalDeviceAttributeMultiprocessorCount means WGP (work-group processors, two compute units), not CUs.
-    if (simdWidth == 32)
-        multiprocessors *= 2;
+    multiprocessors = getGpuCoreCount();
+    if (multiprocessors == 0)
+        multiprocessors = 8; // The smallest Apple GPU with Metal 3.1 support has 7 or 8 cores.
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_METAL"] = "1";
@@ -253,11 +298,11 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
 
     // Set defines based on the requested precision.
 
-    compilationDefines["SQRT"] = useDoublePrecision ? "sqrt" : "__fsqrt_rn";
-    compilationDefines["RSQRT"] = useDoublePrecision ? "rsqrt" : "__frsqrt_rn";
+    compilationDefines["SQRT"] = "sqrt";
+    compilationDefines["RSQRT"] = "rsqrt";
     compilationDefines["RECIP(x)"] = useDoublePrecision ? "(1.0/(x))" : "(1.0f/(x))";
-    compilationDefines["EXP"] = useDoublePrecision ? "exp" : "__expf";
-    compilationDefines["LOG"] = useDoublePrecision ? "log" : "__logf";
+    compilationDefines["EXP"] = "exp";
+    compilationDefines["LOG"] = "log";
     compilationDefines["POW"] = useDoublePrecision ? "pow" : "powf";
     compilationDefines["COS"] = useDoublePrecision ? "cos" : "cosf";
     compilationDefines["SIN"] = useDoublePrecision ? "sin" : "sinf";
@@ -354,7 +399,7 @@ MetalContext::~MetalContext() {
     for (auto computation : postComputations)
         delete computation;
     if (pinnedBuffer != NULL)
-        metalHostFree(pinnedBuffer);
+        free(pinnedBuffer);
     if (integration != NULL)
         delete integration;
     if (expression != NULL)
@@ -364,32 +409,34 @@ MetalContext::~MetalContext() {
     if (nonbonded != NULL)
         delete nonbonded;
     for (auto module : loadedModules)
-        metalModuleUnload(module);
+        module->release();
+    for (auto& kernel : kernelArgumentSizes)
+        kernel.first->release();
     popAsCurrent();
     contextIsValid = false;
+    device->release();
 }
 
 void MetalContext::initialize() {
     ContextSelector selector(*this);
-    string errorMessage = "Error initializing Context";
     int numEnergyBuffers = max(numThreadBlocks*ThreadBlockSize, nonbonded->getNumEnergyBuffers());
     if (useDoublePrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<double>(*this, multiprocessors, "energySum");
         int pinnedBufferSize = max(paddedNumAtoms*4, numEnergyBuffers);
-        CHECK_RESULT(metalHostMalloc(&pinnedBuffer, pinnedBufferSize*sizeof(double), getHostMallocFlags()));
+        pinnedBuffer = malloc(pinnedBufferSize*sizeof(double));
     }
     else if (useMixedPrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<double>(*this, multiprocessors, "energySum");
         int pinnedBufferSize = max(paddedNumAtoms*4, numEnergyBuffers);
-        CHECK_RESULT(metalHostMalloc(&pinnedBuffer, pinnedBufferSize*sizeof(double), getHostMallocFlags()));
+        pinnedBuffer = malloc(pinnedBufferSize*sizeof(double));
     }
     else {
         energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<float>(*this, multiprocessors, "energySum");
         int pinnedBufferSize = max(paddedNumAtoms*6, numEnergyBuffers);
-        CHECK_RESULT(metalHostMalloc(&pinnedBuffer, pinnedBufferSize*sizeof(float), getHostMallocFlags()));
+        pinnedBuffer = malloc(pinnedBufferSize*sizeof(float));
     }
     for (int i = 0; i < numAtoms; i++) {
         double mass = system.getParticleMass(i);
@@ -419,33 +466,12 @@ void MetalContext::initializeContexts() {
 }
 
 void MetalContext::setAsCurrent() {
-    if (contextIsValid)
-        metalSetDevice(device);
 }
 
-thread_local std::stack<metalDevice_t> outerScopeDevices;
-
 void MetalContext::pushAsCurrent() {
-    if (contextIsValid) {
-        // Emulate cuCtxPushCurrent's behavior because metalCtxPushCurrent is deprecated
-        metalDevice_t outerScopeDevice;
-        metalGetDevice(&outerScopeDevice);
-        outerScopeDevices.push(outerScopeDevice);
-        if (device != outerScopeDevice) {
-            metalSetDevice(device);
-        }
-    }
 }
 
 void MetalContext::popAsCurrent() {
-    if (contextIsValid) {
-        // Emulate cuCtxPopCurrent's behavior because metalCtxPopCurrent is deprecated
-        metalDevice_t outerScopeDevice = outerScopeDevices.top();
-        outerScopeDevices.pop();
-        if (outerScopeDevice != device) {
-            metalSetDevice(outerScopeDevice);
-        }
-    }
 }
 
 string MetalContext::getTempFileName() const {
@@ -456,25 +482,6 @@ string MetalContext::getTempFileName() const {
     return tempFileName.str();
 }
 
-string MetalContext::getHash(const string& src) const {
-    CSHA1 sha1;
-    sha1.Update((const UINT_8*) src.c_str(), src.size());
-    sha1.Final();
-    UINT_8 hash[20];
-    sha1.GetHash(hash);
-    stringstream cacheHash;
-    cacheHash.flags(ios::hex);
-    for (int i = 0; i < 20; i++)
-        cacheHash << setw(2) << setfill('0') << (int) hash[i];
-    return cacheHash.str();
-}
-
-string MetalContext::getCacheFileName(const string& src) const {
-    stringstream cacheFile;
-    cacheFile << cacheDir << "openmm-metal-" << getHash(src + gpuArchitecture);
-    return cacheFile.str();
-}
-
 metalModule_t MetalContext::createModule(const string source) {
     return createModule(source, map<string, string>());
 }
@@ -483,30 +490,7 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     const char* saveTempsEnv = getenv("OPENMM_SAVE_TEMPS");
     const bool saveTemps = saveTempsEnv != nullptr && string(saveTempsEnv) == "1";
 
-    int runtimeVersion;
-    CHECK_RESULT2(metalRuntimeGetVersion(&runtimeVersion), "Error getting METAL runtime version");
-
-    string options = "-O3 -ffast-math -munsafe-fp-atomics -Wall -Wno-metal-only";
-    options += " --offload-arch=" + gpuArchitecture;
-    if (gpuArchitecture.find("gfx90a") == 0 ||
-        gpuArchitecture.find("gfx94") == 0) {
-        // METAL-TODO: Remove it when the compiler does a better job
-        // Disable SLP vectorization as it may generate unoptimal packed math instructions on
-        // >=MI200 (gfx90a, gfx942): more v_mov, higher register usage etc.
-        options += " -fno-slp-vectorize";
-    }
-    if (getMaxThreadBlockSize() < 1024) {
-        options += " --gpu-max-threads-per-block=" + std::to_string(getMaxThreadBlockSize());
-    }
-    if (runtimeVersion < 60140092) {
-        // Workaround for operator* defined for complex types (typedefs for float2, double2) in
-        // ROCm 6.0 headers. This issue has been fixed in 6.1. metalRTC includes amd_hip_complex.h
-        // by default, we fool the include guard into thinking the header is already included.
-        options += " -D METAL_INCLUDE_METAL_AMD_DETAIL_METAL_COMPLEX_H";
-    }
     stringstream src;
-    src << "// Compilation Options: " << options << endl << endl;
-    src << "// METAL Runtime Version: " << runtimeVersion << endl << endl;
     for (auto& pair : compilationDefines) {
         // Query defines to avoid duplicate variables
         if (defines.find(pair.first) == defines.end()) {
@@ -518,7 +502,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     }
     if (!compilationDefines.empty())
         src << endl;
-
+    src << "#include <metal_stdlib>\n";
+    src << "using namespace metal;\n";
     if (useDoublePrecision) {
         src << "typedef double real;\n";
         src << "typedef double2 real2;\n";
@@ -545,124 +530,85 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     }
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
+    // Common kernels use "thread" as a variable name, but in MSL it is an address space.
     for (auto& pair : defines) {
         src << "#define " << pair.first;
         if (!pair.second.empty())
-            src << " " << pair.second;
+            src << " " << replaceWord(pair.second, "thread", "_mmThread");
         src << endl;
     }
     if (!defines.empty())
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
-    src << source << endl;
-
-    // See whether we already have PTX for this kernel cached.
-
-    string cacheFile = getCacheFileName(src.str());
-    metalModule_t module;
-    if (metalModuleLoad(&module, cacheFile.c_str()) == metalSuccess) {
-        loadedModules.push_back(module);
-        return module;
-    }
-    else {
-        // Need to call metalGetLastError to clear the error code
-        metalError_t last_error = metalGetLastError();
-        if (last_error != metalErrorFileNotFound) {
-            std::ostringstream msg;
-            msg << "Detected METAL error: " << metalGetErrorString(last_error)
-                << "(" << last_error << ") at " << __FILE__ << ":" << __LINE__;
-            throw OpenMMException(msg.str());
-        }
-    }
+    src << rewriteKernelSignatures(replaceWord(source, "thread", "_mmThread")) << endl;
 
     // Select names for the various temporary files.
 
     if (saveTemps) {
-        stringstream tempFileName;
-        const char* saveTempsPrefixEnv = getenv("OPENMM_SAVE_TEMPS_PREFIX");
-        if (saveTempsPrefixEnv) {
-            tempFileName << saveTempsPrefixEnv;
-        }
-        tempFileName << getHash(src.str());
-
-        options += " --save-temps";
-
-        string inputFile = (tempFileName.str()+".metal");
+        string inputFile = getTempFileName()+"_"+to_string(hash<string>()(src.str()))+".metal";
         std::cout << "Source code: " << inputFile << std::endl;
-        std::cout << "Compile options: " << options << std::endl;
         ofstream out(inputFile.c_str());
         out << src.str();
         out.close();
     }
 
-    // Split the command line options into an array of options.
+    // Compile the program.  Autoreleased objects must not outlive the pool, so no exception may
+    // be thrown until it is released.
 
-    stringstream flagsStream(options);
-    string flag;
-    vector<string> splitFlags;
-    while (flagsStream >> flag)
-        splitFlags.push_back(flag);
-    int numOptions = splitFlags.size();
-    vector<const char*> optionsVec(numOptions);
-    for (int i = 0; i < numOptions; i++)
-        optionsVec[i] = &splitFlags[i][0];
-
-    // Compile the program to CO.
-
-    metalrtcProgram program;
-    METALRTC_CHECK_RESULT(metalrtcCreateProgram(&program, src.str().c_str(), NULL, 0, NULL, NULL), "Error creating program");
-    try {
-        metalrtcResult result = metalrtcCompileProgram(program, optionsVec.size(), &optionsVec[0]);
-        if (result != METALRTC_SUCCESS || saveTemps) {
-            size_t logSize;
-            metalrtcGetProgramLogSize(program, &logSize);
-            std::string log(logSize, '\0');
-            if (logSize > 0) {
-                metalrtcGetProgramLog(program, &log[0]);
-                if (saveTemps) {
-                    std::cout << "Log: " << log << std::endl;
-                }
-            }
-            if (result != METALRTC_SUCCESS) {
-                throw OpenMMException("Error compiling program: "+log);
-            }
-        }
-        size_t codeSize;
-        metalrtcGetCodeSize(program, &codeSize);
-        vector<char> code(codeSize);
-        metalrtcGetCode(program, &code[0]);
-        metalrtcDestroyProgram(&program);
-
-        // If possible, write the CO out to a cache file for later use.
-
-        try {
-            ofstream out(cacheFile.c_str(), ios::out | ios::binary);
-            out.write(&code[0], code.size());
-            out.close();
-        }
-        catch (...) {
-            // An error occurred.  Possibly we don't have permission to write to the temp directory.
-            // Ignore.
-        }
-        CHECK_RESULT2(metalModuleLoadDataEx(&module, &code[0], 0, NULL, NULL), "Error loading METAL module");
-        loadedModules.push_back(module);
-        return module;
-    }
-    catch (...) {
-        metalrtcDestroyProgram(&program);
-        throw;
-    }
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
+    options->setLanguageVersion(MTL::LanguageVersion3_2);
+    options->setMathMode(MTL::MathModeSafe);
+    options->setMathFloatingPointFunctions(MTL::MathFloatingPointFunctionsPrecise);
+    NS::Error* error = NULL;
+    metalModule_t module = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
+    options->release();
+    string log;
+    if (module == NULL && error != NULL)
+        log = error->localizedDescription()->utf8String();
+    pool->release();
+    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
+        throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
+    if (module == NULL)
+        throw OpenMMException("Error compiling program: "+log);
+    loadedModules.push_back(module);
+    return module;
 }
 
-metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& name) {
-    metalFunction_t function;
-    metalError_t result = metalModuleGetFunction(&function, module, name.c_str());
-    if (result != metalSuccess) {
-        std::stringstream m;
-        m<<"Error creating kernel "<<name<<": "<<getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(m.str());
+metalFunction_t MetalContext::getKernel(metalModule_t module, const string& name) {
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::Function* function = module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+    metalFunction_t kernel = NULL;
+    MTL::ComputePipelineReflection* reflection = NULL;
+    string log = "no kernel with this name";
+    if (function != NULL) {
+        NS::Error* error = NULL;
+        kernel = device->newComputePipelineState(function, MTL::PipelineOptionBindingInfo, &reflection, &error);
+        function->release();
+        if (kernel == NULL && error != NULL)
+            log = error->localizedDescription()->utf8String();
     }
-    return function;
+
+    // Record which arguments are passed by value (see rewriteParameter()), and their sizes.
+
+    vector<int> sizes;
+    for (int i = 0; kernel != NULL && i < reflection->bindings()->count(); i++) {
+        MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
+        if (binding->type() != MTL::BindingTypeBuffer)
+            continue;
+        sizes.resize(max((int) sizes.size(), (int) binding->index()+1), 0);
+        if (string(binding->name()->utf8String()).rfind("_in_", 0) == 0)
+            sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
+    }
+    pool->release();
+    if (kernel == NULL)
+        throw OpenMMException("Error creating kernel "+name+": "+log);
+    if (kernel->threadExecutionWidth() != getSIMDWidth()) {
+        kernel->release();
+        throw OpenMMException("Error creating kernel "+name+": the kernels require a SIMD width of "+intToString(getSIMDWidth()));
+    }
+    kernelArgumentSizes[kernel] = sizes;
+    return kernel;
 }
 
 vector<ComputeContext*> MetalContext::getAllContexts() {
@@ -677,11 +623,11 @@ double& MetalContext::getEnergyWorkspace() {
 }
 
 ComputeQueue MetalContext::createQueue() {
-    return shared_ptr<ComputeQueueImpl>(new MetalQueue());
+    return shared_ptr<ComputeQueueImpl>(new MetalQueue(device));
 }
 
-metalStream_t MetalContext::getCurrentStream() {
-    return dynamic_cast<MetalQueue*>(currentQueue.get())->getStream();
+MetalQueue& MetalContext::getCurrentStream() {
+    return *dynamic_cast<MetalQueue*>(currentQueue.get());
 }
 
 MetalArray* MetalContext::createArray() {
@@ -721,32 +667,35 @@ MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
     return *cuarray;
 }
 
-std::string MetalContext::getErrorString(metalError_t result) {
-    return string(metalGetErrorName(result));
-}
-
 void MetalContext::executeKernel(metalFunction_t kernel, void** arguments, int threads, int blockSize, unsigned int sharedSize) {
     if (blockSize == -1)
         blockSize = ThreadBlockSize;
     int gridSize = std::min((threads+blockSize-1)/blockSize, numThreadBlocks);
-    metalError_t result = metalModuleLaunchKernel(kernel, gridSize, 1, 1, blockSize, 1, 1, sharedSize, getCurrentStream(), arguments, NULL);
-    if (result != metalSuccess) {
-        stringstream str;
-        str<<"Error invoking kernel: "<<getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    launchKernel(kernel, arguments, gridSize, blockSize, sharedSize);
 }
 
 void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize, unsigned int sharedSize) {
     if (blockSize == -1)
         blockSize = ThreadBlockSize;
     int gridSize = (threads+blockSize-1)/blockSize;
-    metalError_t result = metalModuleLaunchKernel(kernel, gridSize, 1, 1, blockSize, 1, 1, sharedSize, getCurrentStream(), arguments, NULL);
-    if (result != metalSuccess) {
-        stringstream str;
-        str<<"Error invoking kernel: "<<getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
+    launchKernel(kernel, arguments, gridSize, blockSize, sharedSize);
+}
+
+void MetalContext::launchKernel(metalFunction_t kernel, void** arguments, int gridSize, int blockSize, unsigned int sharedSize) {
+    MetalQueue& queue = getCurrentStream();
+    lock_guard<recursive_mutex> guard(queue.getLock());
+    MTL::ComputeCommandEncoder* encoder = queue.getEncoder();
+    encoder->setComputePipelineState(kernel);
+    const vector<int>& sizes = kernelArgumentSizes[kernel];
+    for (int i = 0; i < sizes.size(); i++) {
+        if (sizes[i] == 0)
+            encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, i);
+        else
+            encoder->setBytes(arguments[i], sizes[i], i);
     }
+    if (sharedSize > 0)
+        encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
+    encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
 }
 
 int MetalContext::computeThreadBlockSize(double memory) const {
@@ -782,42 +731,5 @@ double MetalContext::reduceEnergy() {
 }
 
 void MetalContext::flushQueue() {
-    metalStreamSynchronize(getCurrentStream());
-}
-
-vector<int> MetalContext::getDevicePrecedence() {
-    int numDevices;
-    metalDeviceProp_t thisDevice;
-    string errorMessage = "Error initializing Context";
-    vector<pair<int, int> > devices;
-
-    CHECK_RESULT(metalGetDeviceCount(&numDevices));
-    for (int i = 0; i < numDevices; i++) {
-        CHECK_RESULT(metalGetDeviceProperties(&thisDevice, i));
-        int clock, multiprocessors, speed;
-        clock = thisDevice.clockRate;
-        multiprocessors = thisDevice.multiProcessorCount;
-        speed = clock*multiprocessors;
-        devices.push_back(std::make_pair(speed, -i));
-    }
-
-    // sort first by speed (higher is better), and finally device index (lower is better)
-    std::sort(devices.begin(), devices.end());
-    std::reverse(devices.begin(), devices.end());
-
-    vector<int> precedence;
-    for (int i = 0; i < static_cast<int>(devices.size()); i++) {
-        precedence.push_back(-devices[i].second);
-    }
-
-    return precedence;
-}
-
-unsigned int MetalContext::getEventFlags() {
-    unsigned int flags = metalEventDisableTiming;
-    return flags;
-}
-
-unsigned int MetalContext::getHostMallocFlags() {
-    return hostMallocFlags;
+    getCurrentStream().commit();
 }

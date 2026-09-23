@@ -40,11 +40,7 @@ string MetalKernel::getName() const {
 }
 
 int MetalKernel::getMaxBlockSize() const {
-    int size;
-    metalError_t result = metalFuncGetAttribute(&size, METAL_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, kernel);
-    if (result != metalSuccess)
-        throw OpenMMException("Error querying max thread block size: "+context.getErrorString(result));
-    return size;
+    return kernel->maxTotalThreadsPerThreadgroup();
 }
 
 void MetalKernel::execute(int threads, int blockSize) {

@@ -47,13 +47,6 @@
 using namespace OpenMM;
 using namespace std;
 
-#define CHECK_RESULT(result, prefix) \
-    if (result != metalSuccess) { \
-        std::stringstream m; \
-        m<<prefix<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")"<<" at "<<__FILE__<<":"<<__LINE__; \
-        throw OpenMMException(m.str());\
-    }
-
 static void getMetalPmeParameters(MetalContext& cu, bool& usePmeQueue, bool& useFixedPointChargeSpreading) {
     usePmeQueue = (!cu.getPlatformData().disablePmeStream && !cu.getPlatformData().useCpuPme);
     useFixedPointChargeSpreading = cu.getUseDoublePrecision() || !cu.getSupportsHardwareFloatGlobalAtomicAdd() || cu.getPlatformData().deterministicForces;
@@ -85,6 +78,10 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
+
+    // Submit the force computation so the GPU works on it while the integrator's kernels are encoded.
+
+    cu.getCurrentStream().commit();
     if (includeEnergy)
         sum += cu.reduceEnergy();
     if (!cu.getForcesValid())

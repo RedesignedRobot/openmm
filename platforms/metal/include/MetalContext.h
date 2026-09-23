@@ -27,15 +27,6 @@
  * -------------------------------------------------------------------------- */
 
 
-/*
- * Porting notes:
-  - Metal only marginally supports the CUDA context API, and will remove
-    support eventually.  To my knowledge, contexts don't really buy you anything
-    that streams / metalSetDevice don't.  Hence, for this implementation, we are doing
-    away entirely with the context usage.
- */
-
-
 #include <map>
 #include <string>
 #include <utility>
@@ -44,7 +35,7 @@
     // Prevent Windows from defining macros that interfere with other code.
     #define NOMINMAX
 #endif
-#include <metal/metal_runtime.h>
+#include <Metal/Metal.hpp>
 #include "openmm/common/windowsExportCommon.h"
 #include "MetalArray.h"
 #include "MetalBondedUtilities.h"
@@ -59,6 +50,17 @@
 typedef unsigned int tileflags;
 
 namespace OpenMM {
+
+class MetalQueue;
+
+// The host code uses the vector types that the HIP and CUDA runtime headers provide.
+typedef mm_int2 int2;
+typedef mm_float4 float4;
+typedef mm_double4 double4;
+typedef unsigned int uint1;
+inline int2 make_int2(int x, int y) { return int2(x, y); }
+inline float4 make_float4(float x, float y, float z, float w) { return float4(x, y, z, w); }
+inline double4 make_double4(double x, double y, double z, double w) { return double4(x, y, z, w); }
 
 /**
  * This class contains the information associated with a Context by the METAL Platform.  Each MetalContext is
@@ -110,19 +112,13 @@ public:
      */
     void popAsCurrent();
     /**
-     * Get the metalDevice_t associated with this object.
+     * Get the MTL::Device associated with this object.
      */
-    metalDevice_t getDevice() {
+    MTL::Device* getDevice() {
         return device;
     }
     /**
-     * Get the compute capability of the device associated with this object.
-     */
-    double getComputeCapability() const {
-        return computeCapability;
-    }
-    /**
-     * Get the index of the metalDevice_t associated with this object.
+     * Get the index of the MTL::Device associated with this object.
      */
     int getDeviceIndex() const {
         return deviceIndex;
@@ -171,7 +167,7 @@ public:
     /**
      * Get the stream currently being used for execution.
      */
-    metalStream_t getCurrentStream();
+    MetalQueue& getCurrentStream();
     /**
      * Construct an uninitialized array of the appropriate class for this platform.  The returned
      * value should be created on the heap with the "new" operator.
@@ -268,14 +264,6 @@ public:
      */
     std::string getTempFileName() const;
     /**
-     * Get src hash.
-     */
-    std::string getHash(const std::string& src) const;
-    /**
-     * Get a filename in cacheDir based on src hash.
-     */
-    std::string getCacheFileName(const std::string& src) const;
-    /**
      * Create a METAL module from source code.
      *
      * @param source             the source code of the module
@@ -294,7 +282,7 @@ public:
      * @param module    the module to get the kernel from
      * @param name      the name of the kernel to get
      */
-    metalFunction_t getKernel(metalModule_t& module, const std::string& name);
+    metalFunction_t getKernel(metalModule_t module, const std::string& name);
     /**
      * Execute a kernel.
      *
@@ -355,7 +343,7 @@ public:
      * Get whether the device being used supports 64 bit atomic operations on global memory.
      */
     bool getSupports64BitGlobalAtomics() const {
-        return true;
+        return false;
     }
     /**
      * Get whether the device being used supports 32 bit floating point atomic operations
@@ -368,12 +356,8 @@ public:
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
-        return true;
+        return false;
     }
-    /**
-     * Convert a METAL result code to the corresponding string description.
-     */
-    static std::string getErrorString(metalError_t result);
     /**
      * Get the vectors defining the periodic box.
      */
@@ -489,21 +473,8 @@ public:
      * expense of reduced simulation performance.
      */
     void flushQueue();
-    /**
-     * Get the flags that should be used when creating metalEvent_t objects.
-     */
-    unsigned int getEventFlags();
-    /**
-     * Get the flags that should be used when allocating pinned host memory.
-     */
-    unsigned int getHostMallocFlags();
 private:
-    /**
-     * Compute a sorted list of device indices in decreasing order of desirability
-     */
-    std::vector<int> getDevicePrecedence();
-    static bool hasInitializedMetal;
-    double computeCapability;
+    void launchKernel(metalFunction_t kernel, void** arguments, int gridSize, int blockSize, unsigned int sharedSize);
     MetalPlatform::PlatformData& platformData;
     int deviceIndex;
     int contextIndex;
@@ -511,15 +482,14 @@ private:
     int multiprocessors;
     int sharedMemPerBlock;
     bool supportsHardwareFloatGlobalAtomicAdd;
-    unsigned int hostMallocFlags;
     bool useBlockingSync, contextIsValid;
-    bool isLinkedContext;
-    std::string tempDir, cacheDir, gpuArchitecture;
+    std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
     std::map<std::string, std::string> compilationDefines;
     std::vector<metalModule_t> loadedModules;
-    metalDevice_t device;
+    std::map<metalFunction_t, std::vector<int> > kernelArgumentSizes;
+    MTL::Device* device;
     void* pinnedBuffer;
     MetalArray energyBuffer;
     MetalIntegrationUtilities* integration;

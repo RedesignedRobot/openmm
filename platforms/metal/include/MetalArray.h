@@ -29,10 +29,14 @@
 #include "openmm/OpenMMException.h"
 #include "openmm/common/windowsExportCommon.h"
 #include "openmm/common/ArrayInterface.h"
-#include <metal/metal_runtime.h>
+#include <Metal/Metal.hpp>
 #include <iostream>
 #include <sstream>
 #include <vector>
+
+// Names for Metal's program and kernel handles, like the ones the HIP runtime defines.
+typedef MTL::Library* metalModule_t;
+typedef MTL::ComputePipelineState* metalFunction_t;
 
 namespace OpenMM {
 
@@ -127,7 +131,7 @@ public:
     /**
      * Get a pointer to the device memory.
      */
-    metalDeviceptr_t& getDevicePointer() {
+    MTL::Buffer*& getDevicePointer() {
         return pointer;
     }
     /**
@@ -180,7 +184,7 @@ public:
     void copyTo(ArrayInterface& dest) const;
 private:
     MetalContext* context;
-    metalDeviceptr_t pointer;
+    MTL::Buffer* pointer;
     size_t size;
     int elementSize;
     bool ownsMemory;

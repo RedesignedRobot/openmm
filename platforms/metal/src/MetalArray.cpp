@@ -25,7 +25,9 @@
 
 #include "MetalArray.h"
 #include "MetalContext.h"
+#include "MetalQueue.h"
 #include "openmm/common/ContextSelector.h"
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -40,15 +42,8 @@ MetalArray::MetalArray(MetalContext& context, size_t size, int elementSize, cons
 }
 
 MetalArray::~MetalArray() {
-    if (pointer != 0 && ownsMemory) {
-        ContextSelector selector(*context);
-        metalError_t result = metalFree(pointer);
-        if (result != metalSuccess) {
-            std::stringstream str;
-            str<<"Error deleting array "<<name<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-            throw OpenMMException(str.str());
-        }
-    }
+    if (pointer != 0 && ownsMemory)
+        pointer->release();
 }
 
 void MetalArray::initialize(ComputeContext& context, size_t size, int elementSize, const std::string& name) {
@@ -59,13 +54,10 @@ void MetalArray::initialize(ComputeContext& context, size_t size, int elementSiz
     this->elementSize = elementSize;
     this->name = name;
     ownsMemory = true;
-    ContextSelector selector(*this->context);
-    metalError_t result = metalMalloc(&pointer, size*elementSize);
-    if (result != metalSuccess) {
-        std::stringstream str;
-        str<<"Error creating array "<<name<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    // Metal cannot create empty buffers.
+    pointer = this->context->getDevice()->newBuffer(std::max(size*elementSize, (size_t) 16), MTL::ResourceStorageModeShared);
+    if (pointer == 0)
+        throw OpenMMException("Error creating array "+name);
 }
 
 void MetalArray::resize(size_t size) {
@@ -73,13 +65,7 @@ void MetalArray::resize(size_t size) {
         throw OpenMMException("MetalArray has not been initialized");
     if (!ownsMemory)
         throw OpenMMException("Cannot resize an array that does not own its storage");
-    ContextSelector selector(*context);
-    metalError_t result = metalFree(pointer);
-    if (result != metalSuccess) {
-        std::stringstream str;
-        str<<"Error deleting array "<<name<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    pointer->release();
     pointer = 0;
     initialize(*context, size, elementSize, name);
 }
@@ -93,29 +79,15 @@ void MetalArray::uploadSubArray(const void* data, int offset, int elements, bool
         throw OpenMMException("MetalArray has not been initialized");
     if (offset < 0 || offset+elements > getSize())
         throw OpenMMException("uploadSubArray: data exceeds range of array");
-    metalError_t result;
-    result = metalMemcpyAsync(reinterpret_cast<char*>(pointer)+offset*elementSize, const_cast<void*>(data), elements*elementSize, metalMemcpyHostToDevice, context->getCurrentStream());
-    if (blocking && result == metalSuccess)
-        result = metalStreamSynchronize(context->getCurrentStream());
-    if (result != metalSuccess) {
-        std::stringstream str;
-        str<<"Error uploading array "<<name<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    context->getCurrentStream().finish();
+    memcpy(reinterpret_cast<char*>(pointer->contents())+offset*elementSize, data, elements*elementSize);
 }
 
 void MetalArray::download(void* data, bool blocking) const {
     if (pointer == 0)
         throw OpenMMException("MetalArray has not been initialized");
-    metalError_t result;
-    result = metalMemcpyAsync(data, pointer, size*elementSize, metalMemcpyDeviceToHost, context->getCurrentStream());
-    if (blocking && result == metalSuccess)
-        result = metalStreamSynchronize(context->getCurrentStream());
-    if (result != metalSuccess) {
-        std::stringstream str;
-        str<<"Error downloading array "<<name<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    context->getCurrentStream().finish();
+    memcpy(data, pointer->contents(), size*elementSize);
 }
 
 void MetalArray::copyTo(ArrayInterface& dest) const {
@@ -124,10 +96,11 @@ void MetalArray::copyTo(ArrayInterface& dest) const {
     if (dest.getSize() != size || dest.getElementSize() != elementSize)
         throw OpenMMException("Error copying array "+name+" to "+dest.getName()+": The destination array does not match the size of the array");
     MetalArray& cuDest = context->unwrap(dest);
-    metalError_t result = metalMemcpyAsync(cuDest.getDevicePointer(), pointer, size*elementSize, metalMemcpyDeviceToDevice, context->getCurrentStream());
-    if (result != metalSuccess) {
-        std::stringstream str;
-        str<<"Error copying array "<<name<<" to "<<dest.getName()<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")";
-        throw OpenMMException(str.str());
-    }
+    MetalQueue& queue = context->getCurrentStream();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::BlitCommandEncoder* blit = queue.getCommandBuffer()->blitCommandEncoder();
+    blit->copyFromBuffer(pointer, 0, cuDest.getDevicePointer(), 0, size*elementSize);
+    blit->endEncoding();
+    pool->release();
 }

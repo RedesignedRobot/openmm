@@ -44,7 +44,7 @@ public:
     class PlatformData;
     MetalPlatform();
     const std::string& getName() const {
-        static const std::string name = "METAL";
+        static const std::string name = "Metal";
         return name;
     }
     double getSpeed() const;
@@ -124,7 +124,7 @@ public:
     ContextImpl* context;
     std::vector<MetalContext*> contexts;
     std::vector<double> contextEnergy;
-    bool hasInitializedContexts, removeCM, peerAccessSupported, useCpuPme, disablePmeStream, deterministicForces;
+    bool hasInitializedContexts, removeCM, useCpuPme, disablePmeStream, deterministicForces;
     int cmMotionFrequency, computeForceCount;
     long long stepCount;
     double time;

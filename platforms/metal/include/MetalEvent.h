@@ -54,8 +54,9 @@ public:
     void queueWait(ComputeQueue queue);
 private:
     MetalContext& context;
-    metalEvent_t event;
-    bool eventCreated;
+    MTL::SharedEvent* event;
+    MTL::CommandBuffer* buffer;
+    uint64_t value;
 };
 
 } // namespace OpenMM

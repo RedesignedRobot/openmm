@@ -32,6 +32,7 @@
 #include "openmm/System.h"
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/hardware.h"
+#include <Metal/Metal.hpp>
 #include <algorithm>
 #include <cctype>
 #include <sstream>
@@ -42,12 +43,27 @@
 using namespace OpenMM;
 using namespace std;
 
-#define CHECK_RESULT(result, prefix) \
-    if (result != metalSuccess) { \
-        std::stringstream m; \
-        m<<prefix<<": "<<MetalContext::getErrorString(result)<<" ("<<result<<")"<<" at "<<__FILE__<<":"<<__LINE__; \
-        throw OpenMMException(m.str());\
+static bool isPlatformSupported() {
+    // Compiling kernels needs macOS 15 (MTLCompileOptions.mathMode), and the kernels assume the
+    // 32 wide SIMD groups of Apple GPUs.
+
+    if (__builtin_available(macOS 15.0, *)) {
+        MTL::Device* device = MTL::CreateSystemDefaultDevice();
+        if (device == NULL)
+            return false;
+        bool supported = device->supportsFamily(MTL::GPUFamilyApple7);
+        device->release();
+        return supported;
     }
+    return false;
+}
+
+static string getDeviceName(MTL::Device* device) {
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    string name = device->name()->utf8String();
+    pool->release();
+    return name;
+}
 
 
 #ifdef OPENMM_COMMON_BUILDING_STATIC_LIBRARY
@@ -127,7 +143,8 @@ MetalPlatform::MetalPlatform() {
     setPropertyDefaultValue(MetalUseBlockingSync(), "true");
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
-    setPropertyDefaultValue(MetalDisablePmeStream(), "false");
+    // A separate PME queue synchronizes through events, and each event commits a command buffer.
+    setPropertyDefaultValue(MetalDisablePmeStream(), "true");
     setPropertyDefaultValue(MetalDeterministicForces(), "false");
 #ifdef _MSC_VER
     setPropertyDefaultValue(MetalTempDirectory(), string(getenv("TEMP")));
@@ -141,12 +158,11 @@ MetalPlatform::MetalPlatform() {
 double MetalPlatform::getSpeed() const {
     // Reduce the speed of the METAL platform if there are no METAL devices in the system,
     // so the OpenCL plaform can be selected as default
-    int numDevices;
-    return metalGetDeviceCount(&numDevices) != metalErrorNoDevice ? 100 : 40;
+    return isPlatformSupported() ? 100 : 40;
 }
 
 bool MetalPlatform::supportsDoublePrecision() const {
-    return true;
+    return false;
 }
 
 const string& MetalPlatform::getPropertyValue(const Context& context, const string& property) const {
@@ -175,18 +191,13 @@ vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>
     // Loop over devices.
 
     vector<map<string, string> > results;
-    int numDevices;
-    if (metalGetDeviceCount(&numDevices) != metalSuccess)
-        numDevices = 0;
+    MTL::Device* device = MTL::CreateSystemDefaultDevice();
+    int numDevices = (device == NULL ? 0 : 1);
     for (int i = 0; i < numDevices; i++) {
         if (deviceIndex != -1 && deviceIndex != i)
             continue;
-        char name[1000];
-        metalDevice_t device;
-        CHECK_RESULT(metalDeviceGet(&device, i), "Error querying device");
-        CHECK_RESULT(metalDeviceGetName(name, 1000, device), "Error querying device name");
         stringstream deviceNameStr;
-        deviceNameStr << name;
+        deviceNameStr << getDeviceName(device);
         if (deviceName.size() > 0 && deviceName != deviceNameStr.str())
             continue;
         stringstream deviceIndexStr;
@@ -195,6 +206,8 @@ vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>
                                           {MetalDeviceName(), deviceNameStr.str()}};
         results.push_back(properties);
     }
+    if (device != NULL)
+        device->release();
     return results;
 }
 
@@ -275,6 +288,8 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
         }
         if (contexts.size() == 0)
             contexts.push_back(new MetalContext(system, -1, blocking, precisionProperty, tempProperty, *this, (originalData == NULL ? NULL : originalData->contexts[0])));
+        if (contexts.size() > 1)
+            throw OpenMMException("The METAL platform does not support multiple devices");
     }
     catch (...) {
         // If an exception was thrown, do our best to clean up memory.
@@ -290,9 +305,7 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
             deviceName << ',';
         }
         deviceIndex << contexts[i]->getDeviceIndex();
-        char name[1000];
-        CHECK_RESULT(metalDeviceGetName(name, 1000, contexts[i]->getDevice()), "Error querying device name");
-        deviceName << name;
+        deviceName << getDeviceName(contexts[i]->getDevice());
     }
 
     useCpuPme = (cpuPmeProperty == "true" && !contexts[0]->getUseDoublePrecision());
@@ -307,18 +320,6 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
     propertyValues[MetalPlatform::MetalDisablePmeStream()] = disablePmeStream ? "true" : "false";
     propertyValues[MetalPlatform::MetalDeterministicForces()] = deterministicForces ? "true" : "false";
     contextEnergy.resize(contexts.size());
-
-    // Determine whether peer-to-peer copying is supported, and enable it if so.
-
-    peerAccessSupported = true;
-    for (int i = 1; i < contexts.size(); i++) {
-        int canAccess;
-        metalDeviceCanAccessPeer(&canAccess, contexts[i]->getDevice(), contexts[0]->getDevice());
-        if (!canAccess) {
-            peerAccessSupported = false;
-            break;
-        }
-    }
 }
 
 MetalPlatform::PlatformData::~PlatformData() {

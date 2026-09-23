@@ -25,10 +25,8 @@
 
 #include "MetalKernelFactory.h"
 #include "MetalKernels.h"
-#include "MetalParallelKernels.h"
 #include "MetalPlatform.h"
 #include "openmm/common/CommonKernels.h"
-#include "openmm/common/CommonParallelKernels.h"
 #include "openmm/common/CommonCalcCustomGBForceKernel.h"
 #include "openmm/common/CommonCalcCustomHbondForceKernel.h"
 #include "openmm/common/CommonCalcCustomManyParticleForceKernel.h"
@@ -45,38 +43,6 @@ using namespace OpenMM;
 KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platform& platform, ContextImpl& context) const {
     MetalPlatform::PlatformData& data = *static_cast<MetalPlatform::PlatformData*>(context.getPlatformData());
     MetalContext& cu = *data.contexts[0];
-    if (data.contexts.size() > 1) {
-        // We are running in parallel on multiple devices, so we may want to create a parallel kernel.
-
-        if (name == CalcForcesAndEnergyKernel::Name())
-            return new MetalParallelCalcForcesAndEnergyKernel(name, platform, data);
-        if (name == CalcHarmonicBondForceKernel::Name())
-            return new CommonParallelCalcHarmonicBondForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomBondForceKernel::Name())
-            return new CommonParallelCalcCustomBondForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcHarmonicAngleForceKernel::Name())
-            return new CommonParallelCalcHarmonicAngleForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomAngleForceKernel::Name())
-            return new CommonParallelCalcCustomAngleForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcPeriodicTorsionForceKernel::Name())
-            return new CommonParallelCalcPeriodicTorsionForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcRBTorsionForceKernel::Name())
-            return new CommonParallelCalcRBTorsionForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCMAPTorsionForceKernel::Name())
-            return new CommonParallelCalcCMAPTorsionForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomTorsionForceKernel::Name())
-            return new CommonParallelCalcCustomTorsionForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcNonbondedForceKernel::Name())
-            return new MetalParallelCalcNonbondedForceKernel(name, platform, data, context.getSystem());
-        if (name == CalcCustomNonbondedForceKernel::Name())
-            return new CommonParallelCalcCustomNonbondedForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomExternalForceKernel::Name())
-            return new CommonParallelCalcCustomExternalForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomHbondForceKernel::Name())
-            return new CommonParallelCalcCustomHbondForceKernel(name, platform, cu, context.getSystem());
-        if (name == CalcCustomCompoundBondForceKernel::Name())
-            return new CommonParallelCalcCustomCompoundBondForceKernel(name, platform, cu, context.getSystem());
-    }
     if (name == CalcForcesAndEnergyKernel::Name())
         return new MetalCalcForcesAndEnergyKernel(name, platform, cu);
     if (name == UpdateStateDataKernel::Name())

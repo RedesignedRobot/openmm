@@ -54,8 +54,7 @@ MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, u
 
     // Work out the work group sizes for various kernels.
 
-    int maxSharedMem;
-    metalDeviceGetAttribute(&maxSharedMem, metalDeviceAttributeMaxSharedMemoryPerBlock, context.getDevice());
+    int maxSharedMem = context.getDevice()->maxThreadgroupMemoryLength();
     int maxLocalBuffer = (maxSharedMem/trait->getDataSize())/2;
     int maxShortList = min(1024, max(maxLocalBuffer, MetalContext::ThreadBlockSize*context.getNumThreadBlocks()));
     isShortList = (length <= maxShortList);

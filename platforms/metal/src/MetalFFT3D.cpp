@@ -23,18 +23,23 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
+// This is the only translation unit that includes vkFFT.h.  With the Metal backend it defines
+// NS_PRIVATE_IMPLEMENTATION, CA_PRIVATE_IMPLEMENTATION, and MTL_PRIVATE_IMPLEMENTATION before
+// including metal-cpp, which emits the metal-cpp symbols for the whole library.
+#define VKFFT_BACKEND 5
+#include <iostream> // vkFFT.h prints Metal compiler errors to std::cout without including it
+#include "vkFFT.h"
 #include "MetalFFT3D.h"
 #include "MetalContext.h"
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <iterator>
+#include "MetalQueue.h"
 
 using namespace OpenMM;
 using namespace std;
 
+struct MetalFFT3D::VkFFTApp : VkFFTApplication {
+};
+
 MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, bool realToComplex) : context(context) {
-    deviceIndex = context.getDeviceIndex();
     size_t valueSize = context.getUseDoublePrecision() ? sizeof(double) : sizeof(float);
     inputBufferSize = zsize * ysize * xsize * valueSize;
     if (realToComplex) {
@@ -46,9 +51,8 @@ MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, b
 
     VkFFTConfiguration configuration = {};
     configuration.performR2C = realToComplex;
-    configuration.device = &deviceIndex;
-    configuration.num_streams = 1;
-    configuration.stream = &stream;
+    configuration.device = context.getDevice();
+    configuration.queue = context.getCurrentStream().getStream();
     configuration.doublePrecision = context.getUseDoublePrecision();
 
     configuration.FFTdim = 3;
@@ -70,55 +74,16 @@ MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, b
     configuration.bufferStride[1] = configuration.bufferStride[0] * ysize;
     configuration.bufferStride[2] = configuration.bufferStride[1] * xsize;
 
-    // Combine all parameters into a unique key
-    stringstream info;
-    int runtimeVersion;
-    (void)metalRuntimeGetVersion(&runtimeVersion);
-    info << runtimeVersion;
-    info << " " << VkFFTGetVersion();
-    info << " " << xsize << " " << ysize << " " << zsize;
-    info << " " << realToComplex << " " << context.getUseDoublePrecision();
+    // VkFFT compiles its kernels with fast math, so use lookup tables for the twiddle factors
+    // rather than trusting the fast trig functions.
+    configuration.useLUT = 1;
 
-    string cacheFile = context.getCacheFileName(info.str());
-
-    bool hasCache = false;
-    vector<char> cacheContent;
-
-    ifstream cache(cacheFile.c_str(), ios::in | ios::binary);
-    if (cache.is_open()) {
-        cacheContent.insert(cacheContent.begin(), istreambuf_iterator<char>(cache), istreambuf_iterator<char>());
-        cache.close();
-        hasCache = true;
-        // There is an existing cache, load VkFFT kernels from it
-        configuration.loadApplicationFromString = 1;
-        configuration.loadApplicationString = cacheContent.data();
-    }
-    else {
-        // There is no existing cache, request saving
-        configuration.saveApplicationToString = 1;
-    }
-
-    app = new VkFFTApplication();
+    app = new VkFFTApp();
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     VkFFTResult fftResult = initializeVkFFT(app, configuration);
+    pool->release();
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing initializeVkFFT: "+context.intToString(fftResult));
-    }
-
-    if (!hasCache) {
-        // There is no existing cache, create it
-        string outputFile = context.getTempFileName() + ".vkfftcache";
-        try {
-            ofstream out(outputFile.c_str(), ios::out | ios::binary);
-            out.write(reinterpret_cast<char*>(app->saveApplicationString), size_t(app->applicationStringSize));
-            out.close();
-            if (!out.fail()) {
-                if (rename(outputFile.c_str(), cacheFile.c_str()) != 0)
-                    remove(outputFile.c_str());
-            }
-        }
-        catch (...) {
-            // An error occurred.  Possibly we don't have permission to write to the temp directory.
-        }
     }
 }
 
@@ -136,8 +101,13 @@ void MetalFFT3D::execFFT(ArrayInterface& in, ArrayInterface& out, bool forward) 
         inputBuffer = context.unwrap(out).getDevicePointer();
         outputBuffer = context.unwrap(in).getDevicePointer();
     }
-    stream = context.getCurrentStream();
-    VkFFTResult fftResult = VkFFTAppend(app, forward ? -1 : 1, NULL);
+    // VkFFT's Metal backend encodes only through commandEncoder, so the FFT is batched into the
+    // open command buffer like any other kernel.
+    MetalQueue& queue = context.getCurrentStream();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    VkFFTLaunchParams params = {};
+    params.commandEncoder = queue.getEncoder();
+    VkFFTResult fftResult = VkFFTAppend(app, forward ? -1 : 1, &params);
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing VkFFTAppend: "+context.intToString(fftResult));
     }

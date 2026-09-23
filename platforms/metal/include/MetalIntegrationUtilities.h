@@ -30,7 +30,7 @@
 #include "openmm/System.h"
 #include "openmm/common/IntegrationUtilities.h"
 #include "openmm/common/windowsExportCommon.h"
-#include <metal/metal_runtime.h>
+#include "openmm/common/ComputeEvent.h"
 
 namespace OpenMM {
 
@@ -65,8 +65,8 @@ public:
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     int* ccmaConvergedMemory;
-    metalDeviceptr_t ccmaConvergedDeviceMemory;
-    metalEvent_t ccmaEvent;
+    MTL::Buffer* ccmaConvergedDeviceMemory;
+    ComputeEvent ccmaEvent;
 };
 
 } // namespace OpenMM

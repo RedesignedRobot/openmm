@@ -8,10 +8,9 @@ extern "C" {
  * Sort a list that is short enough to entirely fit in local memory.  This is executed as
  * a single thread block.
  */
-__global__ void sortShortList(DATA_TYPE* __restrict__ data, unsigned int length) {
+__global__ void sortShortList(DATA_TYPE* __restrict__ data, unsigned int length, threadgroup DATA_TYPE* dataBuffer [[threadgroup(0)]]) {
     // Load the data into local memory.
 
-    extern __shared__ DATA_TYPE dataBuffer[];
     for (int index = threadIdx.x; index < length; index += blockDim.x)
         dataBuffer[index] = data[index];
     __syncthreads();
@@ -51,8 +50,7 @@ __global__ void sortShortList(DATA_TYPE* __restrict__ data, unsigned int length)
  * scan through the data to select the destination for one element.  This involves more
  * work, but also parallelizes much better.
  */
-__global__ void sortShortList2(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* __restrict__ dataOut, unsigned int length) {
-    extern __shared__ KEY_TYPE keyBuffer[];
+__global__ void sortShortList2(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* __restrict__ dataOut, unsigned int length, threadgroup KEY_TYPE* keyBuffer [[threadgroup(0)]]) {
     int globalId = blockDim.x*blockIdx.x+threadIdx.x;
     DATA_TYPE value = dataIn[globalId < length ? globalId : 0];
     KEY_TYPE key = getValue(value);
@@ -72,8 +70,8 @@ __global__ void sortShortList2(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* 
         dataOut[count] = value;
 }
 
-inline __device__ void reduceMinMax(KEY_TYPE minimum, KEY_TYPE maximum, KEY_TYPE* minBuffer, KEY_TYPE* maxBuffer,
-        KEY_TYPE* minResult, KEY_TYPE* maxResult) {
+inline __device__ void reduceMinMax(KEY_TYPE minimum, KEY_TYPE maximum, threadgroup KEY_TYPE* minBuffer, threadgroup KEY_TYPE* maxBuffer,
+        device KEY_TYPE* minResult, device KEY_TYPE* maxResult) {
     minBuffer[threadIdx.x] = minimum;
     maxBuffer[threadIdx.x] = maximum;
     __syncthreads();
@@ -94,10 +92,9 @@ inline __device__ void reduceMinMax(KEY_TYPE minimum, KEY_TYPE maximum, KEY_TYPE
  * Calculate the minimum and maximum value in the array to be sorted.
  */
 __global__ void computeRange(const DATA_TYPE* __restrict__ data, unsigned int length, KEY_TYPE* __restrict__ range,
-        unsigned int numBuckets, unsigned int* __restrict__ bucketOffset, unsigned int* __restrict__ counters) {
+        unsigned int numBuckets, unsigned int* __restrict__ bucketOffset, unsigned int* __restrict__ counters, threadgroup KEY_TYPE* minBuffer [[threadgroup(0)]]) {
 #if UNIFORM
-    extern __shared__ KEY_TYPE minBuffer[];
-    KEY_TYPE* maxBuffer = minBuffer+blockDim.x;
+    threadgroup KEY_TYPE* maxBuffer = minBuffer+blockDim.x;
     KEY_TYPE minimum = MAX_KEY;
     KEY_TYPE maximum = MIN_KEY;
 
@@ -122,6 +119,7 @@ __global__ void computeRange(const DATA_TYPE* __restrict__ data, unsigned int le
         isLastFinishedBlock = atomicAdd(&counters[0], 1) + 1 == gridDim.x;
     }
     __syncthreads();
+    __threadfence();
 
     // The last block reduce partial results
 
@@ -230,7 +228,7 @@ __global__ void assignElementsToBuckets2(const DATA_TYPE* __restrict__ data, uns
         for (segment = 0; segment < 7 && key > segmentLowerBound[segment+1]; segment++)
             ;
         unsigned int bucketIndex = segmentBaseIndex[segment]+(key-segmentLowerBound[segment])*segmentIndexScale[segment];
-        bucketIndex = min(max(0, bucketIndex), numBuckets-1);
+        bucketIndex = min(max(0u, bucketIndex), numBuckets-1);
         offsetInBucket[index] = atomicAdd(&bucketOffset[bucketIndex], 1);
         bucketOfElement[index] = bucketIndex;
     }
@@ -240,8 +238,7 @@ __global__ void assignElementsToBuckets2(const DATA_TYPE* __restrict__ data, uns
  * Sum the bucket sizes to compute the start position of each bucket.  This kernel
  * is executed as a single work group.
  */
-__global__ __launch_bounds__(1024) void computeBucketPositions(unsigned int numBuckets, unsigned int* __restrict__ bucketOffset, unsigned int* __restrict__ counters) {
-    extern __shared__ unsigned int posBuffer[];
+__global__ __launch_bounds__(1024) void computeBucketPositions(unsigned int numBuckets, unsigned int* __restrict__ bucketOffset, unsigned int* __restrict__ counters, threadgroup unsigned int* posBuffer [[threadgroup(0)]]) {
     unsigned int globalOffset = 0;
     for (unsigned int startBucket = 0; startBucket < numBuckets; startBucket += blockDim.x) {
         // Load the bucket sizes into local memory.
@@ -286,8 +283,7 @@ __global__ void copyDataToBuckets(const DATA_TYPE* __restrict__ data, DATA_TYPE*
 /**
  * Sort the data in each bucket.
  */
-__global__ void sortBuckets(DATA_TYPE* __restrict__ data, const DATA_TYPE* __restrict__ buckets, const unsigned int* __restrict__ bucketOffset) {
-    extern __shared__ DATA_TYPE dataBuffer[];
+__global__ void sortBuckets(DATA_TYPE* __restrict__ data, const DATA_TYPE* __restrict__ buckets, const unsigned int* __restrict__ bucketOffset, threadgroup DATA_TYPE* dataBuffer [[threadgroup(0)]]) {
     unsigned int index = blockIdx.x;
     unsigned int startIndex = (index == 0 ? 0 : bucketOffset[index-1]);
     unsigned int endIndex = bucketOffset[index];

@@ -30,26 +30,17 @@
 using namespace OpenMM;
 using namespace std;
 
-#define CHECK_RESULT(result) CHECK_RESULT2(result, errorMessage);
-#define CHECK_RESULT2(result, prefix) \
-    if (result != metalSuccess) { \
-        std::stringstream m; \
-        m<<prefix<<": "<<dynamic_cast<MetalContext&>(context).getErrorString(result)<<" ("<<result<<")"<<" at "<<__FILE__<<":"<<__LINE__; \
-        throw OpenMMException(m.str());\
-    }
-
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
         ccmaConvergedMemory(NULL) {
-        CHECK_RESULT2(metalEventCreateWithFlags(&ccmaEvent, context.getEventFlags()), "Error creating event for CCMA");
-        CHECK_RESULT2(metalHostMalloc((void**) &ccmaConvergedMemory, sizeof(int), context.getHostMallocFlags()), "Error allocating pinned memory");
-        CHECK_RESULT2(metalHostGetDevicePointer(&ccmaConvergedDeviceMemory, ccmaConvergedMemory, 0), "Error getting device address for pinned memory");
+        ccmaEvent = context.createEvent();
+        ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
+        ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {
     ContextSelector selector(context);
     if (ccmaConvergedMemory != NULL) {
-        metalHostFree(ccmaConvergedMemory);
-        metalEventDestroy(ccmaEvent);
+        ccmaConvergedDeviceMemory->release();
     }
 }
 
@@ -116,13 +107,13 @@ void MetalIntegrationUtilities::applyConstraintsImpl(bool constrainVelocities, d
                 ccmaForceKernel->setArg(8, i);
                 ccmaForceKernel->execute(ccmaConstraintAtoms.getSize());
                 if ((i+1)%checkInterval == 0)
-                    CHECK_RESULT2(metalEventRecord(ccmaEvent, dynamic_cast<MetalContext&>(context).getCurrentStream()), "Error recording event for CCMA");
+                    ccmaEvent->enqueue();
                 ccmaMultiplyKernel->setArg(5, i);
                 ccmaMultiplyKernel->execute(ccmaConstraintAtoms.getSize());
                 ccmaUpdateKernel->setArg(9, i);
                 ccmaUpdateKernel->execute(context.getNumAtoms());
                 if ((i+1)%checkInterval == 0) {
-                    CHECK_RESULT2(metalEventSynchronize(ccmaEvent), "Error synchronizing on event for CCMA");
+                    ccmaEvent->wait();
                     if (ccmaConvergedMemory[0])
                         break;
                 }

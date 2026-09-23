@@ -29,26 +29,39 @@
 
 using namespace OpenMM;
 
-MetalEvent::MetalEvent(MetalContext& context) : context(context), eventCreated(false) {
-    metalError_t result = metalEventCreateWithFlags(&event, context.getEventFlags());
-    if (result != metalSuccess)
-        throw OpenMMException("Error creating METAL event:"+MetalContext::getErrorString(result));
-    eventCreated = true;
+MetalEvent::MetalEvent(MetalContext& context) : context(context), buffer(NULL), value(0) {
+    event = context.getDevice()->newSharedEvent();
+    if (event == NULL)
+        throw OpenMMException("Error creating METAL event");
 }
 
 MetalEvent::~MetalEvent() {
-    if (eventCreated)
-        metalEventDestroy(event);
+    if (buffer != NULL)
+        buffer->release();
+    event->release();
 }
 
 void MetalEvent::enqueue() {
-    metalEventRecord(event, context.getCurrentStream());
+    MetalQueue& queue = context.getCurrentStream();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    if (buffer != NULL)
+        buffer->release();
+    buffer = queue.getCommandBuffer()->retain();
+    buffer->encodeSignalEvent(event, ++value);
+    queue.commit();
 }
 
 void MetalEvent::wait() {
-    metalEventSynchronize(event);
+    if (buffer == NULL)
+        return;
+    buffer->waitUntilCompleted();
+    std::string failure = MetalQueue::getFailure(buffer);
+    if (!failure.empty())
+        throw OpenMMException("Error executing METAL command buffer: "+failure);
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
-    metalStreamWaitEvent(dynamic_cast<MetalQueue*>(queue.get())->getStream(), event, 0);
+    MetalQueue& metalQueue = *dynamic_cast<MetalQueue*>(queue.get());
+    std::lock_guard<std::recursive_mutex> guard(metalQueue.getLock());
+    metalQueue.getCommandBuffer()->encodeWait(event, value);
 }

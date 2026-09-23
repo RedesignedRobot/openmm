@@ -27,18 +27,84 @@
 #include "openmm/OpenMMException.h"
 
 using namespace OpenMM;
+using namespace std;
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), initialized(false) {
-}
-
-MetalQueue::MetalQueue() : initialized(false) {
-    metalError_t result = metalStreamCreateWithFlags(&stream, metalStreamNonBlocking);
-    if (result != metalSuccess)
-        throw OpenMMException("Error creating METAL stream: "+MetalContext::getErrorString(result));
-    initialized = true;
+MetalQueue::MetalQueue(MTL::Device* device) : openBuffer(NULL), encoder(NULL), commitCount(0) {
+    stream = device->newCommandQueue();
+    if (stream == NULL)
+        throw OpenMMException("Error creating METAL stream");
 }
 
 MetalQueue::~MetalQueue() {
-    if (initialized)
-        metalStreamDestroy(stream);
+    finish();
+    stream->release();
+}
+
+MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
+    if (encoder == NULL) {
+        MTL::CommandBuffer* buffer = getCommandBuffer();
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        encoder = buffer->computeCommandEncoder()->retain();
+        pool->release();
+    }
+    return encoder;
+}
+
+MTL::CommandBuffer* MetalQueue::getCommandBuffer() {
+    endEncoding();
+    if (openBuffer == NULL) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        openBuffer = stream->commandBuffer()->retain();
+        pool->release();
+    }
+    return openBuffer;
+}
+
+void MetalQueue::endEncoding() {
+    if (encoder != NULL) {
+        encoder->endEncoding();
+        encoder->release();
+        encoder = NULL;
+    }
+}
+
+void MetalQueue::commit() {
+    lock_guard<recursive_mutex> guard(lock);
+    if (openBuffer == NULL)
+        return;
+    endEncoding();
+    openBuffer->commit();
+    pending.push_back(openBuffer);
+    openBuffer = NULL;
+    commitCount++;
+    releaseCompleted();
+}
+
+void MetalQueue::finish() {
+    lock_guard<recursive_mutex> guard(lock);
+    commit();
+    for (MTL::CommandBuffer* buffer : pending)
+        buffer->waitUntilCompleted();
+    releaseCompleted();
+}
+
+void MetalQueue::releaseCompleted() {
+    while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
+        MTL::CommandBuffer* buffer = pending.front();
+        pending.pop_front();
+        string failure = getFailure(buffer);
+        buffer->release();
+        if (!failure.empty())
+            throw OpenMMException("Error executing METAL command buffer: "+failure);
+    }
+}
+
+string MetalQueue::getFailure(MTL::CommandBuffer* buffer) {
+    if (buffer->status() != MTL::CommandBufferStatusError)
+        return "";
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = buffer->error();
+    string message = (error == NULL ? "unknown error" : error->localizedDescription()->utf8String());
+    pool->release();
+    return message;
 }

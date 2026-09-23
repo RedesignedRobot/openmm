@@ -26,34 +26,77 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/common/ComputeQueue.h"
-#include <metal/metal_runtime.h>
+#include <Metal/Metal.hpp>
+#include <deque>
+#include <mutex>
+#include <string>
 
 namespace OpenMM {
 
 /**
- * This is the METAL implementation of the ComputeQueue interface.  It wraps a metalStream_t.
+ * This is the METAL implementation of the ComputeQueue interface.  It wraps an MTL::CommandQueue.
+ * Kernels are encoded into one open command buffer, which is committed when the host reads or
+ * writes an array, waits for an event, or finishes computing forces.
  */
 
 class MetalQueue : public ComputeQueueImpl {
 public:
     /**
-     * Create a MetalQueue that wraps an existing metalStream_t.
+     * Create a MetalQueue that create a new MTL::CommandQueue.
      */
-    MetalQueue(metalStream_t stream);
-    /**
-     * Create a MetalQueue that create a new metalStream_t.
-     */
-    MetalQueue();
+    MetalQueue(MTL::Device* device);
     ~MetalQueue();
     /**
-     * Get the CUstream.
+     * Get the MTL::CommandQueue.
      */
-    metalStream_t getStream() {
+    MTL::CommandQueue* getStream() {
         return stream;
     }
+    /**
+     * Get the lock that serializes encoding and submission.  CustomCPPForce uploads from the
+     * context's worker thread while the main thread encodes kernels.
+     */
+    std::recursive_mutex& getLock() {
+        return lock;
+    }
+    /**
+     * Get the compute encoder of the open command buffer, creating both if necessary.  The
+     * caller must hold the lock.
+     */
+    MTL::ComputeCommandEncoder* getEncoder();
+    /**
+     * Get the open command buffer with no encoder active, so a different kind of command
+     * can be encoded into it.  The caller must hold the lock.
+     */
+    MTL::CommandBuffer* getCommandBuffer();
+    /**
+     * Submit the open command buffer, if there is one, without waiting for it.
+     */
+    void commit();
+    /**
+     * Submit the open command buffer and block until all work submitted to the queue has
+     * completed.
+     */
+    void finish();
+    /**
+     * Get why a completed command buffer failed, or an empty string if it succeeded.
+     */
+    static std::string getFailure(MTL::CommandBuffer* buffer);
+    /**
+     * Get the number of command buffers this queue has committed.
+     */
+    long long getCommitCount() const {
+        return commitCount;
+    }
 private:
-    metalStream_t stream;
-    bool initialized;
+    void endEncoding();
+    void releaseCompleted();
+    MTL::CommandQueue* stream;
+    MTL::CommandBuffer* openBuffer;
+    MTL::ComputeCommandEncoder* encoder;
+    std::deque<MTL::CommandBuffer*> pending;
+    long long commitCount;
+    std::recursive_mutex lock;
 };
 
 } // namespace OpenMM

@@ -28,8 +28,6 @@
 
 #include "MetalArray.h"
 
-#define VKFFT_BACKEND 2 // METAL
-#include "vkFFT.h"
 #include "openmm/common/FFT3D.h"
 #include "openmm/common/ArrayInterface.h"
 
@@ -90,14 +88,15 @@ public:
      */
     static int findLegalDimension(int minimum);
 private:
-    metalStream_t stream;
     MetalContext& context;
-    int deviceIndex;
-    void* inputBuffer;
-    void* outputBuffer;
+    MTL::Buffer* inputBuffer;
+    MTL::Buffer* outputBuffer;
     uint64_t inputBufferSize;
     uint64_t outputBufferSize;
-    VkFFTApplication* app;
+    // vkFFT.h compiles the metal-cpp implementation into whatever includes it, so its types
+    // stay in MetalFFT3D.cpp.
+    struct VkFFTApp;
+    VkFFTApp* app;
 };
 
 } // namespace OpenMM
