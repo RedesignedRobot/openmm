@@ -154,9 +154,10 @@ DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
     } while(check != old);
 
     #endif
-#elif defined(__METAL_VERSION__)
+#elif defined(__METAL_VERSION__) && !defined(USE_MIXED_PRECISION)
 
-    // Metal only supports single precision, which has atomic floating-point addition
+    // Metal has atomic addition of floats, but no 64-bit atomics for mixed precision
+    // (this will be checked on the host before trying to compile this kernel)
     ATOMIC_ADD(target, value);
 
 #else

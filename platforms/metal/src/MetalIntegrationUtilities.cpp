@@ -60,23 +60,35 @@ void MetalIntegrationUtilities::applyConstraintsImpl(bool constrainVelocities, d
         ccmaForceKernel = ccmaPosForceKernel;
     }
     if (settleAtoms.isInitialized()) {
-        settleKernel->setArg(1, (float) tol);
+        if (context.getUseMixedPrecision())
+            settleKernel->setArg(1, tol);
+        else
+            settleKernel->setArg(1, (float) tol);
         settleKernel->execute(settleAtoms.getSize());
     }
     if (shakeAtoms.isInitialized()) {
-        shakeKernel->setArg(1, (float) tol);
+        if (context.getUseMixedPrecision())
+            shakeKernel->setArg(1, tol);
+        else
+            shakeKernel->setArg(1, (float) tol);
         shakeKernel->execute(shakeAtoms.getSize());
     }
     if (ccmaConstraintAtoms.isInitialized()) {
         if (ccmaConstraintAtoms.getSize() <= 1024) {
             // Use the version of CCMA that runs in a single kernel with one workgroup.
             ccmaFullKernel->setArg(0, (int) constrainVelocities);
-            ccmaFullKernel->setArg(14, (float) tol);
+            if (context.getUseMixedPrecision())
+                ccmaFullKernel->setArg(14, tol);
+            else
+                ccmaFullKernel->setArg(14, (float) tol);
             ccmaFullKernel->execute(128, 128);
         }
         else {
             ccmaForceKernel->setArg(6, ccmaHostConvergedFlag);
-            ccmaForceKernel->setArg(7, (float) tol);
+            if (context.getUseMixedPrecision())
+                ccmaForceKernel->setArg(7, tol);
+            else
+                ccmaForceKernel->setArg(7, (float) tol);
             ccmaDirectionsKernel->execute(ccmaConstraintAtoms.getSize());
             const int checkInterval = 4;
             ccmaUpdateKernel->setArg(4, constrainVelocities ? context.getVelm() : posDelta);

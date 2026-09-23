@@ -254,17 +254,18 @@ public:
     }
     /**
      * Get whether the device being used supports 64 bit atomic operations on global memory.
-     * Apple GPUs before the M3 lack them, but the prelude emulates the only one the common
-     * kernels need, which is addition.
+     * Apple GPUs have no 64 bit atomic addition.  The prelude emulates it for the integers that
+     * fixed point forces use, but not for doubles, which the minimizer needs in mixed precision.
      */
     bool getSupports64BitGlobalAtomics() const {
-        return true;
+        return false;
     }
     /**
-     * Get whether the device being used supports double precision math.
+     * Get whether the device being used supports double precision math.  Apple GPUs do not, but in
+     * mixed precision mode kernels have df64, which stands in for double.
      */
     bool getSupportsDoublePrecision() const {
-        return false;
+        return useMixedPrecision;
     }
     /**
      * Get the vectors defining the periodic box.

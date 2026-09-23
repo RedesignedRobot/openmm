@@ -53,8 +53,7 @@ const int MetalContext::TileSize = 32;
 
 /**
  * The types and constructors that depend on the precision mode.  They come right after the Metal
- * standard library, before the prelude, so another precision mode can replace this block with
- * one that defines its types in terms of Metal functions.
+ * standard library and before the prelude, which uses them.
  */
 static const char* singlePrecisionDefinitions = R"(
 typedef float real;
@@ -71,6 +70,37 @@ typedef float4 mixed4;
 #define make_mixed2 make_float2
 #define make_mixed3 make_float3
 #define make_mixed4 make_float4
+)";
+
+/**
+ * Apple GPUs have no double precision, so in mixed precision mode mixed and double are df64, an
+ * unevaluated sum of two floats, defined by the df64 source that precedes this block.  Device and
+ * constant memory hold df64 values as IEEE doubles, so arrays and kernel arguments have the same
+ * format as on devices with double precision.  metal_stdlib reserves double2 to double4 as type
+ * names, so the double types are macros.
+ */
+static const char* mixedPrecisionDefinitions = R"(
+typedef float real;
+typedef float2 real2;
+typedef float3 real3;
+typedef float4 real4;
+typedef df64 mixed;
+typedef df64_2 mixed2;
+typedef df64_3 mixed3;
+typedef df64_4 mixed4;
+#define make_real2 make_float2
+#define make_real3 make_float3
+#define make_real4 make_float4
+#define make_mixed2 df64_2
+#define make_mixed3 df64_3
+#define make_mixed4 df64_4
+#define double df64
+#define double2 df64_2
+#define double3 df64_3
+#define double4 df64_4
+#define make_double2 df64_2
+#define make_double3 df64_3
+#define make_double4 df64_4
 )";
 
 /**
@@ -201,10 +231,10 @@ static string rewriteKernelSignatures(const string& source) {
 MetalContext::MetalContext(const System& system, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), tempDir(tempDir+"/"),
         integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL) {
-    if (precision != "single")
+    if (precision != "single" && precision != "mixed")
         throw OpenMMException("Illegal value for Precision: "+precision);
     useDoublePrecision = false;
-    useMixedPrecision = false;
+    useMixedPrecision = (precision == "mixed");
     contextIndex = platformData.contexts.size();
     if (originalContext == NULL) {
         device = MTL::CreateSystemDefaultDevice();
@@ -365,12 +395,21 @@ MetalContext::~MetalContext() {
 
 void MetalContext::initialize() {
     int numEnergyBuffers = max(numThreadBlocks*ThreadBlockSize, nonbonded->getNumEnergyBuffers());
-    energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
-    energySum.initialize<float>(*this, numCores, "energySum");
+    if (useMixedPrecision) {
+        energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
+        energySum.initialize<double>(*this, numCores, "energySum");
+    }
+    else {
+        energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
+        energySum.initialize<float>(*this, numCores, "energySum");
+    }
     pinnedBuffer.resize(max(paddedNumAtoms*4, numEnergyBuffers));
     for (int i = 0; i < numAtoms; i++) {
         double mass = system.getParticleMass(i);
-        ((mm_float4*) getPinnedBuffer())[i] = mm_float4(0.0f, 0.0f, 0.0f, mass == 0.0 ? 0.0f : (float) (1.0/mass));
+        if (useMixedPrecision)
+            ((mm_double4*) getPinnedBuffer())[i] = mm_double4(0.0, 0.0, 0.0, mass == 0.0 ? 0.0 : 1.0/mass);
+        else
+            ((mm_float4*) getPinnedBuffer())[i] = mm_float4(0.0f, 0.0f, 0.0f, mass == 0.0 ? 0.0f : (float) (1.0/mass));
     }
     velm.upload(getPinnedBuffer());
     bonded->initialize(system);
@@ -378,7 +417,10 @@ void MetalContext::initialize() {
     addAutoclearBuffer(energyBuffer);
     int numEnergyParamDerivs = energyParamDerivNames.size();
     if (numEnergyParamDerivs > 0) {
-        energyParamDerivBuffer.initialize<float>(*this, numEnergyParamDerivs*numEnergyBuffers, "energyParamDerivBuffer");
+        if (useMixedPrecision)
+            energyParamDerivBuffer.initialize<double>(*this, numEnergyParamDerivs*numEnergyBuffers, "energyParamDerivBuffer");
+        else
+            energyParamDerivBuffer.initialize<float>(*this, numEnergyParamDerivs*numEnergyBuffers, "energyParamDerivBuffer");
         addAutoclearBuffer(energyParamDerivBuffer);
     }
     findMoleculeGroups();
@@ -403,7 +445,14 @@ MTL::Library* MetalContext::createLibrary(const string& source, const map<string
     src << endl;
     src << "#include <metal_stdlib>\n";
     src << "using namespace metal;\n";
-    src << singlePrecisionDefinitions << endl;
+    if (useMixedPrecision) {
+        src << "#define USE_MIXED_PRECISION 1\n";
+        src << "#define SUPPORTS_DOUBLE_PRECISION\n";
+        src << MetalKernelSources::df64 << endl;
+        src << mixedPrecisionDefinitions << endl;
+    }
+    else
+        src << singlePrecisionDefinitions << endl;
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
     for (auto& pair : defines) {
@@ -535,8 +584,14 @@ double MetalContext::reduceEnergy() {
     reduceEnergyKernel->execute(workGroupSize*energySum.getSize(), workGroupSize);
     energySum.download(getPinnedBuffer());
     double result = 0;
-    for (int i = 0; i < energySum.getSize(); i++)
-        result += ((float*) getPinnedBuffer())[i];
+    if (useMixedPrecision) {
+        for (int i = 0; i < energySum.getSize(); i++)
+            result += ((double*) getPinnedBuffer())[i];
+    }
+    else {
+        for (int i = 0; i < energySum.getSize(); i++)
+            result += ((float*) getPinnedBuffer())[i];
+    }
     return result;
 }
 
