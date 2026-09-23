@@ -52,6 +52,28 @@ const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
 
 /**
+ * The types and constructors that depend on the precision mode.  They come right after the Metal
+ * standard library, before the prelude, so another precision mode can replace this block with
+ * one that defines its types in terms of Metal functions.
+ */
+static const char* singlePrecisionDefinitions = R"(
+typedef float real;
+typedef float2 real2;
+typedef float3 real3;
+typedef float4 real4;
+typedef float mixed;
+typedef float2 mixed2;
+typedef float3 mixed3;
+typedef float4 mixed4;
+#define make_real2 make_float2
+#define make_real3 make_float3
+#define make_real4 make_float4
+#define make_mixed2 make_float2
+#define make_mixed3 make_float3
+#define make_mixed4 make_float4
+)";
+
+/**
  * Metal does not report the number of GPU cores, so read it from the IORegistry.
  */
 static int getGpuCoreCount() {
@@ -203,13 +225,7 @@ MetalContext::MetalContext(const System& system, const string& precision, const 
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
     numThreadBlocks = 12*numCores;
 
-    compilationDefines["make_real2"] = "make_float2";
-    compilationDefines["make_real3"] = "make_float3";
-    compilationDefines["make_real4"] = "make_float4";
-    compilationDefines["make_mixed2"] = "make_float2";
-    compilationDefines["make_mixed3"] = "make_float3";
-    compilationDefines["make_mixed4"] = "make_float4";
-    compilationDefines["SQRT"] = "sqrt";
+    compilationDefines["SQRT"] = "precise::sqrt";
     compilationDefines["RSQRT"] = "rsqrt";
     compilationDefines["RECIP(x)"] = "(1.0f/(x))";
     compilationDefines["EXP"] = "exp";
@@ -357,14 +373,9 @@ MTL::Library* MetalContext::createLibrary(const string& source, const map<string
         }
     }
     src << endl;
-    src << "typedef float real;\n";
-    src << "typedef float2 real2;\n";
-    src << "typedef float3 real3;\n";
-    src << "typedef float4 real4;\n";
-    src << "typedef float mixed;\n";
-    src << "typedef float2 mixed2;\n";
-    src << "typedef float3 mixed3;\n";
-    src << "typedef float4 mixed4;\n";
+    src << "#include <metal_stdlib>\n";
+    src << "using namespace metal;\n";
+    src << singlePrecisionDefinitions << endl;
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
     for (auto& pair : defines) {

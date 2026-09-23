@@ -3,9 +3,6 @@
  * common compute framework.
  */
 
-#include <metal_stdlib>
-using namespace metal;
-
 uint3 _mmGlobalId [[thread_position_in_grid]];
 uint3 _mmGlobalSize [[threads_per_grid]];
 uint3 _mmLocalId [[thread_position_in_threadgroup]];
@@ -76,7 +73,15 @@ inline unsigned long ATOMIC_ADD(device unsigned long* dest, unsigned long value)
 #define make_float3 float3
 #define make_float4 float4
 
-#define trimTo3(v) (v).xyz
+// These are functions rather than a macro so another precision mode can overload them.
+
+inline float3 trimTo3(float4 v) {
+    return v.xyz;
+}
+
+inline float3 trimTo3(float3 v) {
+    return v;
+}
 
 inline float4 cross(float4 a, float4 b) {
     return float4(cross(a.xyz, b.xyz), 0.0f);
