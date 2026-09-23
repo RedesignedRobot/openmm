@@ -1345,6 +1345,35 @@ void testMergedRandoms() {
     }
 }
 
+/**
+ * Test a per-DOF expression with several integer powers of the same base, which are computed together.
+ */
+void testRelatedPowers() {
+    const int numParticles = 8;
+    System system;
+    CustomIntegrator integrator(0.001);
+    integrator.addPerDofVariable("powers", 0.0);
+    integrator.addComputePerDof("powers", "x^4+x^5");
+    OpenMM_SFMT::SFMT sfmt;
+    init_gen_rand(0, sfmt);
+    vector<Vec3> positions(numParticles);
+    for (int i = 0; i < numParticles; i++) {
+        system.addParticle(1.0);
+        positions[i] = Vec3(genrand_real2(sfmt)+0.5, genrand_real2(sfmt)+0.5, genrand_real2(sfmt)+0.5);
+    }
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    integrator.step(1);
+    vector<Vec3> powers;
+    integrator.getPerDofVariable(0, powers);
+    for (int i = 0; i < numParticles; i++) {
+        Vec3 expected;
+        for (int j = 0; j < 3; j++)
+            expected[j] = pow(positions[i][j], 4)+pow(positions[i][j], 5);
+        ASSERT_EQUAL_VEC(expected, powers[i], 1e-5);
+    }
+}
+
 void runPlatformTests();
 
 int main(int argc, char* argv[]) {
@@ -1377,6 +1406,7 @@ int main(int argc, char* argv[]) {
         testSaveParameters();
         testAnalyzeComputations();
         testMergedRandoms();
+        testRelatedPowers();
         runPlatformTests();
     }
     catch(const exception& e) {
