@@ -215,11 +215,12 @@ CommonCalcNonbondedForceKernel::~CommonCalcNonbondedForceKernel() {
 }
 
 void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue,
-        bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme) {
+        bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme, bool sortPmeAtoms) {
     this->usePmeQueue = false;
     this->deviceIsCpu = deviceIsCpu;
     this->useFixedPointChargeSpreading = useFixedPointChargeSpreading;
     this->useCpuPme = useCpuPme;
+    this->sortPmeAtoms = sortPmeAtoms;
     ContextSelector selector(cc);
     int forceIndex;
     for (forceIndex = 0; forceIndex < system.getNumForces() && &system.getForce(forceIndex) != &force; ++forceIndex)
@@ -458,6 +459,12 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                     pmeDispersionBsplineModuliZ.initialize(cc, dispersionGridSizeZ, elementSize, "pmeDispersionBsplineModuliZ");
                 }
                 pmeAtomGridIndex.initialize<mm_int2>(cc, numParticles, "pmeAtomGridIndex");
+                if (!sortPmeAtoms) {
+                    vector<mm_int2> atomOrder(numParticles);
+                    for (int i = 0; i < numParticles; i++)
+                        atomOrder[i] = mm_int2(i, 0);
+                    pmeAtomGridIndex.upload(atomOrder);
+                }
                 int energyElementSize = (cc.getUseDoublePrecision() || cc.getUseMixedPrecision() ? sizeof(double) : sizeof(float));
                 pmeEnergyBuffer.initialize(cc, cc.getNumThreadBlocks()*ComputeContext::ThreadBlockSize, energyElementSize, "pmeEnergyBuffer");
                 cc.clearBuffer(pmeEnergyBuffer);
@@ -963,7 +970,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         // Execute the reciprocal space kernels.
 
         if (hasCoulomb) {
-            if (stepsToSort <= 0 || doLJPME) {
+            if (sortPmeAtoms && (stepsToSort <= 0 || doLJPME)) {
                 setPeriodicBoxArgs(cc, pmeGridIndexKernel, 2);
                 if (cc.getUseDoublePrecision()) {
                     pmeGridIndexKernel->setArg(7, recipBoxVectors[0]);
@@ -979,7 +986,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 sort->sort(pmeAtomGridIndex);
                 stepsToSort = (cc.getNumAtoms() > 15000) ? 1 : 3;
             }
-            else
+            else if (sortPmeAtoms)
                 stepsToSort--;
             setPeriodicBoxArgs(cc, pmeSpreadChargeKernel, 2);
             if (cc.getUseDoublePrecision()) {
@@ -1034,19 +1041,21 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         }
 
         if (doLJPME && hasLJ) {
-            setPeriodicBoxArgs(cc, pmeDispersionGridIndexKernel, 2);
-            if (cc.getUseDoublePrecision()) {
-                pmeDispersionGridIndexKernel->setArg(7, recipBoxVectors[0]);
-                pmeDispersionGridIndexKernel->setArg(8, recipBoxVectors[1]);
-                pmeDispersionGridIndexKernel->setArg(9, recipBoxVectors[2]);
+            if (sortPmeAtoms) {
+                setPeriodicBoxArgs(cc, pmeDispersionGridIndexKernel, 2);
+                if (cc.getUseDoublePrecision()) {
+                    pmeDispersionGridIndexKernel->setArg(7, recipBoxVectors[0]);
+                    pmeDispersionGridIndexKernel->setArg(8, recipBoxVectors[1]);
+                    pmeDispersionGridIndexKernel->setArg(9, recipBoxVectors[2]);
+                }
+                else {
+                    pmeDispersionGridIndexKernel->setArg(7, recipBoxVectorsFloat[0]);
+                    pmeDispersionGridIndexKernel->setArg(8, recipBoxVectorsFloat[1]);
+                    pmeDispersionGridIndexKernel->setArg(9, recipBoxVectorsFloat[2]);
+                }
+                pmeDispersionGridIndexKernel->execute(cc.getNumAtoms());
+                sort->sort(pmeAtomGridIndex);
             }
-            else {
-                pmeDispersionGridIndexKernel->setArg(7, recipBoxVectorsFloat[0]);
-                pmeDispersionGridIndexKernel->setArg(8, recipBoxVectorsFloat[1]);
-                pmeDispersionGridIndexKernel->setArg(9, recipBoxVectorsFloat[2]);
-            }
-            pmeDispersionGridIndexKernel->execute(cc.getNumAtoms());
-            sort->sort(pmeAtomGridIndex);
             if (useFixedPointChargeSpreading)
                 cc.clearBuffer(pmeGrid2);
             else
