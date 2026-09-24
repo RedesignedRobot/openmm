@@ -436,8 +436,44 @@ inline df64 log(df64 x) {
     return (c - 0.5f * c.hi * c.hi) + y;
 }
 
-df64 sin(df64) = delete;
-df64 cos(df64) = delete;
+// Reduces x to r in [-pi/4, pi/4] with x = r + k*pi/2, returns k mod 4, and sets s and c to sin(r)
+// and cos(r) from Taylor series, whose terms past r^17 are below df64 precision.
+inline int df64_sincos_reduced(df64 x, thread df64& s, thread df64& c) {
+    const float c1 = 0x1.92p+0f;
+    const float c2 = 0x1.fb5444p-12f;
+    const float c3 = 0x1.68c234p-39f;
+    float k = rint(x.hi * 0x1.45f306p-1f);
+    float2 kc2 = df64_two_prod(k, c2);
+    df64 r = (x - k * c1) - df64(kc2.x, kc2.y) - k * c3;
+    df64 r2 = r * r;
+    df64 sinTerm = r, cosTerm = df64(1.0f);
+    s = r;
+    c = df64(1.0f);
+    for (int n = 2; n <= 16; n += 2) {
+        cosTerm = -cosTerm * r2 / (float) ((n - 1) * n);
+        sinTerm = -sinTerm * r2 / (float) (n * (n + 1));
+        c += cosTerm;
+        s += sinTerm;
+    }
+    return ((int) k) & 3;
+}
+
+inline df64 sin(df64 x) {
+    if (!isfinite(x.hi))
+        return df64(NAN, 0.0f);
+    df64 s, c;
+    int quadrant = df64_sincos_reduced(x, s, c);
+    return quadrant == 0 ? s : (quadrant == 1 ? c : (quadrant == 2 ? -s : -c));
+}
+
+inline df64 cos(df64 x) {
+    if (!isfinite(x.hi))
+        return df64(NAN, 0.0f);
+    df64 s, c;
+    int quadrant = df64_sincos_reduced(x, s, c);
+    return quadrant == 0 ? c : (quadrant == 1 ? -s : (quadrant == 2 ? -c : s));
+}
+
 df64 tan(df64) = delete;
 df64 asin(df64) = delete;
 df64 acos(df64) = delete;
