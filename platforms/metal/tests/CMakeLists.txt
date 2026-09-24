@@ -18,5 +18,3 @@ FOREACH(TEST_PROG ${TEST_PROGS})
     ADD_TEST(${TEST_ROOT}Mixed ${EXECUTABLE_OUTPUT_PATH}/${TEST_ROOT} mixed)
 
 ENDFOREACH(TEST_PROG ${TEST_PROGS})
-
-SET_TESTS_PROPERTIES(TestMetalQTBIntegratorMixed PROPERTIES PASS_REGULAR_EXPRESSION "exception: Error compiling program: .*error: call to deleted function 'cos'")

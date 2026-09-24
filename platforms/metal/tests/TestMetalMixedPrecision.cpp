@@ -61,6 +61,8 @@ ASSERT_TYPE(RECIP(mixed()), mixed)
 ASSERT_TYPE(RECIP(mixed3()), mixed3)
 ASSERT_TYPE(EXP(mixed()), mixed)
 ASSERT_TYPE(LOG(mixed()), mixed)
+ASSERT_TYPE(SIN(mixed()), mixed)
+ASSERT_TYPE(COS(mixed()), mixed)
 ASSERT_TYPE(sqrt(mixed()), mixed)
 ASSERT_TYPE(rsqrt(mixed()), mixed)
 ASSERT_TYPE(exp(mixed()), mixed)
@@ -78,14 +80,20 @@ KERNEL void evaluate(GLOBAL mixed* values) {
     values[3] = RECIP(x);
     values[4] = EXP(x);
     values[5] = LOG(x);
+    values[6] = SIN(x);
+    values[7] = COS(x);
+    values[8] = SIN(-3*x);
+    values[9] = COS(-3*x);
+    values[10] = SIN(100*x);
+    values[11] = COS(100*x);
 }
 )";
     const double x = 1.2345678901234567;
     ComputeKernel kernel = context.compileProgram(source)->createKernel("evaluate");
     if (context.getUseMixedPrecision()) {
         MetalArray values;
-        values.initialize<double>(context, 6, "values");
-        vector<double> results(6, 0.0);
+        values.initialize<double>(context, 12, "values");
+        vector<double> results(12, 0.0);
         results[0] = x;
         values.upload(results);
         kernel->addArg(values);
@@ -96,6 +104,12 @@ KERNEL void evaluate(GLOBAL mixed* values) {
         ASSERT_EQUAL_TOL(1.0/x, results[3], 1e-12);
         ASSERT_EQUAL_TOL(exp(x), results[4], 1e-12);
         ASSERT_EQUAL_TOL(log(x), results[5], 1e-12);
+        ASSERT_EQUAL_TOL(sin(x), results[6], 1e-12);
+        ASSERT_EQUAL_TOL(cos(x), results[7], 1e-12);
+        ASSERT_EQUAL_TOL(sin(-3*x), results[8], 1e-12);
+        ASSERT_EQUAL_TOL(cos(-3*x), results[9], 1e-12);
+        ASSERT_EQUAL_TOL(sin(100*x), results[10], 1e-12);
+        ASSERT_EQUAL_TOL(cos(100*x), results[11], 1e-12);
     }
 }
 
@@ -158,7 +172,7 @@ void testUnsupportedFunctions(const string& precision) {
     system.addParticle(1.0);
     MetalPlatform::PlatformData platformData(NULL, system, "", "true", precision, "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), "false", "false", 1, NULL);
     MetalContext& context = *platformData.contexts[0];
-    for (string call : {"SIN(x)", "COS(x)", "TAN(x)", "ASIN(x)", "ACOS(x)", "ATAN(x)", "atan2(x, x)", "sinh(x)", "cosh(x)", "tanh(x)", "ERF(x)", "ERFC(x)", "POW(x, x)"}) {
+    for (string call : {"TAN(x)", "ASIN(x)", "ACOS(x)", "ATAN(x)", "atan2(x, x)", "sinh(x)", "cosh(x)", "tanh(x)", "ERF(x)", "ERFC(x)", "POW(x, x)"}) {
         string function = call.substr(0, call.find('('));
         transform(function.begin(), function.end(), function.begin(), ::tolower);
         bool threwException = false;
