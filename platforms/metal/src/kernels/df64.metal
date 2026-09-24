@@ -437,7 +437,8 @@ inline df64 log(df64 x) {
 }
 
 // Reduces x to r in [-pi/4, pi/4] with x = r + k*pi/2, returns k mod 4, and sets s and c to sin(r)
-// and cos(r) from Taylor series, whose terms past r^17 are below df64 precision.
+// and cos(r) from Taylor series, whose terms past r^17 are below df64 precision. The reduction keeps
+// df64 precision for |x| below about 2e4, and k*c1 stays exact up to |x| of about 1e5.
 inline int df64_sincos_reduced(df64 x, thread df64& s, thread df64& c) {
     const float c1 = 0x1.92p+0f;
     const float c2 = 0x1.fb5444p-12f;
