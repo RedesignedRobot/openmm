@@ -57,7 +57,7 @@ void testTooManyArguments() {
         context.getState(State::Energy);
     }
     catch (const OpenMMException& e) {
-        thrown = (string(e.what()).find("no 'buffer' resource location available") != string::npos);
+        thrown = (string(e.what()).find("at most 31") != string::npos);
     }
     ASSERT(thrown);
 }
