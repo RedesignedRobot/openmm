@@ -111,6 +111,46 @@ static string rewriteKernelSignatures(const string& source) {
     return result+source.substr(pos);
 }
 
+static string addThreadAddressSpace(const string& param) {
+    if (param.find('*') == string::npos || regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|PRIVATE|device|threadgroup|constant|thread)\\b")))
+        return param;
+    return "thread "+param;
+}
+
+/**
+ * Common kernels follow OpenCL, where a pointer parameter with no address space is private.
+ * Metal requires an address space on every pointer, so give those parameters of device
+ * functions the thread address space.
+ */
+static string rewriteDeviceSignatures(const string& source) {
+    string result;
+    size_t pos = 0;
+    smatch m;
+    while (regex_search(source.begin()+pos, source.end(), m, regex("\\b(DEVICE|__device__)\\b[^;{}()=]*?\\b\\w+\\s*\\("))) {
+        size_t i = pos+m.position()+m.length();
+        result += source.substr(pos, i-pos);
+        string param;
+        for (int depth = 0; depth >= 0; i++) {
+            if (source[i] == '#') {
+                size_t end = source.find('\n', i)+1;
+                result += addThreadAddressSpace(param)+source.substr(i, end-i);
+                param.clear();
+                i = end-1;
+                continue;
+            }
+            depth += (source[i] == '(')-(source[i] == ')');
+            if (depth < 0 || (source[i] == ',' && depth == 0)) {
+                result += addThreadAddressSpace(param)+source[i];
+                param.clear();
+            }
+            else
+                param += source[i];
+        }
+        pos = i;
+    }
+    return result+source.substr(pos);
+}
+
 MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
@@ -443,6 +483,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << "typedef double4 mixed4;\n";
     }
     else {
+        // Metal has no double, so single precision kernels that name it get float.
+        src << "#define double float\n";
         src << "typedef float mixed;\n";
         src << "typedef float2 mixed2;\n";
         src << "typedef float3 mixed3;\n";
@@ -459,7 +501,7 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     if (!defines.empty())
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
-    src << rewriteKernelSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long")) << endl;
+    src << rewriteKernelSignatures(rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"))) << endl;
 
     // Select names for the various temporary files.
 

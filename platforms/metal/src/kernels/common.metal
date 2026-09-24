@@ -124,6 +124,10 @@ inline float erf(float x) {
     return 1.1283791670955126f*x*(1.0f+x2*(-1.0f/3.0f+x2*(1.0f/10.0f+x2*(-1.0f/42.0f+x2*(1.0f/216.0f+x2*(-1.0f/1320.0f))))));
 }
 
+inline float remainder(float x, float y) {
+    return x-y*rint(x/y);
+}
+
 __device__ inline long realToFixedPoint(float x) {
     // Faster way to calculate static_cast<long long>(x * 0x100000000) with exactly the same
     // results but less instructions.
