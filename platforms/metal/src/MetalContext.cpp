@@ -95,10 +95,16 @@ static string rewriteParameter(const string& param, string& prologue, string* me
     return m[4].str();
 }
 
+static size_t lineEnd(const string& source, size_t i) {
+    size_t end = source.find('\n', i);
+    return (end == string::npos ? source.size() : end+1);
+}
+
 /**
  * Metal needs an address space on every kernel pointer, and passes values by constant reference.
  * With packValues, value parameters instead go into one struct per kernel, because Metal allows
- * only 31 buffer bindings per kernel.
+ * only 31 buffer bindings per kernel.  A signature that never closes is left for the compiler to
+ * report.
  */
 static string rewriteKernelSignatures(const string& source, bool packValues) {
     string result;
@@ -111,11 +117,12 @@ static string rewriteKernelSignatures(const string& source, bool packValues) {
         result += source.substr(pos, m.position());
         string prologue, members, param;
         int index = 0;
-        for (int depth = 0; depth >= 0; i++) {
+        int depth = 0;
+        for (; depth >= 0 && i < source.size(); i++) {
             // A value moved into the struct leaves the signature, along with one comma next to it.
             size_t prologueSize = prologue.size();
             if (source[i] == '#') {
-                size_t end = source.find('\n', i)+1;
+                size_t end = lineEnd(source, i);
                 string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index);
                 if (packValues && prologue.size() > prologueSize)
                     signature.erase(signature.rfind(','), 1);
@@ -140,9 +147,12 @@ static string rewriteKernelSignatures(const string& source, bool packValues) {
             else
                 param += source[i];
         }
+        size_t body = source.find('{', i);
+        if (depth >= 0 || body == string::npos)
+            return source;
         if (packValues)
             result += "struct "+argsType+" {\n"+members+"};\n";
-        pos = source.find('{', i)+1;
+        pos = body+1;
         result += signature+source.substr(i, pos-i)+"\n"+prologue;
     }
     return result+source.substr(pos);
@@ -157,7 +167,8 @@ static string addThreadAddressSpace(const string& param) {
 /**
  * Common kernels follow OpenCL, where a pointer parameter with no address space is private.
  * Metal requires an address space on every pointer, so give those parameters of device
- * functions the thread address space.
+ * functions the thread address space.  A signature that never closes is left for the compiler
+ * to report.
  */
 static string rewriteDeviceSignatures(const string& source) {
     string result;
@@ -167,9 +178,10 @@ static string rewriteDeviceSignatures(const string& source) {
         size_t i = pos+m.position()+m.length();
         result += source.substr(pos, i-pos);
         string param;
-        for (int depth = 0; depth >= 0; i++) {
+        int depth = 0;
+        for (; depth >= 0 && i < source.size(); i++) {
             if (source[i] == '#') {
-                size_t end = source.find('\n', i)+1;
+                size_t end = lineEnd(source, i);
                 result += addThreadAddressSpace(param)+source.substr(i, end-i);
                 param.clear();
                 i = end-1;
@@ -183,6 +195,8 @@ static string rewriteDeviceSignatures(const string& source) {
             else
                 param += source[i];
         }
+        if (depth >= 0)
+            return source;
         pos = i;
     }
     return result+source.substr(pos);
@@ -542,8 +556,11 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
     string log;
     metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);
-    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos) {
-        module = createLibrary(header+rewriteKernelSignatures(body, true)+"\n", log, saveTemps);
+    if (module == NULL) {
+        // A kernel past Metal's 31 buffer bindings compiles once its values are packed.  Any other
+        // error fails both ways, and the first log reports it.
+        string packedLog;
+        module = createLibrary(header+rewriteKernelSignatures(body, true)+"\n", packedLog, saveTemps);
         if (module != NULL)
             packedModules.insert(module);
     }
@@ -624,6 +641,8 @@ bool MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffer
     // a buffer, and _mmV<n> followed by _mmE<n> for a value.  Arguments past the last marker came from
     // macros, and are buffers.
     MTL::StructType* type = binding->bufferStructType();
+    if (type == NULL)
+        return false;
     map<int, MTL::StructMember*> markers;
     for (int i = 0; i < type->members()->count(); i++) {
         MTL::StructMember* member = type->members()->object<MTL::StructMember>(i);
@@ -637,8 +656,11 @@ bool MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffer
         int offset = marker.second->offset();
         int size = 0;
         if (memberName[3] == 'V') {
-            string end = "_mmE"+to_string(marker.first);
-            size = type->memberByName(NS::String::string(end.c_str(), NS::UTF8StringEncoding))->offset()-offset;
+            string endName = "_mmE"+to_string(marker.first);
+            MTL::StructMember* end = type->memberByName(NS::String::string(endName.c_str(), NS::UTF8StringEncoding));
+            if (end == NULL)
+                return false;
+            size = end->offset()-offset;
         }
         else
             numBuffers--;
