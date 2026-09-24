@@ -62,7 +62,7 @@ MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, u
     rangeKernelSize = 256;
     if (rangeKernelSize > length)
         rangeKernelSize = length;
-    rangeKernelBlocks = (length + rangeKernelSize - 1) / rangeKernelSize;
+    rangeKernelBlocks = 1;
     if (sortKernelSize > maxLocalBuffer)
         sortKernelSize = maxLocalBuffer;
     unsigned int targetBucketSize = uniform ? sortKernelSize/2 : sortKernelSize/8;
