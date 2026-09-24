@@ -248,7 +248,6 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
-    real3 force = make_real3(0);
 #ifdef USE_NEIGHBOR_LIST
     const unsigned int numTiles = interactionCount[0];
     if (numTiles > maxTiles)
@@ -256,7 +255,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 
     // Each warp takes a contiguous range of tiles. findBlocksWithInteractions stores each x block's tiles next to each
     // other, so the forces on the x atoms stay in registers until x changes, which saves three emulated 64 bit atomic
-    // adds per tile.
+    // adds per tile. They are summed in fixed point, because which tiles share a write varies from one neighbor list
+    // build to the next, and the forces must not.
+    mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
     const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
     for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
 #else
@@ -266,6 +267,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     int skipTiles = -1;
     for (; pos < end; pos++) {
 #endif
+        real3 force = make_real3(0);
         bool includeTile = true;
 
         // Extract the coordinates of this tile.
@@ -446,16 +448,20 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             // Write results.
 #ifdef INCLUDE_FORCES
 #ifdef USE_NEIGHBOR_LIST
-            const bool writeForce = (pos+1 == end || tiles[pos+1] != x);
-#else
-            const bool writeForce = true;
-#endif
-            if (writeForce) {
-                atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(force.x)));
-                atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
-                atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
-                force = make_real3(0);
+            xForceX += realToFixedPoint(force.x);
+            xForceY += realToFixedPoint(force.y);
+            xForceZ += realToFixedPoint(force.z);
+            if (pos+1 == end || tiles[pos+1] != x) {
+                atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
+                atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
+                atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+                xForceX = xForceY = xForceZ = 0;
             }
+#else
+            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(force.x)));
+            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
+            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
+#endif
             unsigned int atom2 = atomIndex;
             if (atom2 < PADDED_NUM_ATOMS) {
                 atomicAdd(&forceBuffers[atom2], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
