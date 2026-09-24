@@ -78,7 +78,6 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
-    cu.getCurrentStream().commit();
     if (includeEnergy)
         sum += cu.reduceEnergy();
     if (!cu.getForcesValid())

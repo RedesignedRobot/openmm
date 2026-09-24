@@ -486,8 +486,6 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     if (module == NULL)
         log = error->localizedDescription()->utf8String();
     pool->release();
-    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
-        throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
     if (module == NULL)
         throw OpenMMException("Error compiling program: "+log);
     loadedModules.push_back(module);
