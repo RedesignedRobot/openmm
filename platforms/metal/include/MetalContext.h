@@ -484,16 +484,17 @@ private:
      */
     struct KernelArguments {
         std::vector<int> sizes, offsets;
-        int packedSize;
+        int packedSize = 0;
     };
     /**
      * Compile Metal source into a library.  On failure this returns NULL and sets log to the compiler output.
      */
     metalModule_t createLibrary(const std::string& source, std::string& log, bool saveTemps);
     /**
-     * Find where each argument of a kernel with packed values goes, from the reflection of its argument struct.
+     * Find where each argument of a kernel with packed values goes, from the reflection of its argument
+     * struct.  Returns false if the struct has more buffer markers than the kernel has buffer bindings.
      */
-    KernelArguments getPackedArguments(MTL::BufferBinding* binding, int numBuffers);
+    bool getPackedArguments(MTL::BufferBinding* binding, int numBuffers, KernelArguments& args);
     MetalPlatform::PlatformData& platformData;
     int deviceIndex;
     int contextIndex;

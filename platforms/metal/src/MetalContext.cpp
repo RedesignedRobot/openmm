@@ -72,14 +72,14 @@ const int MetalContext::TileSize = 32;
 /**
  * Rewrite one kernel parameter.  A value parameter becomes a constant reference, or, when members is
  * given, a member of the kernel's argument struct, and then this returns only its trailing macros.
- * Each other declared parameter gets a one byte marker member, so the host can recover the position of
- * every argument from reflection.
+ * Each other parameter that takes a buffer binding gets a one byte marker member, so the host can
+ * recover the position of every argument from reflection.
  */
 static string rewriteParameter(const string& param, string& prologue, string* members, int& index) {
     smatch m;
     bool isValue = !regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[*]"));
     if (!isValue || !regex_match(param, m, regex("\\s*(const\\s+)?(\\S.*?)\\s+(\\w+)((\\s+[A-Z_]+)*)\\s*"))) {
-        if (members != NULL && !isValue)
+        if (members != NULL && !isValue && !regex_search(param, regex("\\b(LOCAL|LOCAL_ARG|threadgroup)\\b|\\[\\[")))
             *members += "char _mmB"+to_string(index++)+";\n";
         if (isValue || regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[]")))
             return param;
@@ -607,18 +607,19 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
         else if (bindingName.rfind("_in_", 0) == 0)
             args.sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
     }
-    if (argsBinding != NULL)
-        args = getPackedArguments(argsBinding, args.sizes.size()-1);
+    bool validArguments = (!packed || (argsBinding != NULL && getPackedArguments(argsBinding, args.sizes.size()-1, args)));
     if (function != NULL)
         function->release();
     pool->release();
     if (kernel == NULL)
         throw OpenMMException("Error creating kernel "+name);
+    if (!validArguments)
+        throw OpenMMException("Error creating kernel "+name+": its packed arguments don't match its buffer bindings");
     kernelArguments[kernel] = args;
     return kernel;
 }
 
-MetalContext::KernelArguments MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffers) {
+bool MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffers, KernelArguments& args) {
     // The struct has a marker member for each declared argument, numbered in source order: _mmB<n> for
     // a buffer, and _mmV<n> followed by _mmE<n> for a value.  Arguments past the last marker came from
     // macros, and are buffers.
@@ -630,7 +631,7 @@ MetalContext::KernelArguments MetalContext::getPackedArguments(MTL::BufferBindin
         if (memberName.rfind("_mmB", 0) == 0 || memberName.rfind("_mmV", 0) == 0)
             markers[stoi(memberName.substr(4))] = member;
     }
-    KernelArguments args;
+    args = KernelArguments();
     for (auto& marker : markers) {
         string memberName = marker.second->name()->utf8String();
         int offset = marker.second->offset();
@@ -644,10 +645,12 @@ MetalContext::KernelArguments MetalContext::getPackedArguments(MTL::BufferBindin
         args.sizes.push_back(size);
         args.offsets.push_back(offset);
     }
+    if (numBuffers < 0)
+        return false;
     args.sizes.resize(args.sizes.size()+numBuffers, 0);
     args.offsets.resize(args.sizes.size(), 0);
     args.packedSize = binding->bufferDataSize();
-    return args;
+    return true;
 }
 
 vector<ComputeContext*> MetalContext::getAllContexts() {
