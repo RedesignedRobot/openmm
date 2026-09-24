@@ -53,7 +53,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0) {
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
@@ -252,15 +252,24 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {
-        // Select a size for the arrays that hold the neighbor list.  We have to make a fairly
-        // arbitrary guess, but if this turns out to be too small we'll increase it later.
+        // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
+        // the list could ever hold fit in 1/256 of the device's unused working set, it can't overflow, and
+        // the host only waits for the interaction count on steps that set the reordering baseline.  With
+        // several contexts, one context's blocks can have more than its share of tiles.  Otherwise we have to
+        // make a fairly arbitrary guess, but if this turns out to be too small we'll increase it later.
 
+        long long maxPossiblePairs = getMaxBitsForPairs()*(long long) MetalContext::TileSize*numTiles;
+        long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
+        long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
+        waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
         maxTiles = 20*numAtomBlocks;
-        if (maxTiles > numTiles)
+        if (maxTiles > numTiles || !waitForCount)
             maxTiles = numTiles;
         if (maxTiles < 1)
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
+        if (!waitForCount && maxSinglePairs < maxPossiblePairs)
+            maxSinglePairs = maxPossiblePairs;
         // METAL-TODO: This may require tuning
         numTilesInBatch = 1;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
@@ -424,7 +433,8 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
-    downloadCountEvent->signal();
+    if (waitForCount || context.getStepsSinceReorder() == 0)
+        downloadCountEvent->signal();
 }
 
 void MetalNonbondedUtilities::initParamArgs() {
@@ -450,7 +460,10 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
     }
     if (useNeighborList && numTiles > 0) {
         context.getCurrentStream().commit();
-        downloadCountEvent->poll();
+        // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
+        // guides reordering, which needs the exact count right after a reorder.
+        if (waitForCount || context.getStepsSinceReorder() == 0)
+            downloadCountEvent->poll();
         updateNeighborListSize();
     }
 }
@@ -509,6 +522,34 @@ void MetalNonbondedUtilities::setAtomBlockRange(double startFraction, double end
     forceRebuildNeighborList = true;
 }
 
+int MetalNonbondedUtilities::getMaxBitsForPairs() const {
+    int maxBits = 0;
+    if (canUsePairList) {
+        if (context.getUseDoublePrecision()) {
+            maxBits = 4;
+        }
+        else {
+            if (context.getSIMDWidth() > 32) {
+                // CDNA
+                if (context.getNumAtoms() < 100000)
+                    maxBits = 4;
+                else // Large systems
+                    maxBits = 0;
+            }
+            else {
+                // RDNA
+                if (context.getNumAtoms() < 100000)
+                    maxBits = 4;
+                else if (context.getNumAtoms() < 500000)
+                    maxBits = 2;
+                else // Very large systems
+                    maxBits = 0;
+            }
+        }
+    }
+    return maxBits;
+}
+
 void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
     KernelSet kernels;
     string source;
@@ -538,31 +579,7 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
-        int maxBits = 0;
-        if (canUsePairList) {
-            if (context.getUseDoublePrecision()) {
-                maxBits = 4;
-            }
-            else {
-                if (context.getSIMDWidth() > 32) {
-                    // CDNA
-                    if (context.getNumAtoms() < 100000)
-                        maxBits = 4;
-                    else // Large systems
-                        maxBits = 0;
-                }
-                else {
-                    // RDNA
-                    if (context.getNumAtoms() < 100000)
-                        maxBits = 4;
-                    else if (context.getNumAtoms() < 500000)
-                        maxBits = 2;
-                    else // Very large systems
-                        maxBits = 0;
-                }
-            }
-        }
-        defines["MAX_BITS_FOR_PAIRS"] = context.intToString(maxBits);
+        defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         int binShift = 1;

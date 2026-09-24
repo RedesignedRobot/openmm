@@ -99,9 +99,9 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
 }
 
 void testCommitsPerStep() {
-    // Each step is submitted once.  With a neighbor list, the buffer holds the event the host
-    // waits on for the interaction count, followed by the force kernels, and is submitted before
-    // that wait.  The rest of the step goes with the next step's neighbor list.
+    // Each step is submitted once.  With a neighbor list, the buffer holds the neighbor list and the
+    // force kernels, and is submitted before the host waits for the interaction count, if it has to.
+    // The rest of the step goes with the next step's neighbor list.
 
     double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
     double pme = measureCommitsPerStep(NonbondedForce::PME);
