@@ -75,6 +75,7 @@ private:
     double downloadReturnValueFinish();
     double downloadReturnValueSync();
     double downloadGradNormSync();
+    void executeReduction(ComputeKernel& kernel, int numThreads);
     void runLineSearchKernels();
 
     ComputeContext& cc;
@@ -87,7 +88,7 @@ private:
     std::vector<mm_int2> hostConstraintIndices;
     std::vector<double> hostConstraintDistances;
 
-    bool isSetup, mixedIsDouble;
+    bool isSetup, mixedIsDouble, singleBlockReductions;
     int elementSize, threadBlockSize;
     void* pinnedMemory;
 

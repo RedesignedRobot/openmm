@@ -124,7 +124,11 @@ DEVICE mixed reduceMax(mixed value, LOCAL_ARG volatile mixed* temp) {
 }
 
 DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
-#if defined(__CUDA_ARCH__) || defined(USE_HIP)
+#if defined(SINGLE_BLOCK_REDUCTIONS)
+
+    *target += value;
+
+#elif defined(__CUDA_ARCH__) || defined(USE_HIP)
 
     // Do atomic addition of floating-point values directly
     atomicAdd(target, value);
@@ -156,7 +160,6 @@ DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
     #endif
 #elif defined(__METAL_VERSION__)
 
-    // Metal only supports single precision, which has atomic floating-point addition
     ATOMIC_ADD(target, value);
 
 #else
