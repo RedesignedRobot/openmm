@@ -534,8 +534,6 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << "typedef double4 mixed4;\n";
     }
     else {
-        // Metal has no double, so single precision kernels that name it get float.
-        src << "#define double float\n";
         src << "typedef float mixed;\n";
         src << "typedef float2 mixed2;\n";
         src << "typedef float3 mixed3;\n";
