@@ -356,6 +356,83 @@ KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real
         mixed4 xp1 = posDelta[atoms.y];
         mixed4 apos2 = loadPos(oldPos, posqCorrection, atoms.z);
         mixed4 xp2 = posDelta[atoms.z];
+#ifdef USE_MIXED_PRECISION
+        // Solve the same equations as SETTLE by Newton's method: move the atoms along the old bonds, weighted by
+        // inverse mass, until the bonds have the right lengths.  The analytic solution below needs much more
+        // arithmetic in mixed precision.  The iterations run in real precision until the residuals are near its
+        // resolution, then one last step from residuals in mixed precision brings them to about 1e-12 of the
+        // squared bond lengths.
+
+        real w0 = (real) velm[atoms.x].w;
+        real w1 = (real) velm[atoms.y].w;
+        real w2 = (real) velm[atoms.z].w;
+        mixed3 b01 = make_mixed3(apos1.x-apos0.x, apos1.y-apos0.y, apos1.z-apos0.z);
+        mixed3 b02 = make_mixed3(apos2.x-apos0.x, apos2.y-apos0.y, apos2.z-apos0.z);
+        real3 s01 = make_real3((real) b01.x, (real) b01.y, (real) b01.z);
+        real3 s02 = make_real3((real) b02.x, (real) b02.y, (real) b02.z);
+        real3 s12 = s02-s01;
+        real3 r01 = s01+make_real3((real) (xp1.x-xp0.x), (real) (xp1.y-xp0.y), (real) (xp1.z-xp0.z));
+        real3 r02 = s02+make_real3((real) (xp2.x-xp0.x), (real) (xp2.y-xp0.y), (real) (xp2.z-xp0.z));
+        real d01sq = params.x*params.x;
+        real d12sq = params.y*params.y;
+        real3 dx0 = make_real3(0), dx1 = make_real3(0), dx2 = make_real3(0);
+        bool last = false;
+        for (int iteration = 0; !last; iteration++) {
+            real3 f01 = r01+dx1-dx0;
+            real3 f02 = r02+dx2-dx0;
+            real3 f12 = f02-f01;
+            real g01 = d01sq-dot(f01, f01);
+            real g02 = d01sq-dot(f02, f02);
+            real g12 = d12sq-dot(f12, f12);
+            last = (iteration == 14 || (fabs(g01) < 1e-6f*d01sq && fabs(g02) < 1e-6f*d01sq && fabs(g12) < 1e-6f*d12sq));
+            if (last) {
+                // Move the corrections so far into the mixed precision displacements, so the last step is not
+                // rounded to the resolution of the earlier ones.
+
+                xp0.x += dx0.x;
+                xp0.y += dx0.y;
+                xp0.z += dx0.z;
+                xp1.x += dx1.x;
+                xp1.y += dx1.y;
+                xp1.z += dx1.z;
+                xp2.x += dx2.x;
+                xp2.y += dx2.y;
+                xp2.z += dx2.z;
+                dx0 = make_real3(0);
+                dx1 = make_real3(0);
+                dx2 = make_real3(0);
+                mixed3 m01 = make_mixed3(b01.x+xp1.x-xp0.x, b01.y+xp1.y-xp0.y, b01.z+xp1.z-xp0.z);
+                mixed3 m02 = make_mixed3(b02.x+xp2.x-xp0.x, b02.y+xp2.y-xp0.y, b02.z+xp2.z-xp0.z);
+                mixed3 m12 = make_mixed3(m02.x-m01.x, m02.y-m01.y, m02.z-m01.z);
+                g01 = (real) ((mixed) params.x*params.x - (m01.x*m01.x + m01.y*m01.y + m01.z*m01.z));
+                g02 = (real) ((mixed) params.x*params.x - (m02.x*m02.x + m02.y*m02.y + m02.z*m02.z));
+                g12 = (real) ((mixed) params.y*params.y - (m12.x*m12.x + m12.y*m12.y + m12.z*m12.z));
+            }
+
+            // Solve the linearized equations for the multipliers of the three bonds.
+
+            real a11 = (w0+w1)*dot(f01, s01), a12 = w0*dot(f01, s02), a13 = -w1*dot(f01, s12);
+            real a21 = w0*dot(f02, s01), a22 = (w0+w2)*dot(f02, s02), a23 = w2*dot(f02, s12);
+            real a31 = -w1*dot(f12, s01), a32 = w2*dot(f12, s02), a33 = (w1+w2)*dot(f12, s12);
+            real c11 = a22*a33-a23*a32, c12 = a23*a31-a21*a33, c13 = a21*a32-a22*a31;
+            real scale = 0.5f/(a11*c11 + a12*c12 + a13*c13);
+            real l01 = (g01*c11 + g02*(a13*a32-a12*a33) + g12*(a12*a23-a13*a22))*scale;
+            real l02 = (g01*c12 + g02*(a11*a33-a13*a31) + g12*(a13*a21-a11*a23))*scale;
+            real l12 = (g01*c13 + g02*(a12*a31-a11*a32) + g12*(a11*a22-a12*a21))*scale;
+            dx0 -= (s01*l01 + s02*l02)*w0;
+            dx1 += (s01*l01 - s12*l12)*w1;
+            dx2 += (s02*l02 + s12*l12)*w2;
+        }
+        xp0.x += dx0.x;
+        xp0.y += dx0.y;
+        xp0.z += dx0.z;
+        xp1.x += dx1.x;
+        xp1.y += dx1.y;
+        xp1.z += dx1.z;
+        xp2.x += dx2.x;
+        xp2.y += dx2.y;
+        xp2.z += dx2.z;
+#else
         mixed m0 = 1/velm[atoms.x].w;
         mixed m1 = 1/velm[atoms.y].w;
         mixed m2 = 1/velm[atoms.z].w;
@@ -482,6 +559,7 @@ KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real
         xp2.x = xcom + xc3 - xc0;
         xp2.y = ycom + yc3 - yc0;
         xp2.z = zcom + zc3 - zc0;
+#endif
 
         // Record the new positions.
 
