@@ -49,8 +49,11 @@ void MetalEvent::enqueue() {
 }
 
 void MetalEvent::wait() {
+    // Waiting on the command buffer instead of the event delays the start of the next command buffer
+    // by about 40 us on the M3 Ultra.  The status check returns if the buffer fails before the signal.
     if (buffer != NULL)
-        buffer->waitUntilCompleted();
+        while (!event->waitUntilSignaledValue(value, 100) && buffer->status() < MTL::CommandBufferStatusCompleted)
+            ;
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
