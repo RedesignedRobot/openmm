@@ -27,8 +27,11 @@
 
 #include "openmm/common/ComputeQueue.h"
 #include <Metal/Metal.hpp>
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <thread>
 
 typedef MTL::CommandQueue* metalStream_t;
 
@@ -51,6 +54,11 @@ public:
     metalStream_t getStream() {
         return stream;
     }
+    /**
+     * Get the lock that callers must hold for as long as they use the encoder or command buffer this
+     * returns, since after commitWhenIdle() another thread can commit the open buffer whenever the lock
+     * is free.
+     */
     std::recursive_mutex& getLock() {
         return lock;
     }
@@ -63,18 +71,37 @@ public:
     void setConcurrentDispatch(bool concurrent);
     void commit();
     void finish();
+    /**
+     * Get whether the GPU has finished every command buffer committed to this queue.
+     */
+    bool isIdle();
+    /**
+     * Get whether every kernel encoded on this queue has been committed and has finished.
+     */
+    bool isDrained();
+    /**
+     * From now on, commit the open command buffer from a background thread whenever the GPU finishes every
+     * committed buffer.  Code that can leave steps open calls this, so they don't wait for the host's next
+     * commit after Integrator::step() returns.
+     */
+    void commitWhenIdle();
     long long getCommitCount() const {
         return commitCount;
     }
 private:
     void endEncoding();
+    void submit();
+    void runIdleCommits();
     metalStream_t stream;
     MTL::CommandBuffer* openBuffer;
     MTL::ComputeCommandEncoder* encoder;
     bool concurrentDispatch;
     std::deque<MTL::CommandBuffer*> pending;
-    long long commitCount;
+    std::atomic<long long> commitCount;
     std::recursive_mutex lock;
+    std::condition_variable_any bufferOpened;
+    std::thread committer;
+    bool stopCommitter;
 };
 
 } // namespace OpenMM

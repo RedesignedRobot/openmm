@@ -262,6 +262,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
         long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
+        if (!waitForCount)
+            context.getCurrentStream().commitWhenIdle();
         maxTiles = 20*numAtomBlocks;
         if (maxTiles > numTiles || !waitForCount)
             maxTiles = numTiles;

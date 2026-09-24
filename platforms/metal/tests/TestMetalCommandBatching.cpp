@@ -29,7 +29,8 @@
 
 /**
  * This tests that the Metal platform batches kernels into a few command buffers per step,
- * instead of submitting each kernel separately.
+ * instead of submitting each kernel separately, and that work left open when step() returns
+ * still reaches the GPU.
  */
 
 #include "openmm/internal/AssertionUtilities.h"
@@ -42,7 +43,9 @@
 #include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 using namespace OpenMM;
 using namespace std;
@@ -60,19 +63,17 @@ public:
 
 static QueuePlatform platform;
 
-double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
+void createSystem(System& system, vector<Vec3>& positions, NonbondedForce::NonbondedMethod method) {
     // NonbondedForce only uses a neighbor list for more than 3000 particles.
 
     const int gridSize = 15;
     const double spacing = 0.4;
-    System system;
     double boxSize = gridSize*spacing;
     system.setDefaultPeriodicBoxVectors(Vec3(boxSize, 0, 0), Vec3(0, boxSize, 0), Vec3(0, 0, boxSize));
     NonbondedForce* nonbonded = new NonbondedForce();
     nonbonded->setNonbondedMethod(method);
     nonbonded->setCutoffDistance(1.0);
     HarmonicBondForce* bonds = new HarmonicBondForce();
-    vector<Vec3> positions;
     for (int i = 0; i < gridSize; i++)
         for (int j = 0; j < gridSize; j++)
             for (int k = 0; k < gridSize; k++) {
@@ -86,6 +87,12 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
             }
     system.addForce(nonbonded);
     system.addForce(bonds);
+}
+
+double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
+    System system;
+    vector<Vec3> positions;
+    createSystem(system, positions, method);
     LangevinMiddleIntegrator integrator(300.0, 1.0, 0.002);
     Context context(system, integrator, platform);
     context.setPositions(positions);
@@ -110,9 +117,57 @@ void testCommitsPerStep() {
     ASSERT(pme <= 1.1);
 }
 
+void testWorkLeftOpenAfterStep() {
+    // Work left open when step() returns must reach the GPU while the host does something else, and
+    // committing it from another thread must not change the trajectory.
+
+    System system;
+    vector<Vec3> positions;
+    createSystem(system, positions, NonbondedForce::PME);
+    map<string, string> properties;
+    properties[MetalPlatform::MetalDeterministicForces()] = "true";
+    LangevinMiddleIntegrator integrator1(300.0, 1.0, 0.002);
+    LangevinMiddleIntegrator integrator2(300.0, 1.0, 0.002);
+    integrator1.setRandomNumberSeed(5);
+    integrator2.setRandomNumberSeed(5);
+    Context context1(system, integrator1, platform, properties);
+    Context context2(system, integrator2, platform, properties);
+    context1.setPositions(positions);
+    context2.setPositions(positions);
+
+    // After 25 steps the neighbor list may ask for an early reorder, based on an interaction count whose
+    // age depends on how far ahead the host runs, so the two contexts could reorder at different steps.
+
+    const int numSteps = 25;
+    MetalQueue& queue = platform.getQueue(context1);
+    long long start = queue.getCommitCount();
+    integrator1.step(numSteps);
+
+    // The host leaves the queue alone for 50 ms, and a slow GPU gets up to 10 s more.
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+    auto deadline = chrono::steady_clock::now()+chrono::seconds(10);
+    while (!queue.isDrained() && chrono::steady_clock::now() < deadline)
+        this_thread::sleep_for(chrono::milliseconds(1));
+    ASSERT(queue.isDrained());
+    cout << "Commits per step without a sync: " << (queue.getCommitCount()-start)/(double) numSteps << endl;
+
+    // context2 synchronizes after every step, so no command buffer holds work from two steps.
+
+    for (int i = 0; i < numSteps; i++) {
+        integrator2.step(1);
+        context2.getState(State::Positions);
+    }
+    vector<Vec3> positions1 = context1.getState(State::Positions).getPositions();
+    vector<Vec3> positions2 = context2.getState(State::Positions).getPositions();
+    for (int i = 0; i < system.getNumParticles(); i++)
+        ASSERT(positions1[i] == positions2[i]);
+}
+
 int main(int argc, char* argv[]) {
     try {
         testCommitsPerStep();
+        testWorkLeftOpenAfterStep();
     }
     catch(const exception& e) {
         cout << "exception: " << e.what() << endl;
