@@ -53,6 +53,11 @@ public:
      */
     void wait();
     /**
+     * Like wait(), but poll the event instead of blocking in Metal.  The host wakes sooner after
+     * the signal, and spends CPU time while it waits.
+     */
+    void poll();
+    /**
      * Enqueue a barrier that causes a specified ComputeQueue to block until all
      * operations started before the call to enqueue() have completed.
      */

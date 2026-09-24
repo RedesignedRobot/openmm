@@ -25,6 +25,8 @@
 
 #include "MetalEvent.h"
 #include "openmm/OpenMMException.h"
+#include <atomic>
+#include <unistd.h>
 
 using namespace OpenMM;
 
@@ -60,6 +62,15 @@ void MetalEvent::wait() {
     if (buffer != NULL)
         while (!event->waitUntilSignaledValue(value, 100) && buffer->status() < MTL::CommandBufferStatusCompleted)
             ;
+}
+
+void MetalEvent::poll() {
+    // On the M3 Ultra, waitUntilSignaledValue() wakes the host 90 to 110 us after the signal, and a 10 us
+    // poll within about 22 us.  The fence orders the host's reads of GPU results after the signal.
+    if (buffer != NULL)
+        while (event->signaledValue() < value && buffer->status() < MTL::CommandBufferStatusCompleted)
+            usleep(10);
+    std::atomic_thread_fence(std::memory_order_acquire);
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {

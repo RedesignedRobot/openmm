@@ -450,7 +450,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
     }
     if (useNeighborList && numTiles > 0) {
         context.getCurrentStream().commit();
-        downloadCountEvent->wait();
+        downloadCountEvent->poll();
         updateNeighborListSize();
     }
 }
