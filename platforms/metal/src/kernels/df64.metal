@@ -112,6 +112,8 @@ struct alignas(8) df64 {
 #define DF64_COMPOUND(AS) \
     AS df64& operator+=(df64 v) AS; \
     AS df64& operator-=(df64 v) AS; \
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> AS df64& operator+=(T v) AS; \
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> AS df64& operator-=(T v) AS; \
     AS df64& operator*=(df64 v) AS; \
     AS df64& operator/=(df64 v) AS;
     DF64_COMPOUND(thread)
@@ -322,6 +324,8 @@ template <DF64_INTEGRAL(T)> inline df64 operator/(T x, df64 y) { return df64(x) 
 #define DF64_COMPOUND(AS) \
 inline AS df64& df64::operator+=(df64 v) AS { return *this = df64(*this) + v; } \
 inline AS df64& df64::operator-=(df64 v) AS { return *this = df64(*this) - v; } \
+template <typename T, typename> inline AS df64& df64::operator+=(T v) AS { return *this = df64(*this) + v; } \
+template <typename T, typename> inline AS df64& df64::operator-=(T v) AS { return *this = df64(*this) - v; } \
 inline AS df64& df64::operator*=(df64 v) AS { return *this = df64(*this) * v; } \
 inline AS df64& df64::operator/=(df64 v) AS { return *this = df64(*this) / v; }
 DF64_COMPOUND(thread)
