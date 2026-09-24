@@ -29,6 +29,10 @@
 using namespace OpenMM;
 using namespace std;
 
+// Every committed command buffer holds memory until it completes, so the host stops this many buffers
+// ahead of the GPU.
+static const int MaxBuffersInFlight = 8;
+
 MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), commitCount(0) {
 }
 
@@ -77,6 +81,8 @@ void MetalQueue::commit() {
         openBuffer = NULL;
         commitCount++;
     }
+    if ((int) pending.size() > MaxBuffersInFlight)
+        pending.front()->waitUntilCompleted();
     while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
         MTL::CommandBuffer* buffer = pending.front();
         pending.pop_front();
