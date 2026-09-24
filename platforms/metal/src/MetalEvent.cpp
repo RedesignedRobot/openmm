@@ -41,11 +41,17 @@ MetalEvent::~MetalEvent() {
 void MetalEvent::enqueue() {
     MetalQueue& queue = context.getCurrentStream();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    signal();
+    queue.commit();
+}
+
+void MetalEvent::signal() {
+    MetalQueue& queue = context.getCurrentStream();
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     if (buffer != NULL)
         buffer->release();
     buffer = queue.getCommandBuffer()->retain();
     buffer->encodeSignalEvent(event, ++value);
-    queue.commit();
 }
 
 void MetalEvent::wait() {

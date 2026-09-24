@@ -44,6 +44,11 @@ public:
      */
     void enqueue();
     /**
+     * Place the event into the current command buffer without committing it, so the
+     * operations that follow share the buffer.  Commit the queue before calling wait().
+     */
+    void signal();
+    /**
      * Block until all operations started before the call to enqueue() have completed.
      */
     void wait();

@@ -27,6 +27,7 @@
 #include "MetalNonbondedUtilities.h"
 #include "MetalArray.h"
 #include "MetalContext.h"
+#include "MetalEvent.h"
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
@@ -55,7 +56,7 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
         pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
     // Decide how many thread blocks to use.
 
-    downloadCountEvent = context.createEvent();
+    downloadCountEvent = std::make_shared<MetalEvent>(context);
     pinnedCountDeviceMemory = context.getDevice()->newBuffer(2*sizeof(unsigned int), MTL::ResourceStorageModeShared);
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
     numForceThreadBlocks = 10*4*context.getMultiprocessors();
@@ -421,7 +422,9 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     forceRebuildNeighborList = false;
     context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
-    downloadCountEvent->enqueue();
+    // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
+    // too.  computeInteractions() commits it before waiting for the count.
+    downloadCountEvent->signal();
 }
 
 void MetalNonbondedUtilities::initParamArgs() {
