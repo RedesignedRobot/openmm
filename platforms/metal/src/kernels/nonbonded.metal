@@ -59,6 +59,19 @@
  * [in]interactingAtoms - a list of interactions within a given tile
  *
  */
+
+/**
+ * The first neighbor list tile of a warp. Each warp takes as many tiles as a loop striding over the exclusion tiles,
+ * then the neighbor list, would give it, so the work stays balanced with the first loop.
+ */
+__device__ inline unsigned int firstNeighborListTile(unsigned int numTiles, unsigned int warp, unsigned int totalWarps) {
+    // How many tiles a loop striding by totalWarps gives to the warps below this one.
+    const unsigned int allTiles = LAST_EXCLUSION_TILE+numTiles;
+    const unsigned int belowInAllTiles = (allTiles/totalWarps)*warp + min(warp, allTiles%totalWarps);
+    const unsigned int belowInExclusionTiles = (LAST_EXCLUSION_TILE/totalWarps)*warp + min(warp, LAST_EXCLUSION_TILE%totalWarps);
+    return belowInAllTiles-belowInExclusionTiles;
+}
+
 extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded(
         unsigned long long* __restrict__ forceBuffers, mixed* __restrict__ energyBuffer, const real4* __restrict__ posq, const tileflags* __restrict__ exclusions,
         const int2* __restrict__ exclusionTiles, unsigned int startTileIndex, unsigned long long numTileIndices
@@ -235,16 +248,17 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
+    real3 force = make_real3(0);
 #ifdef USE_NEIGHBOR_LIST
     const unsigned int numTiles = interactionCount[0];
     if (numTiles > maxTiles)
         return; // There wasn't enough memory for the neighbor list.
-    for (unsigned int pos0 = warp; pos0 < LAST_EXCLUSION_TILE+numTiles; pos0+=totalWarps) {
-        // Skip warps that may be still busy in the first loop
-        if (pos0 < LAST_EXCLUSION_TILE) {
-            continue;
-        }
-        const unsigned int pos = pos0-LAST_EXCLUSION_TILE;
+
+    // Each warp takes a contiguous range of tiles. findBlocksWithInteractions stores each x block's tiles next to each
+    // other, so the forces on the x atoms stay in registers until x changes, which saves three emulated 64 bit atomic
+    // adds per tile.
+    const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
+    for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
 #else
     int pos = (int) (startTileIndex+warp*numTileIndices/totalWarps);
     int end = (int) (startTileIndex+(warp+1)*numTileIndices/totalWarps);
@@ -252,7 +266,6 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     int skipTiles = -1;
     for (; pos < end; pos++) {
 #endif
-        real3 force = make_real3(0);
         bool includeTile = true;
 
         // Extract the coordinates of this tile.
@@ -432,9 +445,17 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 
             // Write results.
 #ifdef INCLUDE_FORCES
-            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(force.x)));
-            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
-            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
+#ifdef USE_NEIGHBOR_LIST
+            const bool writeForce = (pos+1 == end || tiles[pos+1] != x);
+#else
+            const bool writeForce = true;
+#endif
+            if (writeForce) {
+                atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(force.x)));
+                atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
+                atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
+                force = make_real3(0);
+            }
             unsigned int atom2 = atomIndex;
             if (atom2 < PADDED_NUM_ATOMS) {
                 atomicAdd(&forceBuffers[atom2], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
