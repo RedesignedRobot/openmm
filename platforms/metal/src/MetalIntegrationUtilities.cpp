@@ -25,6 +25,8 @@
 
 #include "MetalIntegrationUtilities.h"
 #include "MetalContext.h"
+#include "MetalKernelSources.h"
+#include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
 
 using namespace OpenMM;
@@ -159,4 +161,74 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
             vsiteForceKernel->execute(numVsites);
         }
     }
+}
+
+bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
+    if (ccmaConstraintAtoms.isInitialized() || context.getUseDoublePrecision())
+        return false;
+    ContextSelector selector(context);
+    if (!langevinMiddleKernel) {
+        // Each thread handles one unit: a SETTLE cluster, a SHAKE cluster, or an atom in neither.
+
+        int numAtoms = context.getNumAtoms();
+        vector<bool> isConstrained(numAtoms, false);
+        int numSettle = 0, numShake = 0;
+        if (settleAtoms.isInitialized()) {
+            vector<mm_int4> atoms;
+            settleAtoms.download(atoms);
+            numSettle = atoms.size();
+            for (mm_int4 cluster : atoms)
+                isConstrained[cluster.x] = isConstrained[cluster.y] = isConstrained[cluster.z] = true;
+        }
+        if (shakeAtoms.isInitialized()) {
+            vector<mm_int4> atoms;
+            shakeAtoms.download(atoms);
+            numShake = atoms.size();
+            for (mm_int4 cluster : atoms)
+                for (int atom : {cluster.x, cluster.y, cluster.z, cluster.w})
+                    if (atom != -1)
+                        isConstrained[atom] = true;
+        }
+        vector<int> unconstrained;
+        for (int i = 0; i < numAtoms; i++)
+            if (!isConstrained[i])
+                unconstrained.push_back(i);
+        if (unconstrained.size() > 0) {
+            freeAtoms.initialize<int>(context, unconstrained.size(), "freeAtoms");
+            freeAtoms.upload(unconstrained);
+        }
+        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, defines);
+        numLangevinMiddleUnits = numSettle+numShake+unconstrained.size();
+        langevinMiddleKernel = program->createKernel("integrateLangevinMiddleFused");
+        langevinMiddleKernel->addArg(numSettle);
+        langevinMiddleKernel->addArg(numShake);
+        langevinMiddleKernel->addArg(numLangevinMiddleUnits);
+        langevinMiddleKernel->addArg(context.getPaddedNumAtoms());
+        langevinMiddleKernel->addArg(); // The tolerance will be set just before it is executed.
+        langevinMiddleKernel->addArg(context.getPosq());
+        if (context.getUseMixedPrecision())
+            langevinMiddleKernel->addArg(context.getPosqCorrection());
+        else
+            langevinMiddleKernel->addArg(nullptr);
+        langevinMiddleKernel->addArg(context.getVelm());
+        langevinMiddleKernel->addArg(context.getLongForceBuffer());
+        langevinMiddleKernel->addArg(); // The parameters will be set just before it is executed.
+        langevinMiddleKernel->addArg(stepSize);
+        langevinMiddleKernel->addArg(random);
+        langevinMiddleKernel->addArg(); // The random index will be set just before it is executed.
+        for (ComputeArray* array : {&settleAtoms, &settleParams, &shakeAtoms, &shakeParams, &freeAtoms}) {
+            if (array->isInitialized())
+                langevinMiddleKernel->addArg(*array);
+            else
+                langevinMiddleKernel->addArg(nullptr);
+        }
+    }
+    if (context.getUseMixedPrecision())
+        langevinMiddleKernel->setArg(4, tol);
+    else
+        langevinMiddleKernel->setArg(4, (float) tol);
+    langevinMiddleKernel->setArg(9, params);
+    langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
+    langevinMiddleKernel->execute(numLangevinMiddleUnits);
+    return true;
 }

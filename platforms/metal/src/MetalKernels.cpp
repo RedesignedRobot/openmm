@@ -96,3 +96,8 @@ void MetalCalcConstantPotentialForceKernel::initialize(const System& system, con
     getMetalPmeParameters(cu, usePmeQueue, useFixedPointChargeSpreading);
     commonInitialize(system, force, false, useFixedPointChargeSpreading);
 }
+
+void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
+    if (!cu.getIntegrationUtilities().integrateLangevinMiddle(params, tol))
+        CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
+}
