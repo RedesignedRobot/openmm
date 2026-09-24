@@ -94,6 +94,15 @@ inline DEVICE void storePos(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT 
 }
 
 /**
+ * Metal emulates mixed precision with pairs of floats, which makes every mixed operation several times the cost of
+ * a real one.  There the constraint kernels evaluate residuals in mixed precision but compute the corrections in
+ * real precision, and iterate until the residuals meet the tolerance.
+ */
+#if defined(USE_METAL) && defined(USE_MIXED_PRECISION)
+#define EMULATED_MIXED_PRECISION
+#endif
+
+/**
  * Enforce constraints on SHAKE clusters
  */
 KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4* RESTRICT oldPos,
@@ -132,8 +141,7 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
             xpj3 = posDelta[atoms.w];
         }
 
-        // Precompute quantities.  The residuals are evaluated in mixed precision, but the corrections
-        // only need to be as accurate as real, because each iteration corrects the error of the last one.
+        // Precompute quantities.
 
         mixed3 rij1 = make_mixed3(pos.x-pos1.x, pos.y-pos1.y, pos.z-pos1.z);
         mixed3 rij2 = make_mixed3(pos.x-pos2.x, pos.y-pos2.y, pos.z-pos2.z);
@@ -144,10 +152,12 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
         mixed ld1 = d2-rij1sq;
         mixed ld2 = d2-rij2sq;
         mixed ld3 = d2-rij3sq;
+#ifdef EMULATED_MIXED_PRECISION
         real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
         real3 r2 = make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z);
         real3 r3 = make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z);
         real maxResidual = d2*(real) tol;
+#endif
 
         // Iterate until convergence.
 
@@ -158,10 +168,17 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
             mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
             mixed rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
             mixed rrpr = rij1.x*rpij.x + rij1.y*rpij.y + rij1.z*rpij.z;
+#ifdef EMULATED_MIXED_PRECISION
             real residual = (real) (ld1-2.0f*rrpr-rpsqij);
             if (fabs(residual) >= maxResidual) {
                 real acor = residual*avgMass / ((real) rrpr+(real) rij1sq);
                 real3 dr = r1*acor;
+#else
+            mixed diff = fabs(ld1-2.0f*rrpr-rpsqij) / (d2*tol);
+            if (diff >= 1.0f) {
+                mixed acor  = (ld1-2.0f*rrpr-rpsqij)*avgMass / (rrpr+rij1sq);
+                mixed3 dr = rij1*acor;
+#endif
                 xpi.x += dr.x*invMassCentral;
                 xpi.y += dr.y*invMassCentral;
                 xpi.z += dr.z*invMassCentral;
@@ -174,10 +191,17 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
                 rpij = make_mixed3(xpi.x-xpj2.x, xpi.y-xpj2.y, xpi.z-xpj2.z);
                 rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
                 rrpr = rij2.x*rpij.x + rij2.y*rpij.y + rij2.z*rpij.z;
+#ifdef EMULATED_MIXED_PRECISION
                 residual = (real) (ld2-2.0f*rrpr-rpsqij);
                 if (fabs(residual) >= maxResidual) {
                     real acor = residual*avgMass / ((real) rrpr+(real) rij2sq);
                     real3 dr = r2*acor;
+#else
+                diff = fabs(ld2-2.0f*rrpr-rpsqij) / (d2*tol);
+                if (diff >= 1.0f) {
+                    mixed acor  = (ld2 - 2.0f*rrpr - rpsqij)*avgMass / (rrpr + rij2sq);
+                    mixed3 dr = rij2*acor;
+#endif
                     xpi.x += dr.x*invMassCentral;
                     xpi.y += dr.y*invMassCentral;
                     xpi.z += dr.z*invMassCentral;
@@ -191,10 +215,17 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
                 rpij = make_mixed3(xpi.x-xpj3.x, xpi.y-xpj3.y, xpi.z-xpj3.z);
                 rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
                 rrpr = rij3.x*rpij.x + rij3.y*rpij.y + rij3.z*rpij.z;
+#ifdef EMULATED_MIXED_PRECISION
                 residual = (real) (ld3-2.0f*rrpr-rpsqij);
                 if (fabs(residual) >= maxResidual) {
                     real acor = residual*avgMass / ((real) rrpr+(real) rij3sq);
                     real3 dr = r3*acor;
+#else
+                diff = fabs(ld3 - 2.0f*rrpr - rpsqij) / (d2*tol);
+                if (diff >= 1.0f) {
+                    mixed acor  = (ld3-2.0f*rrpr-rpsqij)*avgMass / (rrpr+rij3sq);
+                    mixed3 dr = rij3*acor;
+#endif
                     xpi.x += dr.x*invMassCentral;
                     xpi.y += dr.y*invMassCentral;
                     xpi.z += dr.z*invMassCentral;
@@ -257,18 +288,23 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
             xpj3 = posDelta[atoms.w];
         }
 
-        // Precompute quantities.  The residuals are evaluated in mixed precision, but the corrections
-        // only need to be as accurate as real, because each iteration corrects the error of the last one.
+        // Precompute quantities.
 
         mixed3 rij1 = make_mixed3(pos.x-pos1.x, pos.y-pos1.y, pos.z-pos1.z);
         mixed3 rij2 = make_mixed3(pos.x-pos2.x, pos.y-pos2.y, pos.z-pos2.z);
         mixed3 rij3 = make_mixed3(pos.x-pos3.x, pos.y-pos3.y, pos.z-pos3.z);
+#ifdef EMULATED_MIXED_PRECISION
         real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
         real3 r2 = make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z);
         real3 r3 = make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z);
         real rij1sq = r1.x*r1.x + r1.y*r1.y + r1.z*r1.z;
         real rij2sq = r2.x*r2.x + r2.y*r2.y + r2.z*r2.z;
         real rij3sq = r3.x*r3.x + r3.y*r3.y + r3.z*r3.z;
+#else
+        mixed rij1sq = rij1.x*rij1.x + rij1.y*rij1.y + rij1.z*rij1.z;
+        mixed rij2sq = rij2.x*rij2.x + rij2.y*rij2.y + rij2.z*rij2.z;
+        mixed rij3sq = rij3.x*rij3.x + rij3.y*rij3.y + rij3.z*rij3.z;
+#endif
 
         // Iterate until convergence.
 
@@ -278,8 +314,13 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
             converged = true;
             mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
             mixed rrpr = rpij.x*rij1.x + rpij.y*rij1.y + rpij.z*rij1.z;
+#ifdef EMULATED_MIXED_PRECISION
             real delta = -2.0f*avgMass*(real) rrpr/rij1sq;
             real3 dr = r1*delta;
+#else
+            mixed delta = -2.0f*avgMass*rrpr/rij1sq;
+            mixed3 dr = rij1*delta;
+#endif
             xpi.x += dr.x*invMassCentral;
             xpi.y += dr.y*invMassCentral;
             xpi.z += dr.z*invMassCentral;
@@ -291,8 +332,13 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
             if (atoms.z != -1) {
                 rpij = make_mixed3(xpi.x-xpj2.x, xpi.y-xpj2.y, xpi.z-xpj2.z);
                 rrpr = rpij.x*rij2.x + rpij.y*rij2.y + rpij.z*rij2.z;
+#ifdef EMULATED_MIXED_PRECISION
                 delta = -2.0f*avgMass*(real) rrpr/rij2sq;
                 dr = r2*delta;
+#else
+                delta = -2.0f*avgMass*rrpr/rij2sq;
+                dr = rij2*delta;
+#endif
                 xpi.x += dr.x*invMassCentral;
                 xpi.y += dr.y*invMassCentral;
                 xpi.z += dr.z*invMassCentral;
@@ -305,8 +351,13 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
             if (atoms.w != -1) {
                 rpij = make_mixed3(xpi.x-xpj3.x, xpi.y-xpj3.y, xpi.z-xpj3.z);
                 rrpr = rpij.x*rij3.x + rpij.y*rij3.y + rpij.z*rij3.z;
+#ifdef EMULATED_MIXED_PRECISION
                 delta = -2.0f*avgMass*(real) rrpr/rij3sq;
                 dr = r3*delta;
+#else
+                delta = -2.0f*avgMass*rrpr/rij3sq;
+                dr = rij3*delta;
+#endif
                 xpi.x += dr.x*invMassCentral;
                 xpi.y += dr.y*invMassCentral;
                 xpi.z += dr.z*invMassCentral;
@@ -356,7 +407,7 @@ KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real
         mixed4 xp1 = posDelta[atoms.y];
         mixed4 apos2 = loadPos(oldPos, posqCorrection, atoms.z);
         mixed4 xp2 = posDelta[atoms.z];
-#ifdef USE_MIXED_PRECISION
+#ifdef EMULATED_MIXED_PRECISION
         // Solve the same equations as SETTLE by Newton's method: move the atoms along the old bonds, weighted by
         // inverse mass, until the bonds have the right lengths.  The analytic solution below needs much more
         // arithmetic in mixed precision.  The iterations run in real precision until the residuals are near its
@@ -593,10 +644,11 @@ KERNEL void applySettleToVelocities(int numClusters, mixed tol, GLOBAL const rea
         mixed4 v0 = velm[atoms.x];
         mixed4 v1 = velm[atoms.y];
         mixed4 v2 = velm[atoms.z];
-        
+#ifdef EMULATED_MIXED_PRECISION
+
         // Compute intermediate quantities: the atom masses, the bond directions, and the angle cosines and
         // sines.  They only set the size of the correction, which only needs to be as accurate as real.
-        
+
         real mA = 1/(real) v0.w;
         real mB = 1/(real) v1.w;
         real mC = 1/(real) v2.w;
@@ -630,14 +682,9 @@ KERNEL void applySettleToVelocities(int numClusters, mixed tol, GLOBAL const rea
         real invMass2 = (real) v2.w;
 
         // The relative velocities along the bonds are measured in mixed precision.  Solving in real leaves an error
-        // of about 1e-6 of them, so in mixed precision a second pass measures what is left and removes it.
+        // of about 1e-6 of them, so a second pass measures what is left and removes it.
 
-#ifdef USE_MIXED_PRECISION
-        const int passes = 2;
-#else
-        const int passes = 1;
-#endif
-        for (int pass = 0; pass < passes; pass++) {
+        for (int pass = 0; pass < 2; pass++) {
             real vAB = (real) ((v1.x-v0.x)*bAB.x + (v1.y-v0.y)*bAB.y + (v1.z-v0.z)*bAB.z)*invLengthAB;
             real vBC = (real) ((v2.x-v1.x)*bBC.x + (v2.y-v1.y)*bBC.y + (v2.z-v1.z)*bBC.z)*invLengthBC;
             real vCA = (real) ((v0.x-v2.x)*bCA.x + (v0.y-v2.y)*bCA.y + (v0.z-v2.z)*bCA.z)*invLengthCA;
@@ -654,6 +701,49 @@ KERNEL void applySettleToVelocities(int numClusters, mixed tol, GLOBAL const rea
             v2.y += (tca*eCA.y - tbc*eBC.y)*invMass2;
             v2.z += (tca*eCA.z - tbc*eBC.z)*invMass2;
         }
+#else
+        
+        // Compute intermediate quantities: the atom masses, the bond directions, the relative velocities,
+        // and the angle cosines and sines.
+        
+        mixed mA = 1/v0.w;
+        mixed mB = 1/v1.w;
+        mixed mC = 1/v2.w;
+        mixed3 eAB = make_mixed3(apos1.x-apos0.x, apos1.y-apos0.y, apos1.z-apos0.z);
+        mixed3 eBC = make_mixed3(apos2.x-apos1.x, apos2.y-apos1.y, apos2.z-apos1.z);
+        mixed3 eCA = make_mixed3(apos0.x-apos2.x, apos0.y-apos2.y, apos0.z-apos2.z);
+        eAB *= RSQRT(eAB.x*eAB.x + eAB.y*eAB.y + eAB.z*eAB.z);
+        eBC *= RSQRT(eBC.x*eBC.x + eBC.y*eBC.y + eBC.z*eBC.z);
+        eCA *= RSQRT(eCA.x*eCA.x + eCA.y*eCA.y + eCA.z*eCA.z);
+        mixed vAB = (v1.x-v0.x)*eAB.x + (v1.y-v0.y)*eAB.y + (v1.z-v0.z)*eAB.z;
+        mixed vBC = (v2.x-v1.x)*eBC.x + (v2.y-v1.y)*eBC.y + (v2.z-v1.z)*eBC.z;
+        mixed vCA = (v0.x-v2.x)*eCA.x + (v0.y-v2.y)*eCA.y + (v0.z-v2.z)*eCA.z;
+        mixed cA = -(eAB.x*eCA.x + eAB.y*eCA.y + eAB.z*eCA.z);
+        mixed cB = -(eAB.x*eBC.x + eAB.y*eBC.y + eAB.z*eBC.z);
+        mixed cC = -(eBC.x*eCA.x + eBC.y*eCA.y + eBC.z*eCA.z);
+        mixed s2A = 1-cA*cA;
+        mixed s2B = 1-cB*cB;
+        mixed s2C = 1-cC*cC;
+        
+        // Solve the equations.  These are different from those in the SETTLE paper (JCC 13(8), pp. 952-962, 1992), because
+        // in going from equations B1 to B2, they make the assumption that mB=mC (but don't bother to mention they're
+        // making that assumption).  We allow all three atoms to have different masses.
+        
+        mixed mABCinv = 1/(mA*mB*mC);
+        mixed denom = (((s2A*mB+s2B*mA)*mC+(s2A*mB*mB+2*(cA*cB*cC+1)*mA*mB+s2B*mA*mA))*mC+s2C*mA*mB*(mA+mB))*mABCinv;
+        mixed tab = ((cB*cC*mA-cA*mB-cA*mC)*vCA + (cA*cC*mB-cB*mC-cB*mA)*vBC + (s2C*mA*mA*mB*mB*mABCinv+(mA+mB+mC))*vAB)/denom;
+        mixed tbc = ((cA*cB*mC-cC*mB-cC*mA)*vCA + (s2A*mB*mB*mC*mC*mABCinv+(mA+mB+mC))*vBC + (cA*cC*mB-cB*mA-cB*mC)*vAB)/denom;
+        mixed tca = ((s2B*mA*mA*mC*mC*mABCinv+(mA+mB+mC))*vCA + (cA*cB*mC-cC*mB-cC*mA)*vBC + (cB*cC*mA-cA*mB-cA*mC)*vAB)/denom;
+        v0.x += (tab*eAB.x - tca*eCA.x)*v0.w;
+        v0.y += (tab*eAB.y - tca*eCA.y)*v0.w;
+        v0.z += (tab*eAB.z - tca*eCA.z)*v0.w;
+        v1.x += (tbc*eBC.x - tab*eAB.x)*v1.w;
+        v1.y += (tbc*eBC.y - tab*eAB.y)*v1.w;
+        v1.z += (tbc*eBC.z - tab*eAB.z)*v1.w;
+        v2.x += (tca*eCA.x - tbc*eBC.x)*v2.w;
+        v2.y += (tca*eCA.y - tbc*eBC.y)*v2.w;
+        v2.z += (tca*eCA.z - tbc*eBC.z)*v2.w;
+#endif
         velm[atoms.x] = v0;
         velm[atoms.y] = v1;
         velm[atoms.z] = v2;
