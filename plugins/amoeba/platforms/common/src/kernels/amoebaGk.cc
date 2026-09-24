@@ -345,7 +345,7 @@ typedef struct {
     real q, bornRadius, bornForce;
 } AtomData2;
 
-#if defined(USE_HIP)
+#if defined(USE_HIP) || defined(USE_METAL)
 #define ATOM2_ARG_SPEC
 #else
 #define ATOM2_ARG_SPEC volatile
@@ -866,7 +866,7 @@ typedef struct ALIGN {
 #endif
 } AtomData4;
 
-#if defined(USE_HIP)
+#if defined(USE_HIP) || defined(USE_METAL)
 #define ATOM2_PTR_ARG_SPEC const
 #else
 #define ATOM2_PTR_ARG_SPEC volatile
