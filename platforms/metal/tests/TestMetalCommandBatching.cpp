@@ -106,9 +106,10 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
 }
 
 void testCommitsPerStep() {
-    // Each step is submitted once.  With a neighbor list, the buffer holds the neighbor list and the
-    // force kernels, and is submitted before the host waits for the interaction count, if it has to.
-    // The rest of the step goes with the next step's neighbor list.
+    // The host submits each step at most once.  With a neighbor list, the buffer holds the neighbor list
+    // and the force kernels, and is submitted before the host waits for the interaction count, if it has
+    // to.  The rest of the step goes with the next step's neighbor list.  Steps without the wait can share
+    // a buffer, and the idle commit can split a step when the GPU runs out of work.
 
     double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
     double pme = measureCommitsPerStep(NonbondedForce::PME);
@@ -119,7 +120,8 @@ void testCommitsPerStep() {
 
 void testWorkLeftOpenAfterStep() {
     // Work left open when step() returns must reach the GPU while the host does something else, and
-    // committing it from another thread must not change the trajectory.
+    // neither committing it from another thread nor sharing buffers between steps may change the
+    // trajectory.
 
     System system;
     vector<Vec3> positions;

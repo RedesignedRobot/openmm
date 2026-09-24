@@ -343,7 +343,8 @@ private:
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
-    long long numTiles;
+    int uncommittedSteps;
+    long long numTiles, commitCountAfterLastStep;
     std::string kernelSource;
 };
 

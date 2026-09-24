@@ -38,6 +38,10 @@
 using namespace OpenMM;
 using namespace std;
 
+// Steps without a host wait share a command buffer, up to this many.  Fewer buffers mean fewer boundaries
+// where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
+// it doesn't wait for MetalQueue's idle commit.
+static const int StepsPerCommandBuffer = 8;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -53,7 +57,8 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        uncommittedSteps(0), commitCountAfterLastStep(0) {
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
@@ -461,10 +466,19 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
-        context.getCurrentStream().commit();
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
-        // guides reordering, which needs the exact count right after a reorder.
-        if (waitForCount || context.getStepsSinceReorder() == 0)
+        // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
+        // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
+        MetalQueue& queue = context.getCurrentStream();
+        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        if (queue.getCommitCount() != commitCountAfterLastStep)
+            uncommittedSteps = 0;
+        if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
+            queue.commit();
+            uncommittedSteps = 0;
+        }
+        commitCountAfterLastStep = queue.getCommitCount();
+        if (wait)
             downloadCountEvent->poll();
         updateNeighborListSize();
     }
