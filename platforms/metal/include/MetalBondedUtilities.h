@@ -32,14 +32,26 @@
 namespace OpenMM {
 
 /**
- * This class exists only for backward compatibility.  It adds no features beyond
- * the base BondedUtilities class.
+ * This class evaluates each force's terms in chunks of one threadgroup, and sums the chunk's forces on
+ * each atom in threadgroup memory before adding them to the force buffer.  That takes one atomic add per
+ * atom and component for each chunk, instead of one for every term that touches the atom.
  */
 
 class OPENMM_EXPORT_COMMON MetalBondedUtilities : public BondedUtilities {
 public:
     MetalBondedUtilities(ComputeContext& context) : BondedUtilities(context) {
     }
+    /**
+     * Initialize this object in preparation for a simulation.
+     */
+    void initialize(const System& system);
+protected:
+    std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
+private:
+    ComputeArray plan;
+    std::string planArgument;
+    std::vector<int> entryStartOffset, entryOffset, slotOffset;
+    int firstChunkedForce, maxChunkedAtoms;
 };
 
 } // namespace OpenMM
