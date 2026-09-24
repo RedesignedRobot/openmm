@@ -88,7 +88,8 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
 void MetalCalcNonbondedForceKernel::initialize(const System& system, const NonbondedForce& force) {
     bool usePmeQueue, useFixedPointChargeSpreading;
     getMetalPmeParameters(cu, usePmeQueue, useFixedPointChargeSpreading);
-    commonInitialize(system, force, usePmeQueue, false, useFixedPointChargeSpreading, cu.getPlatformData().useCpuPme);
+    // Sorting atoms by PME grid index costs more than it saves: reorderAtoms already keeps the stored order spatially coherent.
+    commonInitialize(system, force, usePmeQueue, false, useFixedPointChargeSpreading, cu.getPlatformData().useCpuPme, false);
 }
 
 void MetalCalcConstantPotentialForceKernel::initialize(const System& system, const ConstantPotentialForce& force) {
