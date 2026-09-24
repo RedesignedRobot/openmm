@@ -34,7 +34,8 @@
 #include <sstream>
 #include <vector>
 
-// Names for Metal's program and kernel handles, like the ones the HIP runtime defines.
+typedef MTL::Device* metalDevice_t;
+typedef MTL::Buffer* metalDeviceptr_t;
 typedef MTL::Library* metalModule_t;
 typedef MTL::ComputePipelineState* metalFunction_t;
 
@@ -131,7 +132,7 @@ public:
     /**
      * Get a pointer to the device memory.
      */
-    MTL::Buffer*& getDevicePointer() {
+    metalDeviceptr_t& getDevicePointer() {
         return pointer;
     }
     /**
@@ -184,7 +185,7 @@ public:
     void copyTo(ArrayInterface& dest) const;
 private:
     MetalContext* context;
-    MTL::Buffer* pointer;
+    metalDeviceptr_t pointer;
     size_t size;
     int elementSize;
     bool ownsMemory;

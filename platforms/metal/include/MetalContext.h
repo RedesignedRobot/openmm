@@ -35,7 +35,7 @@
     // Prevent Windows from defining macros that interfere with other code.
     #define NOMINMAX
 #endif
-#include <Metal/Metal.hpp>
+#include "MetalQueue.h"
 #include "openmm/common/windowsExportCommon.h"
 #include "MetalArray.h"
 #include "MetalBondedUtilities.h"
@@ -51,9 +51,6 @@ typedef unsigned int tileflags;
 
 namespace OpenMM {
 
-class MetalQueue;
-
-// The host code uses the vector types that the HIP and CUDA runtime headers provide.
 typedef mm_int2 int2;
 typedef mm_float4 float4;
 typedef mm_double4 double4;
@@ -112,13 +109,13 @@ public:
      */
     void popAsCurrent();
     /**
-     * Get the MTL::Device associated with this object.
+     * Get the metalDevice_t associated with this object.
      */
-    MTL::Device* getDevice() {
+    metalDevice_t getDevice() {
         return device;
     }
     /**
-     * Get the index of the MTL::Device associated with this object.
+     * Get the index of the metalDevice_t associated with this object.
      */
     int getDeviceIndex() const {
         return deviceIndex;
@@ -264,6 +261,10 @@ public:
      */
     std::string getTempFileName() const;
     /**
+     * Get src hash.
+     */
+    std::string getHash(const std::string& src) const;
+    /**
      * Create a METAL module from source code.
      *
      * @param source             the source code of the module
@@ -282,7 +283,7 @@ public:
      * @param module    the module to get the kernel from
      * @param name      the name of the kernel to get
      */
-    metalFunction_t getKernel(metalModule_t module, const std::string& name);
+    metalFunction_t getKernel(metalModule_t& module, const std::string& name);
     /**
      * Execute a kernel.
      *
@@ -474,7 +475,6 @@ public:
      */
     void flushQueue();
 private:
-    void launchKernel(metalFunction_t kernel, void** arguments, int gridSize, int blockSize, unsigned int sharedSize);
     MetalPlatform::PlatformData& platformData;
     int deviceIndex;
     int contextIndex;
@@ -489,7 +489,7 @@ private:
     std::map<std::string, std::string> compilationDefines;
     std::vector<metalModule_t> loadedModules;
     std::map<metalFunction_t, std::vector<int> > kernelArgumentSizes;
-    MTL::Device* device;
+    metalDevice_t device;
     void* pinnedBuffer;
     MetalArray energyBuffer;
     MetalIntegrationUtilities* integration;

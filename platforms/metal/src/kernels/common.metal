@@ -3,7 +3,6 @@
  * common compute framework.
  */
 
-// MSL 3.1 lets kernels read built-in values from program scope, so they can have the CUDA names.
 uint3 threadIdx [[thread_position_in_threadgroup]];
 uint3 blockIdx [[threadgroup_position_in_grid]];
 uint3 blockDim [[threads_per_threadgroup]];
@@ -37,8 +36,6 @@ uint3 gridDim [[threadgroups_per_grid]];
 #define NUM_GROUPS gridDim.x
 #define SYNC_THREADS __syncthreads();
 #define SYNC_WARPS simdgroup_barrier(mem_flags::mem_threadgroup);
-// MSL has no fence without a barrier.  Common kernels only use MEM_FENCE after atomic
-// force accumulation, which needs no ordering, so it expands to nothing.
 #define MEM_FENCE
 #define ATOMIC_ADD(dest, value) atomicAdd(dest, value)
 
@@ -57,11 +54,6 @@ inline float atomicAdd(device float* dest, float value) {
     return atomic_fetch_add_explicit((device atomic_float*) dest, value, memory_order_relaxed);
 }
 
-/**
- * Apple GPUs before the M3 have no 64 bit atomic add, so add the two 32 bit words separately
- * and carry into the upper one.  The final sum is exact, but other threads may observe a
- * partially updated value, so the result is only meaningful once the kernel has finished.
- */
 inline unsigned long atomicAdd(device unsigned long* dest, unsigned long value) {
     device atomic_uint* word = (device atomic_uint*) dest;
     unsigned int lower = (unsigned int) value;
@@ -74,10 +66,6 @@ inline unsigned long atomicAdd(device unsigned long* dest, unsigned long value) 
     return 0;
 }
 
-/**
- * MSL has no float atomic min or max.  Non-negative floats order like their bit patterns as
- * unsigned ints, and the kernels only use these on non-negative values.
- */
 inline float atomicMin(device float* dest, float value) {
     return as_type<float>(atomic_fetch_min_explicit((device atomic_uint*) dest, as_type<uint>(value), memory_order_relaxed));
 }
@@ -86,33 +74,20 @@ inline float atomicMax(device float* dest, float value) {
     return as_type<float>(atomic_fetch_max_explicit((device atomic_uint*) dest, as_type<uint>(value), memory_order_relaxed));
 }
 
-// MSL rounds float to half to nearest, so round up by hand.
 inline half __float2half_ru(float x) {
     half h = half(x);
     return (float(h) < x ? nextafter(h, half(INFINITY)) : h);
 }
 
-// MSL constructs vectors with constructors, not make_ functions.
-
-#define make_short2 short2
 #define make_short3 short3
-#define make_short4 short4
 #define make_int2 int2
 #define make_int3 int3
 #define make_int4 int4
-#define make_uint2 uint2
-#define make_uint3 uint3
-#define make_uint4 uint4
 #define make_float2 float2
 #define make_float3 float3
 #define make_float4 float4
 
-// CUDA has separate functions for single precision math.  To allow them to be called
-// consistently, we define the "single precision" functions to just be synonyms for
-// the standard ones.
-
 #define sqrtf sqrt
-#define rsqrtf rsqrt
 #define expf exp
 #define logf log
 #define cosf cos
@@ -129,16 +104,11 @@ inline half __float2half_ru(float x) {
 #define fabsf fabs
 #define truncf trunc
 
-// The library is compiled in safe math mode, so name the fast functions HIP uses.
 #define __fsqrt_rn precise::sqrt
 #define __frsqrt_rn fast::rsqrt
 #define __expf fast::exp
 #define __logf fast::log
 
-/**
- * MSL has no erfc.  This is a degree 7 rational approximation with a maximum relative error
- * of 1.5e-6 on [0, 4], computed directly rather than as 1-erf(x) to avoid cancellation.
- */
 inline float erfc(float x) {
     float t = fabs(x);
     float u = 1.0f/(1.0f+0.47f*t);
@@ -147,9 +117,6 @@ inline float erfc(float x) {
     return (x < 0.0f ? 2.0f-result : result);
 }
 
-/**
- * MSL has no erf.  Near zero 1-erfc(x) loses relative precision, so use the Taylor series there.
- */
 inline float erf(float x) {
     if (fabs(x) >= 0.5f)
         return 1.0f-erfc(x);

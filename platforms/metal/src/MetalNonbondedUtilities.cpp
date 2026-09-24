@@ -29,7 +29,6 @@
 #include "MetalContext.h"
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
-#include "MetalQueue.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -261,7 +260,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         if (maxTiles < 1)
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
-        // Batching tiles made systems under 2000 blocks slower on an M2.
+        // METAL-TODO: This may require tuning
         numTilesInBatch = 1;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
@@ -447,8 +446,6 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
-        // Submit the nonbonded kernel so the GPU works on it while we wait for the count.
-
         context.getCurrentStream().commit();
         downloadCountEvent->wait();
         updateNeighborListSize();

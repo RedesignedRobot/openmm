@@ -367,7 +367,6 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         #pragma unroll 1
         for (int j = indexInWarp; j < numExclusions; j += warpSize)
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
-        // MSL only orders threadgroup memory between the threads of a SIMD group at a barrier.
         SYNC_WARPS;
 
         // Loop over atom blocks to search for neighbors.  The threads in a warp compare block1 against warpSize

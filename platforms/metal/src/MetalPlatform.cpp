@@ -32,7 +32,6 @@
 #include "openmm/System.h"
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/hardware.h"
-#include <Metal/Metal.hpp>
 #include <algorithm>
 #include <cctype>
 #include <sstream>
@@ -44,16 +43,9 @@ using namespace OpenMM;
 using namespace std;
 
 static bool isPlatformSupported() {
-    // Compiling kernels needs macOS 15 (MTLCompileOptions.mathMode), and the kernels assume the
-    // 32 wide SIMD groups of Apple GPUs.
-
     if (__builtin_available(macOS 15.0, *)) {
-        MTL::Device* device = MTL::CreateSystemDefaultDevice();
-        if (device == NULL)
-            return false;
-        bool supported = device->supportsFamily(MTL::GPUFamilyApple7);
-        device->release();
-        return supported;
+        NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+        return device && device->supportsFamily(MTL::GPUFamilyApple7);
     }
     return false;
 }
@@ -64,7 +56,6 @@ static string getDeviceName(MTL::Device* device) {
     pool->release();
     return name;
 }
-
 
 #ifdef OPENMM_COMMON_BUILDING_STATIC_LIBRARY
 extern "C" void registerMetalPlatform() {
@@ -143,7 +134,6 @@ MetalPlatform::MetalPlatform() {
     setPropertyDefaultValue(MetalUseBlockingSync(), "true");
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
-    // A separate PME queue synchronizes through events, and each event commits a command buffer.
     setPropertyDefaultValue(MetalDisablePmeStream(), "true");
     setPropertyDefaultValue(MetalDeterministicForces(), "false");
 #ifdef _MSC_VER
@@ -191,13 +181,13 @@ vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>
     // Loop over devices.
 
     vector<map<string, string> > results;
-    MTL::Device* device = MTL::CreateSystemDefaultDevice();
-    int numDevices = (device == NULL ? 0 : 1);
+    NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+    int numDevices = (device ? 1 : 0);
     for (int i = 0; i < numDevices; i++) {
         if (deviceIndex != -1 && deviceIndex != i)
             continue;
         stringstream deviceNameStr;
-        deviceNameStr << getDeviceName(device);
+        deviceNameStr << getDeviceName(device.get());
         if (deviceName.size() > 0 && deviceName != deviceNameStr.str())
             continue;
         stringstream deviceIndexStr;
@@ -206,8 +196,6 @@ vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>
                                           {MetalDeviceName(), deviceNameStr.str()}};
         results.push_back(properties);
     }
-    if (device != NULL)
-        device->release();
     return results;
 }
 

@@ -78,9 +78,6 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
-
-    // Submit the force computation so the GPU works on it while the integrator's kernels are encoded.
-
     cu.getCurrentStream().commit();
     if (includeEnergy)
         sum += cu.reduceEnergy();

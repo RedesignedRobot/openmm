@@ -65,7 +65,7 @@ public:
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     int* ccmaConvergedMemory;
-    MTL::Buffer* ccmaConvergedDeviceMemory;
+    metalDeviceptr_t ccmaConvergedDeviceMemory;
     ComputeEvent ccmaEvent;
 };
 

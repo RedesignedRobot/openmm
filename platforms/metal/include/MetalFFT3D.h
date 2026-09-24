@@ -93,8 +93,6 @@ private:
     MTL::Buffer* outputBuffer;
     uint64_t inputBufferSize;
     uint64_t outputBufferSize;
-    // vkFFT.h compiles the metal-cpp implementation into whatever includes it, so its types
-    // stay in MetalFFT3D.cpp.
     struct VkFFTApp;
     VkFFTApp* app;
 };

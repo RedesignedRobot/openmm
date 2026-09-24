@@ -24,15 +24,12 @@
  * -------------------------------------------------------------------------- */
 
 #include "MetalEvent.h"
-#include "MetalQueue.h"
 #include "openmm/OpenMMException.h"
 
 using namespace OpenMM;
 
 MetalEvent::MetalEvent(MetalContext& context) : context(context), buffer(NULL), value(0) {
     event = context.getDevice()->newSharedEvent();
-    if (event == NULL)
-        throw OpenMMException("Error creating METAL event");
 }
 
 MetalEvent::~MetalEvent() {
@@ -52,12 +49,8 @@ void MetalEvent::enqueue() {
 }
 
 void MetalEvent::wait() {
-    if (buffer == NULL)
-        return;
-    buffer->waitUntilCompleted();
-    std::string failure = MetalQueue::getFailure(buffer);
-    if (!failure.empty())
-        throw OpenMMException("Error executing METAL command buffer: "+failure);
+    if (buffer != NULL)
+        buffer->waitUntilCompleted();
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {

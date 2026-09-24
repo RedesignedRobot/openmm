@@ -30,7 +30,6 @@
 #include "MetalArray.h"
 #include "MetalExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
-#include "openmm/common/ComputeEvent.h"
 #include "openmm/common/NonbondedUtilities.h"
 #include <sstream>
 #include <string>
@@ -320,7 +319,7 @@ private:
     MetalArray rebuildNeighborList;
     ComputeSort blockSorter;
     ComputeEvent downloadCountEvent;
-    MTL::Buffer* pinnedCountDeviceMemory;
+    metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;

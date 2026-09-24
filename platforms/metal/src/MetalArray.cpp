@@ -25,9 +25,7 @@
 
 #include "MetalArray.h"
 #include "MetalContext.h"
-#include "MetalQueue.h"
 #include "openmm/common/ContextSelector.h"
-#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -54,7 +52,6 @@ void MetalArray::initialize(ComputeContext& context, size_t size, int elementSiz
     this->elementSize = elementSize;
     this->name = name;
     ownsMemory = true;
-    // Metal cannot create empty buffers.
     pointer = this->context->getDevice()->newBuffer(std::max(size*elementSize, (size_t) 16), MTL::ResourceStorageModeShared);
     if (pointer == 0)
         throw OpenMMException("Error creating array "+name);

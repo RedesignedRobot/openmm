@@ -23,15 +23,11 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
-// This is the only translation unit that includes vkFFT.h.  With the Metal backend it defines
-// NS_PRIVATE_IMPLEMENTATION, CA_PRIVATE_IMPLEMENTATION, and MTL_PRIVATE_IMPLEMENTATION before
-// including metal-cpp, which emits the metal-cpp symbols for the whole library.
 #define VKFFT_BACKEND 5
-#include <iostream> // vkFFT.h prints Metal compiler errors to std::cout without including it
+#include <iostream>
 #include "vkFFT.h"
 #include "MetalFFT3D.h"
 #include "MetalContext.h"
-#include "MetalQueue.h"
 
 using namespace OpenMM;
 using namespace std;
@@ -74,8 +70,6 @@ MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, b
     configuration.bufferStride[1] = configuration.bufferStride[0] * ysize;
     configuration.bufferStride[2] = configuration.bufferStride[1] * xsize;
 
-    // VkFFT compiles its kernels with fast math, so use lookup tables for the twiddle factors
-    // rather than trusting the fast trig functions.
     configuration.useLUT = 1;
 
     app = new VkFFTApp();
@@ -101,8 +95,6 @@ void MetalFFT3D::execFFT(ArrayInterface& in, ArrayInterface& out, bool forward) 
         inputBuffer = context.unwrap(out).getDevicePointer();
         outputBuffer = context.unwrap(in).getDevicePointer();
     }
-    // VkFFT's Metal backend encodes only through commandEncoder, so the FFT is batched into the
-    // open command buffer like any other kernel.
     MetalQueue& queue = context.getCurrentStream();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     VkFFTLaunchParams params = {};

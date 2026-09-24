@@ -40,6 +40,7 @@
 #include "MetalSort.h"
 #include "openmm/common/ComputeArray.h"
 #include "openmm/common/ContextSelector.h"
+#include "SHA1.h"
 #include "openmm/MonteCarloFlexibleBarostat.h"
 #include "openmm/Platform.h"
 #include "openmm/System.h"
@@ -58,8 +59,8 @@
 #include <thread>
 #include <typeinfo>
 #include <sys/stat.h>
-#include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <regex>
 
 using namespace OpenMM;
 using namespace std;
@@ -67,142 +68,47 @@ using namespace std;
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
 
-/**
- * Metal does not report the number of GPU cores, so read it from the IORegistry.
- */
-static int getGpuCoreCount() {
-    int cores = 0;
-    io_iterator_t iterator;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"), &iterator) != KERN_SUCCESS)
-        return 0;
-    io_object_t entry;
-    while ((entry = IOIteratorNext(iterator)) != 0) {
-        CFTypeRef value = IORegistryEntryCreateCFProperty(entry, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
-        if (value != NULL) {
-            if (CFGetTypeID(value) == CFNumberGetTypeID())
-                CFNumberGetValue((CFNumberRef) value, kCFNumberIntType, &cores);
-            CFRelease(value);
-        }
-        IOObjectRelease(entry);
-    }
-    IOObjectRelease(iterator);
-    return cores;
-}
-
-static bool isIdentifierChar(char c) {
-    return isalnum((unsigned char) c) || c == '_';
-}
-
-static size_t findWord(const string& source, const string& word, size_t start) {
-    size_t pos = source.find(word, start);
-    while (pos != string::npos) {
-        bool startsWord = (pos == 0 || !isIdentifierChar(source[pos-1]));
-        bool endsWord = (pos+word.size() == source.size() || !isIdentifierChar(source[pos+word.size()]));
-        if (startsWord && endsWord)
-            return pos;
-        pos = source.find(word, pos+1);
-    }
-    return string::npos;
-}
-
-static string replaceWord(const string& source, const string& word, const string& replacement) {
-    string result;
-    size_t pos = 0, found;
-    while ((found = findWord(source, word, pos)) != string::npos) {
-        result += source.substr(pos, found-pos)+replacement;
-        pos = found+word.size();
-    }
-    return result+source.substr(pos);
-}
-
-/**
- * Rewrite one kernel parameter for Metal.  A pointer without an address space points to device
- * memory.  A value becomes a constant reference, so "real4 box" becomes "constant real4& _in_box",
- * and a statement copying it into a local variable with the original name is appended to the
- * prologue.  executeKernel() passes the arguments whose names start with _in_ by value.
- */
 static string rewriteParameter(const string& param, string& prologue) {
-    size_t first = param.find_first_not_of(" \t\r\n");
-    if (first == string::npos)
+    smatch m;
+    if (regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[]")))
         return param;
-    size_t last = param.find_last_not_of(" \t\r\n");
-    string declaration = param.substr(first, last-first+1);
-    if (declaration.find_first_of("&[") != string::npos)
+    if (param.find('*') != string::npos)
+        return "device "+param;
+    if (!regex_match(param, m, regex("\\s*(const\\s+)?(\\S.*?)\\s+(\\w+)((\\s+[A-Z_]+)*)\\s*")))
         return param;
-    stringstream tokenStream(declaration);
-    vector<string> tokens;
-    string token;
-    while (tokenStream >> token)
-        if (token != "const")
-            tokens.push_back(token);
-    if (declaration.find('*') != string::npos) {
-        for (string space : {"GLOBAL", "LOCAL", "LOCAL_ARG", "device", "threadgroup", "constant"})
-            if (find(tokens.begin(), tokens.end(), space) != tokens.end())
-                return param;
-        return param.substr(0, first)+"device "+param.substr(first);
-    }
-    if (tokens.size() < 2)
-        return param;
-    string type;
-    for (int i = 0; i < tokens.size()-1; i++)
-        type += (i == 0 ? "" : " ")+tokens[i];
-    const string& name = tokens.back();
-    prologue += "    "+type+" "+name+" = _in_"+name+";\n";
-    return param.substr(0, first)+"constant "+type+"& _in_"+name+param.substr(last+1);
+    prologue += m[2].str()+" "+m[3].str()+" = _in_"+m[3].str()+";\n";
+    return "constant "+m[2].str()+"& _in_"+m[3].str()+m[4].str();
 }
 
-/**
- * Rewrite the parameters of every kernel in a source file (see rewriteParameter()).  Preprocessor
- * directives inside a parameter list are copied into the prologue as well, so each copy statement
- * is compiled exactly when the parameter it reads is.
- */
 static string rewriteKernelSignatures(const string& source) {
     string result;
     size_t pos = 0;
-    size_t kernelStart;
-    while ((kernelStart = min(findWord(source, "KERNEL", pos), findWord(source, "__global__", pos))) != string::npos) {
-        size_t open = source.find('(', findWord(source, "void", kernelStart));
-        if (open == string::npos)
-            break;
-        result += source.substr(pos, open+1-pos);
+    smatch m;
+    while (regex_search(source.begin()+pos, source.end(), m, regex("\\b(KERNEL|__global__)\\b.*?\\bvoid\\s+\\w+\\s*\\("))) {
+        size_t i = pos+m.position()+m.length();
+        result += source.substr(pos, i-pos);
         string prologue, param;
-        size_t i = open+1;
-        int depth = 0;
-        for (; i < source.size(); i++) {
-            char c = source[i];
-            if (c == '#') {
-                size_t end = source.find('\n', i);
-                string directive = source.substr(i, end-i);
-                result += rewriteParameter(param, prologue)+directive;
-                prologue += directive+"\n";
+        for (int depth = 0; depth >= 0; i++) {
+            if (source[i] == '#') {
+                size_t end = source.find('\n', i)+1;
+                result += rewriteParameter(param, prologue)+"\n"+source.substr(i, end-i);
+                prologue += source.substr(i, end-i);
                 param.clear();
                 i = end-1;
+                continue;
             }
-            else if (c == '(') {
-                depth++;
-                param += c;
-            }
-            else if (c == ')' && depth > 0) {
-                depth--;
-                param += c;
-            }
-            else if (c == ')' || (c == ',' && depth == 0)) {
-                result += rewriteParameter(param, prologue)+c;
+            depth += (source[i] == '(')-(source[i] == ')');
+            if (depth < 0 || (source[i] == ',' && depth == 0)) {
+                result += rewriteParameter(param, prologue)+source[i];
                 param.clear();
-                if (c == ')')
-                    break;
             }
             else
-                param += c;
+                param += source[i];
         }
-        size_t brace = source.find('{', i);
-        if (brace == string::npos)
-            throw OpenMMException("Error parsing kernel signature: "+source.substr(kernelStart, open-kernelStart));
-        result += source.substr(i+1, brace+1-(i+1))+"\n"+prologue;
-        pos = brace+1;
+        pos = source.find('{', i)+1;
+        result += source.substr(i, pos-i)+"\n"+prologue;
     }
-    result += source.substr(pos);
-    return result;
+    return result+source.substr(pos);
 }
 
 MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
@@ -223,8 +129,6 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     }
     else
         throw OpenMMException("Illegal value for Precision: "+precision);
-    if (useDoublePrecision || useMixedPrecision)
-        throw OpenMMException("This device does not support double precision");
 #ifdef WIN32
     this->tempDir = tempDir+"\\";
 #else
@@ -232,15 +136,12 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
 #endif
     contextIndex = platformData.contexts.size();
     if (originalContext == NULL) {
-        // A Mac has one GPU.  MTL::CopyAllDevices() would return NULL here, because metal-cpp
-        // compiles it out below a 10.11 deployment target and OpenMM defaults to 10.7.
-
         device = MTL::CreateSystemDefaultDevice();
         int numDevices = (device == NULL ? 0 : 1);
         if (deviceIndex < -1 || deviceIndex >= numDevices)
             throw OpenMMException("Illegal value for DeviceIndex: "+intToString(deviceIndex));
         this->deviceIndex = 0;
-        defaultQueue = shared_ptr<ComputeQueueImpl>(new MetalQueue(device));
+        defaultQueue = shared_ptr<ComputeQueueImpl>(new MetalQueue(device->newCommandQueue()));
     }
     else {
         this->deviceIndex = originalContext->deviceIndex;
@@ -261,9 +162,11 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     numAtoms = system.getNumParticles();
     paddedNumAtoms = TileSize*((numAtoms+TileSize-1)/TileSize);
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
-    multiprocessors = getGpuCoreCount();
-    if (multiprocessors == 0)
-        multiprocessors = 8; // The smallest Apple GPU with Metal 3.1 support has 7 or 8 cores.
+    io_service_t gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AGXAccelerator"));
+    CFNumberRef cores = (CFNumberRef) IORegistryEntryCreateCFProperty(gpu, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+    CFNumberGetValue(cores, kCFNumberIntType, &multiprocessors);
+    CFRelease(cores);
+    IOObjectRelease(gpu);
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_METAL"] = "1";
@@ -482,6 +385,19 @@ string MetalContext::getTempFileName() const {
     return tempFileName.str();
 }
 
+string MetalContext::getHash(const string& src) const {
+    CSHA1 sha1;
+    sha1.Update((const UINT_8*) src.c_str(), src.size());
+    sha1.Final();
+    UINT_8 hash[20];
+    sha1.GetHash(hash);
+    stringstream cacheHash;
+    cacheHash.flags(ios::hex);
+    for (int i = 0; i < 20; i++)
+        cacheHash << setw(2) << setfill('0') << (int) hash[i];
+    return cacheHash.str();
+}
+
 metalModule_t MetalContext::createModule(const string source) {
     return createModule(source, map<string, string>());
 }
@@ -530,31 +446,33 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     }
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
-    // Common kernels use "thread" as a variable name, but in MSL it is an address space.
     for (auto& pair : defines) {
         src << "#define " << pair.first;
         if (!pair.second.empty())
-            src << " " << replaceWord(pair.second, "thread", "_mmThread");
+            src << " " << regex_replace(pair.second, regex("\\bthread\\b"), "_mmThread");
         src << endl;
     }
     if (!defines.empty())
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
-    // MSL has no long long.  Its long is 64 bits.
-    src << rewriteKernelSignatures(replaceWord(replaceWord(source, "thread", "_mmThread"), "long long", "long")) << endl;
+    src << rewriteKernelSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long")) << endl;
 
     // Select names for the various temporary files.
 
     if (saveTemps) {
-        string inputFile = getTempFileName()+"_"+to_string(hash<string>()(src.str()))+".metal";
+        stringstream tempFileName;
+        const char* saveTempsPrefixEnv = getenv("OPENMM_SAVE_TEMPS_PREFIX");
+        if (saveTempsPrefixEnv) {
+            tempFileName << saveTempsPrefixEnv;
+        }
+        tempFileName << getHash(src.str());
+
+        string inputFile = (tempFileName.str()+".metal");
         std::cout << "Source code: " << inputFile << std::endl;
         ofstream out(inputFile.c_str());
         out << src.str();
         out.close();
     }
-
-    // Compile the program.  Autoreleased objects must not outlive the pool, so no exception may
-    // be thrown until it is released.
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
@@ -565,7 +483,7 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     metalModule_t module = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
     options->release();
     string log;
-    if (module == NULL && error != NULL)
+    if (module == NULL)
         log = error->localizedDescription()->utf8String();
     pool->release();
     if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
@@ -576,22 +494,11 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     return module;
 }
 
-metalFunction_t MetalContext::getKernel(metalModule_t module, const string& name) {
+metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& name) {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Function* function = module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
-    metalFunction_t kernel = NULL;
     MTL::ComputePipelineReflection* reflection = NULL;
-    string log = "no kernel with this name";
-    if (function != NULL) {
-        NS::Error* error = NULL;
-        kernel = device->newComputePipelineState(function, MTL::PipelineOptionBindingInfo, &reflection, &error);
-        function->release();
-        if (kernel == NULL && error != NULL)
-            log = error->localizedDescription()->utf8String();
-    }
-
-    // Record which arguments are passed by value (see rewriteParameter()), and their sizes.
-
+    metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, MTL::PipelineOptionBindingInfo, &reflection, NULL));
     vector<int> sizes;
     for (int i = 0; kernel != NULL && i < reflection->bindings()->count(); i++) {
         MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
@@ -601,13 +508,11 @@ metalFunction_t MetalContext::getKernel(metalModule_t module, const string& name
         if (string(binding->name()->utf8String()).rfind("_in_", 0) == 0)
             sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
     }
+    if (function != NULL)
+        function->release();
     pool->release();
     if (kernel == NULL)
-        throw OpenMMException("Error creating kernel "+name+": "+log);
-    if (kernel->threadExecutionWidth() != getSIMDWidth()) {
-        kernel->release();
-        throw OpenMMException("Error creating kernel "+name+": the kernels require a SIMD width of "+intToString(getSIMDWidth()));
-    }
+        throw OpenMMException("Error creating kernel "+name);
     kernelArgumentSizes[kernel] = sizes;
     return kernel;
 }
@@ -624,7 +529,7 @@ double& MetalContext::getEnergyWorkspace() {
 }
 
 ComputeQueue MetalContext::createQueue() {
-    return shared_ptr<ComputeQueueImpl>(new MetalQueue(device));
+    return shared_ptr<ComputeQueueImpl>(new MetalQueue(device->newCommandQueue()));
 }
 
 MetalQueue& MetalContext::getCurrentStream() {
@@ -672,17 +577,13 @@ void MetalContext::executeKernel(metalFunction_t kernel, void** arguments, int t
     if (blockSize == -1)
         blockSize = ThreadBlockSize;
     int gridSize = std::min((threads+blockSize-1)/blockSize, numThreadBlocks);
-    launchKernel(kernel, arguments, gridSize, blockSize, sharedSize);
+    executeKernelFlat(kernel, arguments, gridSize*blockSize, blockSize, sharedSize);
 }
 
 void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize, unsigned int sharedSize) {
     if (blockSize == -1)
         blockSize = ThreadBlockSize;
     int gridSize = (threads+blockSize-1)/blockSize;
-    launchKernel(kernel, arguments, gridSize, blockSize, sharedSize);
-}
-
-void MetalContext::launchKernel(metalFunction_t kernel, void** arguments, int gridSize, int blockSize, unsigned int sharedSize) {
     MetalQueue& queue = getCurrentStream();
     lock_guard<recursive_mutex> guard(queue.getLock());
     MTL::ComputeCommandEncoder* encoder = queue.getEncoder();
@@ -694,8 +595,7 @@ void MetalContext::launchKernel(metalFunction_t kernel, void** arguments, int gr
         else
             encoder->setBytes(arguments[i], sizes[i], i);
     }
-    if (sharedSize > 0)
-        encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
+    encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
     encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
 }
 
