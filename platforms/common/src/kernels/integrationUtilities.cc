@@ -435,6 +435,7 @@ KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real
             real g01 = d01sq-dot(f01, f01);
             real g02 = d01sq-dot(f02, f02);
             real g12 = d12sq-dot(f12, f12);
+            // After 15 iterations the loop stops without an error, even if the residuals have not converged.
             last = (iteration == 14 || (fabs(g01) < 1e-6f*d01sq && fabs(g02) < 1e-6f*d01sq && fabs(g12) < 1e-6f*d12sq));
             if (last) {
                 // Move the corrections so far into the mixed precision displacements, so the last step is not
