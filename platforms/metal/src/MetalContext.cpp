@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -68,45 +69,81 @@ using namespace std;
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
 
-static string rewriteParameter(const string& param, string& prologue) {
+/**
+ * Rewrite one kernel parameter.  A value parameter becomes a constant reference, or, when members is
+ * given, a member of the kernel's argument struct, and then this returns only its trailing macros.
+ * Each other declared parameter gets a one byte marker member, so the host can recover the position of
+ * every argument from reflection.
+ */
+static string rewriteParameter(const string& param, string& prologue, string* members, int& index) {
     smatch m;
-    if (regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[]")))
-        return param;
-    if (param.find('*') != string::npos)
+    bool isValue = !regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[*]"));
+    if (!isValue || !regex_match(param, m, regex("\\s*(const\\s+)?(\\S.*?)\\s+(\\w+)((\\s+[A-Z_]+)*)\\s*"))) {
+        if (members != NULL && !isValue)
+            *members += "char _mmB"+to_string(index++)+";\n";
+        if (isValue || regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[]")))
+            return param;
         return "device "+param;
-    if (!regex_match(param, m, regex("\\s*(const\\s+)?(\\S.*?)\\s+(\\w+)((\\s+[A-Z_]+)*)\\s*")))
-        return param;
-    prologue += m[2].str()+" "+m[3].str()+" = _in_"+m[3].str()+";\n";
-    return "constant "+m[2].str()+"& _in_"+m[3].str()+m[4].str();
+    }
+    if (members == NULL) {
+        prologue += m[2].str()+" "+m[3].str()+" = _in_"+m[3].str()+";\n";
+        return "constant "+m[2].str()+"& _in_"+m[3].str()+m[4].str();
+    }
+    string member = "_mmV"+to_string(index);
+    *members += m[2].str()+" "+member+";\nchar _mmE"+to_string(index++)+";\n";
+    prologue += m[2].str()+" "+m[3].str()+" = _in__mmArgs."+member+";\n";
+    return m[4].str();
 }
 
-static string rewriteKernelSignatures(const string& source) {
+/**
+ * Metal needs an address space on every kernel pointer, and passes values by constant reference.
+ * With packValues, value parameters instead go into one struct per kernel, because Metal allows
+ * only 31 buffer bindings per kernel.
+ */
+static string rewriteKernelSignatures(const string& source, bool packValues) {
     string result;
     size_t pos = 0;
     smatch m;
-    while (regex_search(source.begin()+pos, source.end(), m, regex("\\b(KERNEL|__global__)\\b.*?\\bvoid\\s+\\w+\\s*\\("))) {
+    while (regex_search(source.begin()+pos, source.end(), m, regex("\\b(KERNEL|__global__)\\b.*?\\bvoid\\s+(\\w+)\\s*\\("))) {
         size_t i = pos+m.position()+m.length();
-        result += source.substr(pos, i-pos);
-        string prologue, param;
+        string argsType = "_mmArgs_"+m[2].str();
+        string signature = m.str()+(packValues ? "constant "+argsType+"& _in__mmArgs, " : "");
+        result += source.substr(pos, m.position());
+        string prologue, members, param;
+        int index = 0;
         for (int depth = 0; depth >= 0; i++) {
+            // A value moved into the struct leaves the signature, along with one comma next to it.
+            size_t prologueSize = prologue.size();
             if (source[i] == '#') {
                 size_t end = source.find('\n', i)+1;
-                result += rewriteParameter(param, prologue)+"\n"+source.substr(i, end-i);
+                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index);
+                if (packValues && prologue.size() > prologueSize)
+                    signature.erase(signature.rfind(','), 1);
+                signature += rewritten+"\n"+source.substr(i, end-i);
                 prologue += source.substr(i, end-i);
+                members += source.substr(i, end-i);
                 param.clear();
                 i = end-1;
                 continue;
             }
             depth += (source[i] == '(')-(source[i] == ')');
             if (depth < 0 || (source[i] == ',' && depth == 0)) {
-                result += rewriteParameter(param, prologue)+source[i];
+                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index);
+                bool moved = packValues && prologue.size() > prologueSize;
+                if (moved && source[i] == ')')
+                    signature.erase(signature.rfind(','), 1);
+                signature += rewritten;
+                if (!moved || source[i] == ')')
+                    signature += source[i];
                 param.clear();
             }
             else
                 param += source[i];
         }
+        if (packValues)
+            result += "struct "+argsType+" {\n"+members+"};\n";
         pos = source.find('{', i)+1;
-        result += source.substr(i, pos-i)+"\n"+prologue;
+        result += signature+source.substr(i, pos-i)+"\n"+prologue;
     }
     return result+source.substr(pos);
 }
@@ -355,7 +392,7 @@ MetalContext::~MetalContext() {
         delete nonbonded;
     for (auto module : loadedModules)
         module->release();
-    for (auto& kernel : kernelArgumentSizes)
+    for (auto& kernel : kernelArguments)
         kernel.first->release();
     popAsCurrent();
     contextIsValid = false;
@@ -501,8 +538,24 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     if (!defines.empty())
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
-    src << rewriteKernelSignatures(rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"))) << endl;
+    string header = src.str();
+    string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
+    string log;
+    metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);
+    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos) {
+        module = createLibrary(header+rewriteKernelSignatures(body, true)+"\n", log, saveTemps);
+        if (module != NULL)
+            packedModules.insert(module);
+    }
+    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
+        throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
+    if (module == NULL)
+        throw OpenMMException("Error compiling program: "+log);
+    loadedModules.push_back(module);
+    return module;
+}
 
+metalModule_t MetalContext::createLibrary(const string& source, string& log, bool saveTemps) {
     // Select names for the various temporary files.
 
     if (saveTemps) {
@@ -511,12 +564,12 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         if (saveTempsPrefixEnv) {
             tempFileName << saveTempsPrefixEnv;
         }
-        tempFileName << getHash(src.str());
+        tempFileName << getHash(source);
 
         string inputFile = (tempFileName.str()+".metal");
         std::cout << "Source code: " << inputFile << std::endl;
         ofstream out(inputFile.c_str());
-        out << src.str();
+        out << source;
         out.close();
     }
 
@@ -526,17 +579,11 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     options->setMathMode(MTL::MathModeSafe);
     options->setMathFloatingPointFunctions(MTL::MathFloatingPointFunctionsPrecise);
     NS::Error* error = NULL;
-    metalModule_t module = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
+    metalModule_t module = device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options, &error);
     options->release();
-    string log;
     if (module == NULL)
         log = error->localizedDescription()->utf8String();
     pool->release();
-    if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
-        throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
-    if (module == NULL)
-        throw OpenMMException("Error compiling program: "+log);
-    loadedModules.push_back(module);
     return module;
 }
 
@@ -544,23 +591,63 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Function* function = module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
     MTL::ComputePipelineReflection* reflection = NULL;
-    metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, MTL::PipelineOptionBindingInfo, &reflection, NULL));
-    vector<int> sizes;
+    bool packed = (packedModules.find(module) != packedModules.end());
+    MTL::PipelineOption reflectionOptions = (packed ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
+    metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, reflectionOptions, &reflection, NULL));
+    KernelArguments args;
+    MTL::BufferBinding* argsBinding = NULL;
     for (int i = 0; kernel != NULL && i < reflection->bindings()->count(); i++) {
         MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
         if (binding->type() != MTL::BindingTypeBuffer)
             continue;
-        sizes.resize(max((int) sizes.size(), (int) binding->index()+1), 0);
-        if (string(binding->name()->utf8String()).rfind("_in_", 0) == 0)
-            sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
+        string bindingName = binding->name()->utf8String();
+        args.sizes.resize(max((int) args.sizes.size(), (int) binding->index()+1), 0);
+        if (bindingName == "_in__mmArgs")
+            argsBinding = (MTL::BufferBinding*) binding;
+        else if (bindingName.rfind("_in_", 0) == 0)
+            args.sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
     }
+    if (argsBinding != NULL)
+        args = getPackedArguments(argsBinding, args.sizes.size()-1);
     if (function != NULL)
         function->release();
     pool->release();
     if (kernel == NULL)
         throw OpenMMException("Error creating kernel "+name);
-    kernelArgumentSizes[kernel] = sizes;
+    kernelArguments[kernel] = args;
     return kernel;
+}
+
+MetalContext::KernelArguments MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffers) {
+    // The struct has a marker member for each declared argument, numbered in source order: _mmB<n> for
+    // a buffer, and _mmV<n> followed by _mmE<n> for a value.  Arguments past the last marker came from
+    // macros, and are buffers.
+    MTL::StructType* type = binding->bufferStructType();
+    map<int, MTL::StructMember*> markers;
+    for (int i = 0; i < type->members()->count(); i++) {
+        MTL::StructMember* member = type->members()->object<MTL::StructMember>(i);
+        string memberName = member->name()->utf8String();
+        if (memberName.rfind("_mmB", 0) == 0 || memberName.rfind("_mmV", 0) == 0)
+            markers[stoi(memberName.substr(4))] = member;
+    }
+    KernelArguments args;
+    for (auto& marker : markers) {
+        string memberName = marker.second->name()->utf8String();
+        int offset = marker.second->offset();
+        int size = 0;
+        if (memberName[3] == 'V') {
+            string end = "_mmE"+to_string(marker.first);
+            size = type->memberByName(NS::String::string(end.c_str(), NS::UTF8StringEncoding))->offset()-offset;
+        }
+        else
+            numBuffers--;
+        args.sizes.push_back(size);
+        args.offsets.push_back(offset);
+    }
+    args.sizes.resize(args.sizes.size()+numBuffers, 0);
+    args.offsets.resize(args.sizes.size(), 0);
+    args.packedSize = binding->bufferDataSize();
+    return args;
 }
 
 vector<ComputeContext*> MetalContext::getAllContexts() {
@@ -641,12 +728,25 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
     lock_guard<recursive_mutex> guard(queue.getLock());
     MTL::ComputeCommandEncoder* encoder = queue.getEncoder();
     encoder->setComputePipelineState(kernel);
-    const vector<int>& sizes = kernelArgumentSizes[kernel];
-    for (int i = 0; i < sizes.size(); i++) {
-        if (sizes[i] == 0)
-            encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, i);
-        else
-            encoder->setBytes(arguments[i], sizes[i], i);
+    const KernelArguments& args = kernelArguments[kernel];
+    if (args.offsets.empty()) {
+        for (int i = 0; i < args.sizes.size(); i++) {
+            if (args.sizes[i] == 0)
+                encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, i);
+            else
+                encoder->setBytes(arguments[i], args.sizes[i], i);
+        }
+    }
+    else {
+        vector<char> packed(args.packedSize);
+        int bufferIndex = 1;
+        for (int i = 0; i < args.sizes.size(); i++) {
+            if (args.sizes[i] == 0)
+                encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, bufferIndex++);
+            else
+                memcpy(&packed[args.offsets[i]], arguments[i], args.sizes[i]);
+        }
+        encoder->setBytes(packed.data(), packed.size(), 0);
     }
     encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
     encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));

@@ -28,6 +28,7 @@
 
 
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #define __CL_ENABLE_EXCEPTIONS
@@ -476,6 +477,23 @@ public:
      */
     void flushQueue();
 private:
+    /**
+     * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
+     * each buffer.  When the kernel has too many arguments for separate bindings, offsets holds where
+     * each value goes in one struct bound at index 0, and packedSize is that struct's size.
+     */
+    struct KernelArguments {
+        std::vector<int> sizes, offsets;
+        int packedSize;
+    };
+    /**
+     * Compile Metal source into a library.  On failure this returns NULL and sets log to the compiler output.
+     */
+    metalModule_t createLibrary(const std::string& source, std::string& log, bool saveTemps);
+    /**
+     * Find where each argument of a kernel with packed values goes, from the reflection of its argument struct.
+     */
+    KernelArguments getPackedArguments(MTL::BufferBinding* binding, int numBuffers);
     MetalPlatform::PlatformData& platformData;
     int deviceIndex;
     int contextIndex;
@@ -489,7 +507,8 @@ private:
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
     std::map<std::string, std::string> compilationDefines;
     std::vector<metalModule_t> loadedModules;
-    std::map<metalFunction_t, std::vector<int> > kernelArgumentSizes;
+    std::set<metalModule_t> packedModules;
+    std::map<metalFunction_t, KernelArguments> kernelArguments;
     metalDevice_t device;
     void* pinnedBuffer;
     MetalArray energyBuffer;
