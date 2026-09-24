@@ -476,10 +476,17 @@ KERNEL void computeGKForces(
                         real bornForce1 = 0, bornForce2 = 0;
                         computeOneInteractionB1B2(data, localData[tbx+j], &bornForce1, &bornForce2);
                         data.bornForce += bornForce1;
+#ifndef USE_METAL
                         localData[tbx+j].bornForce += bornForce2;
                         SYNC_WARPS;
+#endif
                     }
                 }
+#ifdef USE_METAL
+                // Padding lanes skip the branch above, and every lane must reach a simdgroup_barrier.  Nothing
+                // reads localData[].bornForce on a diagonal tile, so one barrier before the next tile is enough.
+                SYNC_WARPS;
+#endif
                 ATOMIC_ADD(&bornForce[atom1], (mm_ulong) realToFixedPoint(data.bornForce));
             }
             else {
