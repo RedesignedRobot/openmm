@@ -420,6 +420,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << endl;
     src << "#include <metal_stdlib>\n";
     src << "using namespace metal;\n";
+    if (useMixedPrecision)
+        src << MetalKernelSources::df64 << endl;
     if (useDoublePrecision) {
         src << "typedef double real;\n";
         src << "typedef double2 real2;\n";
@@ -557,6 +559,13 @@ int MetalContext::findLegalFFTDimension(int minimum) {
 ComputeProgram MetalContext::compileProgram(const std::string source, const std::map<std::string, std::string>& defines) {
     metalModule_t module = createModule(MetalKernelSources::vectorOps+source, defines);
     return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, module));
+}
+
+string MetalContext::doubleToString(double value, bool mixedIsDouble) const {
+    float hi = (float) value;
+    if (!useMixedPrecision || !mixedIsDouble || hi == value || !isfinite(hi))
+        return ComputeContext::doubleToString(value, mixedIsDouble);
+    return "df64("+ComputeContext::doubleToString(hi)+", "+ComputeContext::doubleToString((float) (value-hi))+")";
 }
 
 MetalArray& MetalContext::unwrap(ArrayInterface& array) const {

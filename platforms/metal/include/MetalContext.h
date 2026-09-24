@@ -208,6 +208,7 @@ public:
      * @param defines            a set of preprocessor definitions (name, value) to define when compiling the program
      */
     ComputeProgram compileProgram(const std::string source, const std::map<std::string, std::string>& defines=std::map<std::string, std::string>());
+    std::string doubleToString(double value, bool mixedIsDouble=false) const;
     /**
      * Convert an array to an MetalArray.  If the argument is already an MetalArray, this simply casts it.
      * If the argument is a ComputeArray that wraps a MetalArray, this returns the wrapped array.  For any
@@ -357,7 +358,7 @@ public:
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
-        return false;
+        return useMixedPrecision;
     }
     /**
      * Get the vectors defining the periodic box.
