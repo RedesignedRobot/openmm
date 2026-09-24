@@ -164,6 +164,8 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
     io_service_t gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AGXAccelerator"));
     CFNumberRef cores = (CFNumberRef) IORegistryEntryCreateCFProperty(gpu, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+    if (cores == NULL)
+        throw OpenMMException("Error initializing Metal: the IORegistry has no GPU core count");
     CFNumberGetValue(cores, kCFNumberIntType, &multiprocessors);
     CFRelease(cores);
     IOObjectRelease(gpu);
