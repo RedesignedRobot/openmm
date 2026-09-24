@@ -154,6 +154,10 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     this->simdWidth = 32;
     this->sharedMemPerBlock = device->maxThreadgroupMemoryLength();
 
+    // Apple7 and Apple8 GPUs add floats atomically too, but on an M2 the fixed-point PME spread
+    // measured slightly faster.  From Apple9 on, float atomics spread charge about 3x faster.
+    supportsHardwareFloatGlobalAtomicAdd = device->supportsFamily(MTL::GPUFamilyApple9);
+
     // METAL-TODO: find a good value here
     int numThreadBlocksPerComputeUnit = 12;
 
