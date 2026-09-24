@@ -121,15 +121,15 @@ public:
     /**
      * Initialize this object in preparation for a simulation.
      */
-    void initialize(const System& system);
+    virtual void initialize(const System& system);
     /**
      * Compute the bonded interactions.
      * 
      * @param groups        a set of bit flags for which force groups to include
      */
     void computeInteractions(int groups);
-private:
-    std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
+protected:
+    virtual std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
     ComputeContext& context;
     ComputeKernel kernel;
     std::vector<std::vector<std::vector<int> > > forceAtoms;

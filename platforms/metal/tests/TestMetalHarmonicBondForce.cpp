@@ -30,6 +30,43 @@
 
 #include "MetalTests.h"
 #include "TestHarmonicBondForce.h"
+#include "openmm/HarmonicAngleForce.h"
+
+void testBondChunks() {
+    // The bonded kernel sums each threadgroup's chunk of terms in threadgroup memory (MetalBondedUtilities).
+    // A threadgroup takes more than one chunk of a force once the force has more terms than the grid has
+    // threads, 46,080 on a 60-core GPU.  The angles are in another force group, so each group is checked
+    // alone and with the other.
+    const int numParticles = 100001;
+    System system;
+    HarmonicBondForce* bonds = new HarmonicBondForce();
+    HarmonicAngleForce* angles = new HarmonicAngleForce();
+    angles->setForceGroup(1);
+    vector<Vec3> positions(numParticles);
+    for (int i = 0; i < numParticles; i++) {
+        system.addParticle(1.0);
+        positions[i] = Vec3(0.1*i, 0.02*(i%3), 0.03*(i%2));
+    }
+    for (int i = 1; i < numParticles; i++)
+        bonds->addBond(i-1, i, 0.11, 1000.0);
+    for (int i = 2; i < numParticles; i++)
+        angles->addAngle(i-2, i-1, i, 2.0, 100.0);
+    system.addForce(bonds);
+    system.addForce(angles);
+    VerletIntegrator integrator(0.001), referenceIntegrator(0.001);
+    Context context(system, integrator, platform);
+    Context referenceContext(system, referenceIntegrator, Platform::getPlatformByName("Reference"));
+    context.setPositions(positions);
+    referenceContext.setPositions(positions);
+    for (int groups = 1; groups <= 3; groups++) {
+        State state = context.getState(State::Forces | State::Energy, false, groups);
+        State expected = referenceContext.getState(State::Forces | State::Energy, false, groups);
+        ASSERT_EQUAL_TOL(expected.getPotentialEnergy(), state.getPotentialEnergy(), 1e-4);
+        for (int i = 0; i < numParticles; i++)
+            ASSERT_EQUAL_VEC(expected.getForces()[i], state.getForces()[i], 1e-4);
+    }
+}
 
 void runPlatformTests() {
+    testBondChunks();
 }
