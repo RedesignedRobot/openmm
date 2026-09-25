@@ -29,7 +29,7 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), commitCount(0) {
+MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0) {
 }
 
 MetalQueue::~MetalQueue() {
@@ -44,7 +44,8 @@ MetalQueue::~MetalQueue() {
 MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
     if (encoder == NULL) {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-        encoder = getCommandBuffer()->computeCommandEncoder()->retain();
+        MTL::DispatchType type = (concurrentDispatch ? MTL::DispatchTypeConcurrent : MTL::DispatchTypeSerial);
+        encoder = getCommandBuffer()->computeCommandEncoder(type)->retain();
         pool->release();
     }
     return encoder;
@@ -58,6 +59,14 @@ MTL::CommandBuffer* MetalQueue::getCommandBuffer() {
         pool->release();
     }
     return openBuffer;
+}
+
+void MetalQueue::setConcurrentDispatch(bool concurrent) {
+    lock_guard<recursive_mutex> guard(lock);
+    if (concurrent == concurrentDispatch)
+        return;
+    endEncoding();
+    concurrentDispatch = concurrent;
 }
 
 void MetalQueue::endEncoding() {

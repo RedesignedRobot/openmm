@@ -52,6 +52,18 @@ static void getMetalPmeParameters(MetalContext& cu, bool& usePmeQueue, bool& use
     useFixedPointChargeSpreading = cu.getUseDoublePrecision() || !cu.getSupportsHardwareFloatGlobalAtomicAdd() || cu.getPlatformData().deterministicForces;
 }
 
+// Sets the queue's dispatch type for a scope and restores serial dispatch on the way out, even when an
+// exception leaves the scope.
+struct ConcurrentDispatchScope {
+    ConcurrentDispatchScope(MetalQueue& queue, bool concurrent) : queue(queue) {
+        queue.setConcurrentDispatch(concurrent);
+    }
+    ~ConcurrentDispatchScope() {
+        queue.setConcurrentDispatch(false);
+    }
+    MetalQueue& queue;
+};
+
 void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
 }
 
@@ -72,8 +84,19 @@ void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool
 
 double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups, bool& valid) {
     ContextSelector selector(cu);
-    cu.getBondedUtilities().computeInteractions(groups);
-    cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+
+    // The bonded and nonbonded kernels share no written buffer except the force buffer, and both only add
+    // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
+    // a plain += into the energy buffer (bonded on every step, nonbonded only with energy), and each writes
+    // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
+    // boundaries on either side order them against the clear before and the readers after.
+
+    {
+        bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
+        ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
+        cu.getBondedUtilities().computeInteractions(groups);
+        cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+    }
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
