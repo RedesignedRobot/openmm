@@ -1,4 +1,6 @@
 #define BUFFER_SIZE 256
+// Fewest atoms of block X passing the sphere test for which findBlocksWithInteractions tests all 32 unrolled.
+#define MIN_ATOMS_TO_UNROLL 8
 
 #if defined(AMD_RDNA)
 
@@ -523,6 +525,20 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     mfma4x4<6>(pos1, pos2, c, interacts);
                     mfma4x4<7>(pos1, pos2, c, interacts);
 #else
+                    // atomFlags is uniform across the SIMD group. When enough atoms of block X pass the sphere test,
+                    // an unrolled test of all 32 is cheaper than the serial loop over the passing ones; masking with
+                    // atomFlags gives the same bits. The bits are set directly, because collectInteractions keeps
+                    // only bit 31 when there are no single pairs.
+                    if (__popc(atomFlags) >= MIN_ATOMS_TO_UNROLL) {
+                        #pragma unroll
+                        for (int j = 0; j < TILE_SIZE; j++) {
+                            real4 posj = posBuffer[j];
+                            real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim)));
+                            interacts |= (__float_as_uint(d) >> 31) << j;
+                        }
+                        interacts &= atomFlags;
+                        atomFlags = 0;
+                    }
                     while (atomFlags) {
                         int j = __ffs(atomFlags)-1;
                         atomFlags = atomFlags ^ (static_cast<tileflags>(1) << j);
