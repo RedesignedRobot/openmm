@@ -56,6 +56,11 @@ public:
     }
     MTL::ComputeCommandEncoder* getEncoder();
     MTL::CommandBuffer* getCommandBuffer();
+    /**
+     * Choose whether getEncoder() opens compute passes whose dispatches may run at the same time.  Changing
+     * it ends the current pass.
+     */
+    void setConcurrentDispatch(bool concurrent);
     void commit();
     void finish();
     long long getCommitCount() const {
@@ -66,6 +71,7 @@ private:
     metalStream_t stream;
     MTL::CommandBuffer* openBuffer;
     MTL::ComputeCommandEncoder* encoder;
+    bool concurrentDispatch;
     std::deque<MTL::CommandBuffer*> pending;
     long long commitCount;
     std::recursive_mutex lock;
