@@ -36,8 +36,10 @@ void testBondChunks() {
     // The bonded kernel sums each threadgroup's chunk of terms in threadgroup memory (MetalBondedUtilities).
     // A threadgroup takes more than one chunk of a force once the force has more terms than the grid has
     // threads, 46,080 on a 60-core GPU.  The angles are in another force group, so each group is checked
-    // alone and with the other.
+    // alone and with the other.  The chain snakes through a 50x50x41 grid 0.1 nm apart: along a straight
+    // line, float positions near 10,000 nm would be off by 5e-4 nm and move the bond energy by 0.5%.
     const int numParticles = 100001;
+    const int side = 50;
     System system;
     HarmonicBondForce* bonds = new HarmonicBondForce();
     HarmonicAngleForce* angles = new HarmonicAngleForce();
@@ -45,7 +47,12 @@ void testBondChunks() {
     vector<Vec3> positions(numParticles);
     for (int i = 0; i < numParticles; i++) {
         system.addParticle(1.0);
-        positions[i] = Vec3(0.1*i, 0.02*(i%3), 0.03*(i%2));
+        int row = i/side, column = i%side, plane = row/side, rowInPlane = row%side;
+        if (row%2 == 1)
+            column = side-1-column;
+        if (plane%2 == 1)
+            rowInPlane = side-1-rowInPlane;
+        positions[i] = Vec3(0.1*column, 0.1*rowInPlane+0.02*(i%3), 0.1*plane+0.03*(i%2));
     }
     for (int i = 1; i < numParticles; i++)
         bonds->addBond(i-1, i, 0.11, 1000.0);
