@@ -46,6 +46,7 @@ MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, u
     metalModule_t module = context.createModule(context.replaceStrings(MetalKernelSources::sort, replacements));
     shortListKernel = context.getKernel(module, "sortShortList");
     shortList2Kernel = context.getKernel(module, "sortShortList2");
+    copyShortListKernel = context.getKernel(module, "copyShortList");
     computeRangeKernel = context.getKernel(module, "computeRange");
     assignElementsKernel = context.getKernel(module, uniform ? "assignElementsToBuckets" : "assignElementsToBuckets2");
     computeBucketPositionsKernel = context.getKernel(module, "computeBucketPositions");
@@ -103,8 +104,9 @@ void MetalSort::sort(ArrayInterface& data) {
 
         if (dataLength <= MetalContext::ThreadBlockSize*context.getNumThreadBlocks()) {
             void* sortArgs[] = {&cudata.getDevicePointer(), &buckets.getDevicePointer(), &dataLength};
-            context.executeKernel(shortList2Kernel, sortArgs, dataLength, MetalContext::ThreadBlockSize, MetalContext::ThreadBlockSize*trait->getKeySize());
-            buckets.copyTo(cudata);
+            context.executeKernelFlat(shortList2Kernel, sortArgs, dataLength*context.getSIMDWidth(), MetalContext::ThreadBlockSize);
+            void* copyArgs[] = {&buckets.getDevicePointer(), &cudata.getDevicePointer(), &dataLength};
+            context.executeKernelFlat(copyShortListKernel, copyArgs, dataLength, MetalContext::ThreadBlockSize);
         }
         else {
             void* sortArgs[] = {&cudata.getDevicePointer(), &dataLength};

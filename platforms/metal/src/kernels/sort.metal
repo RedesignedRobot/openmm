@@ -46,28 +46,34 @@ __global__ void sortShortList(DATA_TYPE* __restrict__ data, unsigned int length,
 }
 
 /**
- * An alternate kernel for sorting short lists.  In this version every thread does a full
- * scan through the data to select the destination for one element.  This involves more
- * work, but also parallelizes much better.
+ * An alternate kernel for sorting short lists.  In this version each SIMD group selects the
+ * destination of one element by counting the elements that sort before it.  This involves more
+ * work, but also parallelizes much better.  The sorted data goes to dataOut.
  */
-__global__ void sortShortList2(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* __restrict__ dataOut, unsigned int length, threadgroup KEY_TYPE* keyBuffer [[threadgroup(0)]]) {
-    int globalId = blockDim.x*blockIdx.x+threadIdx.x;
-    DATA_TYPE value = dataIn[globalId < length ? globalId : 0];
+__global__ void sortShortList2(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* __restrict__ dataOut, unsigned int length,
+        ushort lane [[thread_index_in_simdgroup]], ushort simdSize [[threads_per_simdgroup]]) {
+    unsigned int element = GLOBAL_ID/simdSize;
+    if (element >= length)
+        return;
+    DATA_TYPE value = dataIn[element];
     KEY_TYPE key = getValue(value);
-    int count = 0;
-    for (int blockStart = 0; blockStart < length; blockStart += blockDim.x) {
-        int numInBlock = min(static_cast<int>(blockDim.x), static_cast<int>(length-blockStart));
-        __syncthreads();
-        if (threadIdx.x < numInBlock)
-            keyBuffer[threadIdx.x] = getValue(dataIn[blockStart+threadIdx.x]);
-        __syncthreads();
-        for (int i = 0; i < numInBlock; i++) {
-            KEY_TYPE otherKey = keyBuffer[i];
-            count += (otherKey < key) | ((otherKey == key) & (blockStart+i < globalId));
-        }
+    unsigned int count = 0;
+    for (unsigned int i = lane; i < length; i += simdSize) {
+        KEY_TYPE otherKey = getValue(dataIn[i]);
+        count += (otherKey < key) | ((otherKey == key) & (i < element));
     }
-    if (globalId < length)
+    count = simd_sum(count);
+    if (lane == 0)
         dataOut[count] = value;
+}
+
+/**
+ * Copy the output of sortShortList2 back to the array being sorted.  This stays in the compute
+ * encoder, where a blit would need an encoder of its own.
+ */
+__global__ void copyShortList(const DATA_TYPE* __restrict__ dataIn, DATA_TYPE* __restrict__ dataOut, unsigned int length) {
+    if (GLOBAL_ID < length)
+        dataOut[GLOBAL_ID] = dataIn[GLOBAL_ID];
 }
 
 inline __device__ void reduceMinMax(KEY_TYPE minimum, KEY_TYPE maximum, threadgroup KEY_TYPE* minBuffer, threadgroup KEY_TYPE* maxBuffer,
