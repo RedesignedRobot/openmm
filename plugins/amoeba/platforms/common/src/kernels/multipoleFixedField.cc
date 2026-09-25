@@ -1,5 +1,12 @@
 #define WARPS_PER_GROUP (THREAD_BLOCK_SIZE/TILE_SIZE)
 
+#ifdef USE_METAL
+// Mutual polarization amplifies the error of fast::rsqrt in the fixed field enough to fail
+// testGeneralizedKirkwoodVillinMutualPolarization in single precision.
+#undef RSQRT
+#define RSQRT precise::rsqrt
+#endif
+
 typedef struct {
     real4 posq;
     real3 field, fieldPolar, dipole;
