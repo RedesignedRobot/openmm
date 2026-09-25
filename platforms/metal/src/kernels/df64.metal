@@ -112,6 +112,8 @@ struct alignas(8) df64 {
 #define DF64_COMPOUND(AS) \
     AS df64& operator+=(df64 v) AS; \
     AS df64& operator-=(df64 v) AS; \
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> AS df64& operator+=(T v) AS; \
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> AS df64& operator-=(T v) AS; \
     AS df64& operator*=(df64 v) AS; \
     AS df64& operator/=(df64 v) AS;
     DF64_COMPOUND(thread)
@@ -248,9 +250,7 @@ inline df64 operator+(df64 x, df64 y) {
     float2 s = df64_two_sum(x.hi, y.hi);
     if (!isfinite(s.x))
         return df64(s.x, 0.0f);
-    float2 t = df64_two_sum(x.lo, y.lo);
-    float2 v = df64_fast_two_sum(s.x, s.y + t.x);
-    float2 z = df64_fast_two_sum(v.x, t.y + v.y);
+    float2 z = df64_fast_two_sum(s.x, s.y + (x.lo + y.lo));
     return df64(z.x, z.y);
 }
 
@@ -269,8 +269,7 @@ inline df64 operator*(df64 x, df64 y) {
     float2 c = df64_two_prod(x.hi, y.hi);
     if (!isfinite(c.x))
         return df64(c.x, 0.0f);
-    float t = fma(x.hi, y.lo, x.lo * y.lo);
-    float2 z = df64_fast_two_sum(c.x, c.y + fma(x.lo, y.hi, t));
+    float2 z = df64_fast_two_sum(c.x, c.y + fma(x.lo, y.hi, x.hi * y.lo));
     return df64(z.x, z.y);
 }
 
@@ -283,24 +282,24 @@ inline df64 operator*(df64 x, float y) {
 }
 
 inline df64 operator/(df64 x, float y) {
-    float th = x.hi / y;
+    float r = 1.0f / y;
+    float th = x.hi * r;
     if (!isfinite(th))
         return df64(th, 0.0f);
     float2 p = df64_two_prod(th, y);
     float d = ((x.hi - p.x) - p.y) + x.lo;
-    float2 z = df64_fast_two_sum(th, d / y);
+    float2 z = df64_fast_two_sum(th, d * r);
     return df64(z.x, z.y);
 }
 
 inline df64 operator/(df64 x, df64 y) {
-    float th = x.hi / y.hi;
+    float r = 1.0f / y.hi;
+    float th = x.hi * r;
     if (!isfinite(th))
         return df64(th, 0.0f);
-    float2 c = df64_two_prod(y.hi, th);
-    float2 t = df64_fast_two_sum(c.x, y.lo * th);
-    float2 r = df64_fast_two_sum(t.x, t.y + c.y);
-    float delta = (x.hi - r.x) + (x.lo - r.y);
-    float2 z = df64_fast_two_sum(th, delta / y.hi);
+    float2 p = df64_two_prod(th, y.hi);
+    float d = (((x.hi - p.x) - p.y) + x.lo) - th * y.lo;
+    float2 z = df64_fast_two_sum(th, d * r);
     return df64(z.x, z.y);
 }
 
@@ -322,6 +321,8 @@ template <DF64_INTEGRAL(T)> inline df64 operator/(T x, df64 y) { return df64(x) 
 #define DF64_COMPOUND(AS) \
 inline AS df64& df64::operator+=(df64 v) AS { return *this = df64(*this) + v; } \
 inline AS df64& df64::operator-=(df64 v) AS { return *this = df64(*this) - v; } \
+template <typename T, typename> inline AS df64& df64::operator+=(T v) AS { return *this = df64(*this) + v; } \
+template <typename T, typename> inline AS df64& df64::operator-=(T v) AS { return *this = df64(*this) - v; } \
 inline AS df64& df64::operator*=(df64 v) AS { return *this = df64(*this) * v; } \
 inline AS df64& df64::operator/=(df64 v) AS { return *this = df64(*this) / v; }
 DF64_COMPOUND(thread)
@@ -381,11 +382,12 @@ inline df64::operator long() const thread {
 inline df64 sqrt(df64 x) {
     if (x.hi <= 0.0f)
         return x.hi == 0.0f ? df64(x.hi, 0.0f) : df64(NAN, 0.0f);
-    float s = precise::sqrt(x.hi);
-    if (isinf(s))
-        return df64(s, 0.0f);
+    if (isinf(x.hi))
+        return df64(x.hi, 0.0f);
+    float rs = rsqrt(x.hi);
+    float s = x.hi * rs;
     float r = fma(-s, s, x.hi) + x.lo;
-    float2 z = df64_fast_two_sum(s, r / (2.0f * s));
+    float2 z = df64_fast_two_sum(s, r * (0.5f * rs));
     return df64(z.x, z.y);
 }
 
