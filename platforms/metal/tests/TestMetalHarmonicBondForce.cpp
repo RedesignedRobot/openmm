@@ -36,8 +36,9 @@ void testBondChunks() {
     // The bonded kernel sums each threadgroup's chunk of terms in threadgroup memory (MetalBondedUtilities).
     // A threadgroup takes more than one chunk of a force once the force has more terms than the grid has
     // threads, 46,080 on a 60-core GPU.  The angles are in another force group, so each group is checked
-    // alone and with the other.  The chain snakes through a 50x50x41 grid 0.1 nm apart: along a straight
-    // line, float positions near 10,000 nm would be off by 5e-4 nm and move the bond energy by 0.5%.
+    // alone and with the other.  The chain snakes through a 50x50x41 grid 0.1 nm apart, and every coordinate
+    // is a float, so the single precision posq holds the positions Reference sees.  Rounding them instead
+    // moves a bond by up to 5e-7 nm, which the 1000 kJ/mol/nm^2 bonds turn into force errors of 5e-4.
     const int numParticles = 100001;
     const int side = 50;
     System system;
@@ -52,7 +53,7 @@ void testBondChunks() {
             column = side-1-column;
         if (plane%2 == 1)
             rowInPlane = side-1-rowInPlane;
-        positions[i] = Vec3(0.1*column, 0.1*rowInPlane+0.02*(i%3), 0.1*plane+0.03*(i%2));
+        positions[i] = Vec3((float) (0.1*column), (float) (0.1*rowInPlane+0.02*(i%3)), (float) (0.1*plane+0.03*(i%2)));
     }
     for (int i = 1; i < numParticles; i++)
         bonds->addBond(i-1, i, 0.11, 1000.0);
