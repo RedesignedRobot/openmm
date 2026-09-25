@@ -261,7 +261,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
-        numTilesInBatch = (numAtomBlocks < 32*context.getMultiprocessors() ? 4 : 1);
+        numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
