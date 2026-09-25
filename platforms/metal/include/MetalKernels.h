@@ -122,6 +122,19 @@ private:
 };
 
 /**
+ * This kernel is invoked by LangevinMiddleIntegrator to take one time step.
+ */
+class MetalIntegrateLangevinMiddleStepKernel : public CommonIntegrateLangevinMiddleStepKernel {
+public:
+    MetalIntegrateLangevinMiddleStepKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonIntegrateLangevinMiddleStepKernel(name, platform, cu), cu(cu) {
+    }
+private:
+    void integrate(double tol);
+    MetalContext& cu;
+};
+
+/**
  * This kernel is invoked by CustomCVForce to calculate the forces acting on the system and the energy of the system.
  */
 class MetalCalcCustomCVForceKernel : public CommonCalcCustomCVForceKernel {

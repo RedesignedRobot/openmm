@@ -246,6 +246,7 @@ inline uint2 df64_to_ieee(df64 v) {
 inline df64 operator-(df64 a) { return df64(-a.hi, -a.lo); }
 inline df64 operator+(df64 a) { return a; }
 
+// One rounding joins the low parts instead of a second two-sum, so the error is about 2^-47 of |x|+|y|.
 inline df64 operator+(df64 x, df64 y) {
     float2 s = df64_two_sum(x.hi, y.hi);
     if (!isfinite(s.x))
@@ -281,6 +282,7 @@ inline df64 operator*(df64 x, float y) {
     return df64(z.x, z.y);
 }
 
+// Both divisions multiply by 1/y, which is accurate only for 2^-126 <= |y| <= 2^126.
 inline df64 operator/(df64 x, float y) {
     float r = 1.0f / y;
     float th = x.hi * r;
