@@ -44,9 +44,19 @@ public:
      */
     void enqueue();
     /**
+     * Place the event into the current command buffer without committing it, so the
+     * operations that follow share the buffer.  Commit the queue before calling wait().
+     */
+    void signal();
+    /**
      * Block until all operations started before the call to enqueue() have completed.
      */
     void wait();
+    /**
+     * Like wait(), but poll the event instead of blocking in Metal.  The host wakes sooner after
+     * the signal, and spends CPU time while it waits.
+     */
+    void poll();
     /**
      * Enqueue a barrier that causes a specified ComputeQueue to block until all
      * operations started before the call to enqueue() have completed.

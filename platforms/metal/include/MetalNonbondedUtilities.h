@@ -38,6 +38,7 @@
 namespace OpenMM {
 
 class MetalContext;
+class MetalEvent;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
@@ -288,6 +289,11 @@ public:
      */
     void createKernelsForGroups(int groups);
     /**
+     * Get the most interacting atoms a block may have in another block for their interactions to be stored as
+     * single pairs instead of a tile.
+     */
+    int getMaxBitsForPairs() const;
+    /**
      * Set the source code for the main kernel.  This defaults to the content of nonbonded.metal.  It only needs to be
      * changed in very unusual circumstances.
      */
@@ -318,7 +324,7 @@ private:
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
     ComputeSort blockSorter;
-    ComputeEvent downloadCountEvent;
+    std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
@@ -329,7 +335,7 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
-    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
+    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams, waitForCount;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
