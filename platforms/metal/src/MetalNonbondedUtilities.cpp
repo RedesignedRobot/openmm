@@ -577,6 +577,17 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
     groupKernels[groups] = kernels;
 }
 
+/**
+ * A three component parameter is stored as packed scalars, because a Metal vector of three
+ * takes the space of four.
+ */
+static string loadParameter(const ComputeParameterInfo& param, const string& index) {
+    string array = "global_"+param.getName();
+    if (param.getNumComponents() != 3)
+        return array+"["+index+"]";
+    return "make_"+param.getType()+"("+array+"[3*"+index+"], "+array+"[3*"+index+"+1], "+array+"[3*"+index+"+2])";
+}
+
 metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
     map<string, string> replacements;
     replacements["COMPUTE_INTERACTION"] = source;
@@ -586,7 +597,7 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         args << ", ";
         if (param.isConstant())
             args << "const ";
-        args << param.getType();
+        args << (param.getNumComponents() == 3 ? param.getComponentType() : param.getType());
         args << "* __restrict__ global_";
         args << param.getName();
     }
@@ -607,9 +618,9 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         load1 << param.getType();
         load1 << " ";
         load1 << param.getName();
-        load1 << "1 = global_";
-        load1 << param.getName();
-        load1 << "[atom1];\n";
+        load1 << "1 = ";
+        load1 << loadParameter(param, "atom1");
+        load1 << ";\n";
     }
     replacements["LOAD_ATOM1_PARAMETERS"] = load1.str();
 
@@ -639,7 +650,7 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
 
     stringstream loadLocal2;
     for (const ComputeParameterInfo& param : params)
-        loadLocal2<<"shfl"<<param.getName()<<" = global_"<<param.getName()<<"[j];\n";
+        loadLocal2<<"shfl"<<param.getName()<<" = "<<loadParameter(param, "j")<<";\n";
     replacements["LOAD_LOCAL_PARAMETERS_FROM_GLOBAL"] = loadLocal2.str();
 
     stringstream load2j;

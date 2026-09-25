@@ -198,7 +198,12 @@ KERNEL void mapTorqueToForce(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL cons
     const int Z = 2;
     const int I = 3;
     
+#ifdef USE_METAL
+    // Metal has no double.  2^32 is exact in float.
+    const real torqueScale = RECIP((real) 0x100000000);
+#else
     const real torqueScale = RECIP((double) 0x100000000);
+#endif
     
     real3 forces[4];
     real norms[12];
