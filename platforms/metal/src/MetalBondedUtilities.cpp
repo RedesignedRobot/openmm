@@ -34,6 +34,12 @@ using namespace std;
 // threadgroups of ThreadBlockSize.  Only forces whose terms touch up to MaxChunkedAtoms atoms are chunked.
 static const int MaxChunkedAtoms = 4;
 
+// Forces with fewer terms keep the per-term atomics.  On the M3 Ultra, chunking every force slowed the
+// bonded kernel of the rf and gbsa dhfr systems (at most 7,310 terms per force) by 10 to 15%, and sped it
+// up 2.8 to 3.4 times on apoa1 and cellulose, where no force has fewer than 11,428 terms.  dhfr's PME
+// exclusions (34,709 terms) stay chunked.
+static const int MinChunkedTerms = 10000;
+
 // Metal's limit on a kernel's buffer and value arguments (see MetalContext::createProgram()), and the
 // arguments that BondedUtilities::initialize() gives the kernel before any force's.
 static const int MaxKernelArguments = 31;
@@ -43,11 +49,11 @@ void MetalBondedUtilities::initialize(const System& system) {
     // For each chunk, the plan lists the atoms the chunk touches, and for each atom the pad slots that hold
     // its forces.  A force's plan is the offset of each chunk's first entry, then one entry per atom
     // (the atom, and its first and end slot in the low and high 16 bits), then numAtoms*chunkSize slots
-    // per chunk as ushorts.  A force keeps the per-term atomics of BondedUtilities if its terms are too
-    // large, if its code could leave the loop over its terms early and so skip a barrier, if its chunks
-    // save less than a quarter of its atomic adds, too few to pay for the barriers, or if its plan would
-    // take the whole plan past 1% of the device's working set.  So does every force when the plan would
-    // take the kernel past the argument limit.
+    // per chunk as ushorts.  A force keeps the per-term atomics of BondedUtilities if it has too few terms,
+    // if its terms are too large, if its code could leave the loop over its terms early and so skip a
+    // barrier, if its chunks save less than a quarter of its atomic adds, too few to pay for the barriers,
+    // or if its plan would take the whole plan past 1% of the device's working set.  So does every force
+    // when the plan would take the kernel past the argument limit.
 
     const int chunkSize = MetalContext::ThreadBlockSize;
     int numForces = forceAtoms.size();
@@ -65,7 +71,7 @@ void MetalBondedUtilities::initialize(const System& system) {
         int numBonds = forceAtoms[force].size();
         int numAtoms = forceAtoms[force][0].size();
         const string& source = forceSource[force];
-        if (numAtoms > MaxChunkedAtoms || source.find("continue") != string::npos || source.find("break") != string::npos || source.find("return") != string::npos)
+        if (numBonds < MinChunkedTerms || numAtoms > MaxChunkedAtoms || source.find("continue") != string::npos || source.find("break") != string::npos || source.find("return") != string::npos)
             continue;
         int numChunks = (numBonds+chunkSize-1)/chunkSize;
         vector<unsigned int> entryStart(1, 0), entries;
