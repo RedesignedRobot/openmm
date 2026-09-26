@@ -83,9 +83,13 @@ void CommonMinimizeKernel::execute(ContextImpl& context, double tolerance, int m
         // Load system and integrator information.
 
         mixedIsDouble = cc.getUseMixedPrecision() || cc.getUseDoublePrecision();
-        singleBlockReductions = mixedIsDouble && !cc.getSupports64BitGlobalAtomics();
+        twoPassReductions = mixedIsDouble && !cc.getSupports64BitGlobalAtomics();
         elementSize = mixedIsDouble ? sizeof(double) : sizeof(float);
         threadBlockSize = cc.getMaxThreadBlockSize();
+        reductionBlocks = min(cc.getNumThreadBlocks(), max(1, (numVariables+threadBlockSize-1)/threadBlockSize));
+        reductionBlocks = min(reductionBlocks, (int) cc.getEnergyBuffer().getSize()/4);
+        if (twoPassReductions && reductionBlocks == 0)
+            throw OpenMMException("Energy workspace is too small for minimizer reductions");
         pinnedMemory = cc.getPinnedBuffer();
 
         // Initialize all device-side arrays and compile kernels.
@@ -185,8 +189,12 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     defines["LBFGS_SCALE_UP"] = cc.doubleToString(stepScaleUp);
     defines["LBFGS_MIN_STEP"] = cc.doubleToString(minStep);
     defines["LBFGS_MAX_STEP"] = cc.doubleToString(maxStep);
-    if (singleBlockReductions) {
+    if (twoPassReductions) {
+        // Keep the unused atomic helper compilable without 64-bit atomics.
         defines["SINGLE_BLOCK_REDUCTIONS"] = "";
+        defines["TWO_PASS_REDUCTIONS"] = "";
+        defines["REDUCTION_BLOCKS"] = cc.intToString(reductionBlocks);
+        defines["REDUCTION_STRIDE"] = cc.intToString(numVectors+1);
     }
 
     ComputeProgram program = cc.compileProgram(CommonKernelSources::minimize, defines);
@@ -368,6 +376,26 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchContinueKernel->addArg(returnFlag);
     lineSearchContinueKernel->addArg(gradNorm);
     lineSearchContinueKernel->addArg(lineSearchData);
+
+    if (twoPassReductions) {
+        // Force energy has already been reduced to the host before these
+        // reductions run. Reuse its workspace; the next force evaluation clears
+        // it through the usual autoclear path. This adds no device allocation.
+        if (numConstraints)
+            getConstraintEnergyForcesKernel->addArg(cc.getEnergyBuffer());
+        for (ComputeKernel kernel : {getScaleKernel, reinitializeDirKernel,
+                updateDirAlphaKernel, scaleDirKernel, updateDirBetaKernel, lineSearchSetupKernel,
+                lineSearchStepKernel, lineSearchDotKernel}) {
+            kernel->addArg(cc.getEnergyBuffer());
+        }
+        finishReductionKernel = program->createKernel("finishReduction");
+        finishReductionKernel->addArg(cc.getEnergyBuffer());
+        finishReductionKernel->addArg(returnValue);
+        finishReductionKernel->addArg(scale);
+        finishReductionKernel->addArg(alpha);
+        finishReductionKernel->addArg(lineSearchData);
+        finishReductionKernel->addArg(gradNorm);
+    }
 
     downloadStartEvent = cc.createEvent();
     downloadFinishEvent = cc.createEvent();
@@ -751,8 +779,9 @@ double CommonMinimizeKernel::downloadGradNormSync() {
 }
 
 void CommonMinimizeKernel::executeReduction(ComputeKernel& kernel, int numThreads) {
-    if (singleBlockReductions) {
-        kernel->execute(threadBlockSize, threadBlockSize);
+    if (twoPassReductions) {
+        kernel->execute(reductionBlocks*threadBlockSize, threadBlockSize);
+        finishReductionKernel->execute(2*threadBlockSize, threadBlockSize);
     }
     else {
         kernel->execute(numThreads);
