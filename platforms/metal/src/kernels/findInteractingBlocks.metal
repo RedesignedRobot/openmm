@@ -36,90 +36,64 @@ private:
 };
 
 /**
- * Find a bounding box for the atoms in each block.
+ * Find a bounding box for the atoms in each block.  Each SIMD group handles one block, and each threadgroup of
+ * FIND_BLOCK_BOUNDS_GROUP threads records the range of block sizes with one atomic pair, not one per block.
  */
 extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
         real2* __restrict__ blockSizeRange) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
-    const int index = warpSize == TILE_SIZE ? blockIdx.x : (blockIdx.x*(warpSize/TILE_SIZE) + threadIdx.x/TILE_SIZE);
+    const int tileInGroup = threadIdx.x/TILE_SIZE;
+    const int index = blockIdx.x*(FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE) + tileInGroup;
     const int base = index * TILE_SIZE;
-    if (base >= numAtoms)
-        return;
+    const bool validBlock = base < numAtoms;
 
     real4 tPos = posq[base + indexInTile < numAtoms ? base + indexInTile : 0];
+    real4 pos = make_real4(tPos.x, tPos.y, tPos.z, 0);
 #ifdef USE_PERIODIC
-    real4 pos;
-    pos.x = SHFL(tPos.x, 0);
-    pos.y = SHFL(tPos.y, 0);
-    pos.z = SHFL(tPos.z, 0);
-    APPLY_PERIODIC_TO_POS(pos)
+    // Wrap every atom to its image nearest the first atom.  For a block narrower than half the box this picks the
+    // same images as wrapping one atom at a time around the running center, without 31 dependent steps.
 
-    real4 minPos = pos;
-    real4 maxPos = pos;
-
-    for (int i = 1; i < TILE_SIZE; i++) {
-        pos.x = SHFL(tPos.x, i);
-        pos.y = SHFL(tPos.y, i);
-        pos.z = SHFL(tPos.z, i);
-        real4 center = 0.5f*(maxPos+minPos);
-        APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, center)
-        minPos = make_real4(min(minPos.x,pos.x), min(minPos.y,pos.y), min(minPos.z,pos.z), 0);
-        maxPos = make_real4(max(maxPos.x,pos.x), max(maxPos.y,pos.y), max(maxPos.z,pos.z), 0);
-    }
-#else
-    real4 minPos = tPos;
-    real4 maxPos = tPos;
-
-    for (int i = TILE_SIZE >> 1; i > 0; i >>= 1) {
-        real4 tpos1, tpos2;
-        tpos1.x = __shfl_down(minPos.x, i, TILE_SIZE);
-        tpos1.y = __shfl_down(minPos.y, i, TILE_SIZE);
-        tpos1.z = __shfl_down(minPos.z, i, TILE_SIZE);
-        tpos2.x = __shfl_down(maxPos.x, i, TILE_SIZE);
-        tpos2.y = __shfl_down(maxPos.y, i, TILE_SIZE);
-        tpos2.z = __shfl_down(maxPos.z, i, TILE_SIZE);
-
-        minPos.x = min(minPos.x, tpos1.x);
-        minPos.y = min(minPos.y, tpos1.y);
-        minPos.z = min(minPos.z, tpos1.z);
-        maxPos.x = max(maxPos.x, tpos2.x);
-        maxPos.y = max(maxPos.y, tpos2.y);
-        maxPos.z = max(maxPos.z, tpos2.z);
-    }
-
-    minPos.x = SHFL(minPos.x, 0);
-    minPos.y = SHFL(minPos.y, 0);
-    minPos.z = SHFL(minPos.z, 0);
-    maxPos.x = SHFL(maxPos.x, 0);
-    maxPos.y = SHFL(maxPos.y, 0);
-    maxPos.z = SHFL(maxPos.z, 0);
+    real4 first = make_real4(SHFL(tPos.x, 0), SHFL(tPos.y, 0), SHFL(tPos.z, 0), 0);
+    APPLY_PERIODIC_TO_POS(first)
+    APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, first)
 #endif
+    real4 minPos = make_real4(simd_min(pos.x), simd_min(pos.y), simd_min(pos.z), 0);
+    real4 maxPos = make_real4(simd_max(pos.x), simd_max(pos.y), simd_max(pos.z), 0);
 
     real4 blockSize = 0.5f*(maxPos-minPos);
     real4 center = 0.5f*(maxPos+minPos);
-    center.w = 0;
     real4 delta = tPos - center;
 #ifdef USE_PERIODIC
     APPLY_PERIODIC_TO_DELTA(delta)
 #endif
-    real tdelta = delta.x*delta.x+delta.y*delta.y+delta.z*delta.z;
-    real tcenter = max(center.w, tdelta);
-    for (int i = TILE_SIZE >> 1; i > 0; i >>= 1) {
-        real t = __shfl_down(tcenter, i, TILE_SIZE);
-        tcenter = max(tcenter, t);
-    }
+    real tcenter = simd_max(delta.x*delta.x+delta.y*delta.y+delta.z*delta.z);
 
+    // Record the range of sizes.
+
+    __shared__ real groupMinSize[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
+    __shared__ real groupMaxSize[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
     if (indexInTile == 0) {
-        center.w = SQRT(tcenter);
-        blockBoundingBox[index] = blockSize;
-        blockCenter[index] = center;
-
-        // Record the range of sizes.
         real totalSize = blockSize.x+blockSize.y+blockSize.z;
-        if (totalSize > 0)
-            atomicMin((device real*) blockSizeRange, totalSize);
-        atomicMax((device real*) blockSizeRange+1, totalSize);
+        if (validBlock) {
+            center.w = SQRT(tcenter);
+            blockBoundingBox[index] = blockSize;
+            blockCenter[index] = center;
+        }
+        groupMinSize[tileInGroup] = (validBlock && totalSize > 0 ? totalSize : 1e38f);
+        groupMaxSize[tileInGroup] = (validBlock ? totalSize : 0.0f);
+    }
+    SYNC_THREADS;
+    if (threadIdx.x == 0) {
+        real minSize = groupMinSize[0];
+        real maxSize = groupMaxSize[0];
+        for (int i = 1; i < FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE; i++) {
+            minSize = min(minSize, groupMinSize[i]);
+            maxSize = max(maxSize, groupMaxSize[i]);
+        }
+        if (minSize < 1e38f)
+            atomicMin((device real*) blockSizeRange, minSize);
+        atomicMax((device real*) blockSizeRange+1, maxSize);
     }
     if (blockIdx.x == 0 && threadIdx.x == 0)
         rebuildNeighborList[0] = 0;

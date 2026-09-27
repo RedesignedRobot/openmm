@@ -38,6 +38,11 @@
 using namespace OpenMM;
 using namespace std;
 
+// findBlockBounds handles one atom block per SIMD group.  Eight blocks per threadgroup take it from 18.6 to 2.5 us per
+// step on apoa1 on an M3 Ultra (with the parallel periodic wrap), mostly by making one pair of atomics on the block
+// size range per threadgroup instead of per block.
+static const int FindBlockBoundsThreadBlockSize = 256;
+
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -428,7 +433,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
 
     // Compute the neighbor list.
 
-    context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
+    context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), FindBlockBoundsThreadBlockSize);
     context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
     blockSorter->sort(sortedBlocks);
     context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
@@ -594,6 +599,7 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
+        defines["FIND_BLOCK_BOUNDS_GROUP"] = context.intToString(FindBlockBoundsThreadBlockSize);
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
