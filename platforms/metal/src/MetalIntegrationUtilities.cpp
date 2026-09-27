@@ -33,7 +33,9 @@ using namespace OpenMM;
 using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
-        ccmaConvergedMemory(NULL) {
+        ccmaConvergedMemory(NULL), totalMass(0.0), pendingCMMomentum(NULL), pendingCMGroups(0) {
+        for (int i = 0; i < system.getNumParticles(); i++)
+            totalMass += system.getParticleMass(i);
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -163,6 +165,23 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
+    return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision() && !context.getUseMixedPrecision();
+}
+
+void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, ComputeArray& cmMomentum, int numGroups) {
+    pendingCMCalc = calcKernel;
+    pendingCMMomentum = &cmMomentum;
+    pendingCMGroups = numGroups;
+}
+
+void MetalIntegrationUtilities::calcPendingCenterOfMassMomentum() {
+    if (!pendingCMCalc)
+        return;
+    pendingCMCalc->execute(context.getNumAtoms(), 64);
+    pendingCMCalc.reset();
+}
+
 bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
     if (ccmaConstraintAtoms.isInitialized() || context.getUseDoublePrecision())
         return false;
@@ -200,6 +219,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        fusedDefines["INVERSE_TOTAL_MASS"] = context.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
         numLangevinMiddleUnits = numSettle+numShake+unconstrained.size();
         langevinMiddleKernel = program->createKernel("integrateLangevinMiddleFused");
@@ -225,6 +245,8 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
             else
                 langevinMiddleKernel->addArg(nullptr);
         }
+        langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
+        langevinMiddleKernel->addArg(nullptr);
     }
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
@@ -232,6 +254,12 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         langevinMiddleKernel->setArg(4, (float) tol);
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
+    calcPendingCenterOfMassMomentum();
+    langevinMiddleKernel->setArg(18, pendingCMGroups);
+    if (pendingCMMomentum != NULL)
+        langevinMiddleKernel->setArg(19, *pendingCMMomentum);
     langevinMiddleKernel->execute(numLangevinMiddleUnits);
+    pendingCMMomentum = NULL;
+    pendingCMGroups = 0;
     return true;
 }
