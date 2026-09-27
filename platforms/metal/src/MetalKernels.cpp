@@ -128,7 +128,7 @@ void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
 }
 
 // Lanes that share one atom in the reduction kernels.
-static const int REDUCE_LANES = 32;
+static const int REDUCE_LANES = 8;
 
 // The block-pair kernels win when the half-list launch leaves the GPU short of work, so that its tail after the last
 // atomics is exposed, and lose when the launch already fills the GPU, since they read and write one partial per atom
