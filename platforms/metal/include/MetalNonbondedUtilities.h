@@ -90,6 +90,9 @@ public:
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */
     void addParameter(ComputeParameterInfo parameter);
+    void setUseLJPME() override {
+        useLJPME = true;
+    }
     /**
      * Add an array (other than a per-atom parameter) that should be passed as an argument to the default interaction kernel.
      */
@@ -336,6 +339,7 @@ private:
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams, waitForCount;
+    bool useLJPME = false;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
