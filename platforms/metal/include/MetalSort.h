@@ -86,8 +86,6 @@ public:
      * Sort an array.
      */
     void sort(ArrayInterface& data);
-    // GPU-selected dispatch sizes for the short-list sort and copy, two uint3 records.
-    void sortIndirect(ArrayInterface& data, MTL::Buffer* dispatch, size_t offset);
 private:
     MetalContext& context;
     ComputeSortImpl::SortTrait* trait;

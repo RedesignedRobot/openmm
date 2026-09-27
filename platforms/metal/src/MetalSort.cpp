@@ -93,18 +93,6 @@ MetalSort::~MetalSort() {
     delete trait;
 }
 
-void MetalSort::sortIndirect(ArrayInterface& data, MTL::Buffer* dispatch, size_t offset) {
-    if (!isShortList || dataLength > MetalContext::ThreadBlockSize*context.getNumThreadBlocks())
-        throw OpenMMException("Indirect neighbor sort requires the short-list kernel");
-    if (data.getSize() != dataLength || data.getElementSize() != trait->getDataSize())
-        throw OpenMMException("MetalSort called with different data size");
-    MetalArray& values = context.unwrap(data);
-    void* sortArgs[] = {&values.getDevicePointer(), &buckets.getDevicePointer(), &dataLength};
-    context.executeKernelFlat(shortList2Kernel, sortArgs, dataLength*context.getSIMDWidth(), MetalContext::ThreadBlockSize, 0, dispatch, offset);
-    void* copyArgs[] = {&buckets.getDevicePointer(), &values.getDevicePointer(), &dataLength};
-    context.executeKernelFlat(copyShortListKernel, copyArgs, dataLength, MetalContext::ThreadBlockSize, 0, dispatch, offset+3*sizeof(unsigned int));
-}
-
 void MetalSort::sort(ArrayInterface& data) {
     if (data.getSize() != dataLength || data.getElementSize() != trait->getDataSize())
         throw OpenMMException("MetalSort called with different data size");
