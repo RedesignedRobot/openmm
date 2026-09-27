@@ -68,6 +68,7 @@ using namespace std;
 
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
+const int MetalContext::SpreadBlockSize = 128;
 
 /**
  * Rewrite one kernel parameter.  A value parameter becomes a constant reference, or, when members is
@@ -267,6 +268,13 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_METAL"] = "1";
+
+    // PME spreading with float atomics sums spans of up to 16 consecutive atoms in a threadgroup slab
+    // per SIMD group and issues one device atomic per grid point a span touches (pme.cc).  1024
+    // points hold 50% of the 16-atom spans on apoa1pme and 95% of the 8-atom halves.
+    compilationDefines["SPREAD_SPAN"] = "16";
+    compilationDefines["SPREAD_SLAB"] = "1024";
+    compilationDefines["SPREAD_GROUPS"] = intToString(SpreadBlockSize/32);
     if (simdWidth == 32)
         compilationDefines["AMD_RDNA"] = "1";
     if (useDoublePrecision) {

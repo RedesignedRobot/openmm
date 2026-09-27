@@ -49,7 +49,7 @@ using namespace std;
 
 static void getMetalPmeParameters(MetalContext& cu, bool& usePmeQueue, bool& useFixedPointChargeSpreading) {
     usePmeQueue = (!cu.getPlatformData().disablePmeStream && !cu.getPlatformData().useCpuPme);
-    useFixedPointChargeSpreading = cu.getUseDoublePrecision() || !cu.getSupportsHardwareFloatGlobalAtomicAdd() || cu.getPlatformData().deterministicForces;
+    useFixedPointChargeSpreading = cu.getUseFixedPointChargeSpreading();
 }
 
 // Sets the queue's dispatch type for a scope and restores serial dispatch on the way out, even when an

@@ -52,6 +52,10 @@ void MetalKernel::execute(int threads, int blockSize) {
         else
             argPointers[i] = &primitiveArgs[i];
     }
+    // The float charge spread keeps one slab per SIMD group, and a 64 thread launch leaves too few
+    // SIMD groups in flight to hide the slab latency.
+    if (blockSize == -1 && name == "gridSpreadCharge" && !context.getUseFixedPointChargeSpreading())
+        blockSize = MetalContext::SpreadBlockSize;
     context.executeKernel(kernel, argPointers.data(), threads, blockSize);
 }
 

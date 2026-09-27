@@ -80,6 +80,7 @@ public:
     class ForcePostComputation;
     static const int ThreadBlockSize;
     static const int TileSize;
+    static const int SpreadBlockSize;
     MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const std::string& precision,
             const std::string& tempDir, MetalPlatform::PlatformData& platformData, MetalContext* originalContext);
     ~MetalContext();
@@ -354,6 +355,13 @@ public:
      */
     bool getSupportsHardwareFloatGlobalAtomicAdd() const {
         return supportsHardwareFloatGlobalAtomicAdd;
+    }
+    /**
+     * Get whether PME spreads charge with 64 bit fixed point atomics.  Otherwise it spreads with
+     * float atomics through per-SIMD-group slabs (pme.cc), launched with SpreadBlockSize threads.
+     */
+    bool getUseFixedPointChargeSpreading() {
+        return useDoublePrecision || !supportsHardwareFloatGlobalAtomicAdd || platformData.deterministicForces;
     }
     /**
      * Get whether the device being used supports double precision math.
