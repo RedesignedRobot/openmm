@@ -164,7 +164,7 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
 }
 
 bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
-    return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision() && !context.getUseMixedPrecision();
+    return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision();
 }
 
 void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity) {

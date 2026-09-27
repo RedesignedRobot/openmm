@@ -72,7 +72,7 @@ public:
     bool integrateLangevinMiddle(ComputeArray& params, double tol);
     /**
      * Get whether integrateLangevinMiddle() can remove center of mass motion for a CMMotionRemover.  That holds in
-     * single precision when the fused kernel runs.
+     * single and mixed precision when the fused kernel runs.
      */
     bool canRemoveCenterOfMassMomentum() const;
     /**

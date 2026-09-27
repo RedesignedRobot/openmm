@@ -135,8 +135,8 @@ private:
 };
 
 /**
- * This kernel is invoked by CMMotionRemover to remove center of mass motion.  In single precision with the fused
- * LangevinMiddle kernel it only schedules the work: calcCenterOfMassVelocity runs alongside the force kernels, and
+ * This kernel is invoked by CMMotionRemover to remove center of mass motion.  In single and mixed precision with the
+ * fused LangevinMiddle kernel it only schedules the work: calcCenterOfMassVelocity runs alongside the force kernels, and
  * the fused kernel subtracts the center of mass velocity as it loads the velocities, which takes both removal kernels
  * off the step's chain of dependent dispatches.  That is safe only when nothing reads or writes the velocities between
  * this force and the integration, so every later force in the System must be one known not to touch them.
