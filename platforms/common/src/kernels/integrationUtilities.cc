@@ -138,6 +138,106 @@ inline DEVICE void storeShakeCluster(int4 atoms, GLOBAL mixed4* RESTRICT values,
         values[atoms.w] = value[3];
 }
 
+#ifdef EMULATED_MIXED_PRECISION
+/**
+ * Enforce constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the step, and
+ * delta their displacements, which this updates.
+ *
+ * The sweeps change the displacements by real corrections.  A bond's residual is the one measured in mixed precision
+ * when the corrections were last zero, less the change the corrections make since then, which real precision
+ * resolves to about 2^-18 of the measured residual.  When every residual in a sweep is within the tolerance or that
+ * resolution, the corrections move into the displacements and the next sweep measures again.  The cluster has
+ * converged when a sweep that starts from measured residuals finds them all within the tolerance, the same test as a
+ * sweep in mixed precision.
+ */
+DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta) {
+    mixed4 pos = clusterPos[0];
+    mixed4 xpi = delta[0];
+    mixed4 xpj[3] = {delta[1], delta[2], delta[3]};
+    float invMassCentral = params.x;
+    float avgMass = params.y;
+    float d2 = params.z;
+    float invMassPeripheral = params.w;
+    int numBonds = (atoms.w != -1 ? 3 : (atoms.z != -1 ? 2 : 1));
+    real maxResidual = d2*(real) tol;
+
+    // Precompute quantities.
+
+    mixed3 rij[3];
+    mixed ld[3];
+    real3 r[3];
+    real rijsq[3];
+    for (int k = 0; k < 3; k++) {
+        mixed4 posj = clusterPos[k+1];
+        rij[k] = make_mixed3(pos.x-posj.x, pos.y-posj.y, pos.z-posj.z);
+        mixed sq = rij[k].x*rij[k].x + rij[k].y*rij[k].y + rij[k].z*rij[k].z;
+        ld[k] = d2-sq;
+        r[k] = make_real3((real) rij[k].x, (real) rij[k].y, (real) rij[k].z);
+        rijsq[k] = (real) sq;
+    }
+
+    // Iterate until convergence.
+
+    real3 dxi = make_real3(0);
+    real3 dxj[3] = {make_real3(0), make_real3(0), make_real3(0)};
+    real residual0[3], rrpr0[3];
+    real3 twoRp0[3];
+    real resolution = 0;
+    bool measure = true, converged = false;
+    for (int iteration = 0; iteration < 15 && !converged; iteration++) {
+        real largest = 0;
+        if (measure) {
+            xpi.x += dxi.x;
+            xpi.y += dxi.y;
+            xpi.z += dxi.z;
+            dxi = make_real3(0);
+            for (int k = 0; k < 3; k++) {
+                xpj[k].x += dxj[k].x;
+                xpj[k].y += dxj[k].y;
+                xpj[k].z += dxj[k].z;
+                dxj[k] = make_real3(0);
+                mixed3 rpij = make_mixed3(xpi.x-xpj[k].x, xpi.y-xpj[k].y, xpi.z-xpj[k].z);
+                mixed rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
+                mixed rrpr = rij[k].x*rpij.x + rij[k].y*rpij.y + rij[k].z*rpij.z;
+                residual0[k] = (real) (ld[k]-2.0f*rrpr-rpsqij);
+                rrpr0[k] = (real) rrpr;
+                twoRp0[k] = 2.0f*(r[k]+make_real3((real) rpij.x, (real) rpij.y, (real) rpij.z));
+                if (k < numBonds)
+                    largest = max(largest, fabs(residual0[k]));
+            }
+        }
+        real threshold = (measure ? maxResidual : max(maxResidual, resolution));
+        bool small = true;
+        for (int k = 0; k < 3; k++) {
+            if (k >= numBonds)
+                continue;
+            real3 c = dxi-dxj[k];
+            real residual = residual0[k]-dot(twoRp0[k]+c, c);
+            if (fabs(residual) >= threshold) {
+                real acor = residual*avgMass / (rrpr0[k]+dot(r[k], c)+rijsq[k]);
+                real3 dr = r[k]*acor;
+                dxi += dr*invMassCentral;
+                dxj[k] -= dr*invMassPeripheral;
+                small = false;
+            }
+        }
+        converged = (measure && small);
+        if (measure)
+            resolution = largest*0x1p-18f;
+        measure = small;
+    }
+    xpi.x += dxi.x;
+    xpi.y += dxi.y;
+    xpi.z += dxi.z;
+    delta[0] = xpi;
+    for (int k = 0; k < 3; k++) {
+        xpj[k].x += dxj[k].x;
+        xpj[k].y += dxj[k].y;
+        xpj[k].z += dxj[k].z;
+        delta[k+1] = xpj[k];
+    }
+}
+#else
 /**
  * Enforce constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the step, and
  * delta their displacements, which this updates.
@@ -161,12 +261,6 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
     mixed ld1 = d2-rij1sq;
     mixed ld2 = d2-rij2sq;
     mixed ld3 = d2-rij3sq;
-#ifdef EMULATED_MIXED_PRECISION
-    real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
-    real3 r2 = make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z);
-    real3 r3 = make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z);
-    real maxResidual = d2*(real) tol;
-#endif
 
     // Iterate until convergence.
 
@@ -177,17 +271,10 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
         mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
         mixed rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
         mixed rrpr = rij1.x*rpij.x + rij1.y*rpij.y + rij1.z*rpij.z;
-#ifdef EMULATED_MIXED_PRECISION
-        real residual = (real) (ld1-2.0f*rrpr-rpsqij);
-        if (fabs(residual) >= maxResidual) {
-            real acor = residual*avgMass / ((real) rrpr+(real) rij1sq);
-            real3 dr = r1*acor;
-#else
         mixed diff = fabs(ld1-2.0f*rrpr-rpsqij) / (d2*tol);
         if (diff >= 1.0f) {
             mixed acor  = (ld1-2.0f*rrpr-rpsqij)*avgMass / (rrpr+rij1sq);
             mixed3 dr = rij1*acor;
-#endif
             xpi.x += dr.x*invMassCentral;
             xpi.y += dr.y*invMassCentral;
             xpi.z += dr.z*invMassCentral;
@@ -200,17 +287,10 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
             rpij = make_mixed3(xpi.x-xpj2.x, xpi.y-xpj2.y, xpi.z-xpj2.z);
             rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
             rrpr = rij2.x*rpij.x + rij2.y*rpij.y + rij2.z*rpij.z;
-#ifdef EMULATED_MIXED_PRECISION
-            residual = (real) (ld2-2.0f*rrpr-rpsqij);
-            if (fabs(residual) >= maxResidual) {
-                real acor = residual*avgMass / ((real) rrpr+(real) rij2sq);
-                real3 dr = r2*acor;
-#else
             diff = fabs(ld2-2.0f*rrpr-rpsqij) / (d2*tol);
             if (diff >= 1.0f) {
                 mixed acor  = (ld2 - 2.0f*rrpr - rpsqij)*avgMass / (rrpr + rij2sq);
                 mixed3 dr = rij2*acor;
-#endif
                 xpi.x += dr.x*invMassCentral;
                 xpi.y += dr.y*invMassCentral;
                 xpi.z += dr.z*invMassCentral;
@@ -224,17 +304,10 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
             rpij = make_mixed3(xpi.x-xpj3.x, xpi.y-xpj3.y, xpi.z-xpj3.z);
             rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
             rrpr = rij3.x*rpij.x + rij3.y*rpij.y + rij3.z*rpij.z;
-#ifdef EMULATED_MIXED_PRECISION
-            residual = (real) (ld3-2.0f*rrpr-rpsqij);
-            if (fabs(residual) >= maxResidual) {
-                real acor = residual*avgMass / ((real) rrpr+(real) rij3sq);
-                real3 dr = r3*acor;
-#else
             diff = fabs(ld3 - 2.0f*rrpr - rpsqij) / (d2*tol);
             if (diff >= 1.0f) {
                 mixed acor  = (ld3-2.0f*rrpr-rpsqij)*avgMass / (rrpr+rij3sq);
                 mixed3 dr = rij3*acor;
-#endif
                 xpi.x += dr.x*invMassCentral;
                 xpi.y += dr.y*invMassCentral;
                 xpi.z += dr.z*invMassCentral;
@@ -251,6 +324,7 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
     delta[2] = xpj2;
     delta[3] = xpj3;
 }
+#endif
 
 /**
  * Enforce constraints on SHAKE clusters
@@ -275,6 +349,91 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
     }
 }
 
+#ifdef EMULATED_MIXED_PRECISION
+/**
+ * Enforce velocity constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the
+ * step, and vel their velocities, which this updates.
+ *
+ * As in applyShakeToCluster, the sweeps change the velocities by real corrections, and the relative velocity along a
+ * bond is the one measured in mixed precision when the corrections were last zero plus the change they make since
+ * then.  The cluster has converged when a sweep that starts from measured velocities finds every multiplier within
+ * the tolerance.
+ */
+DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* vel) {
+    mixed4 pos = clusterPos[0];
+    mixed4 xpi = vel[0];
+    mixed4 xpj[3] = {vel[1], vel[2], vel[3]};
+    float invMassCentral = params.x;
+    float avgMass = params.y;
+    float invMassPeripheral = params.w;
+    int numBonds = (atoms.w != -1 ? 3 : (atoms.z != -1 ? 2 : 1));
+
+    // Precompute quantities.
+
+    mixed3 rij[3];
+    real3 r[3];
+    real rijsq[3];
+    for (int k = 0; k < 3; k++) {
+        mixed4 posj = clusterPos[k+1];
+        rij[k] = make_mixed3(pos.x-posj.x, pos.y-posj.y, pos.z-posj.z);
+        r[k] = make_real3((real) rij[k].x, (real) rij[k].y, (real) rij[k].z);
+        rijsq[k] = r[k].x*r[k].x + r[k].y*r[k].y + r[k].z*r[k].z;
+    }
+
+    // Iterate until convergence.
+
+    real3 dvi = make_real3(0);
+    real3 dvj[3] = {make_real3(0), make_real3(0), make_real3(0)};
+    real rrpr0[3];
+    real resolution = 0;
+    bool measure = true, converged = false;
+    for (int iteration = 0; iteration < 15 && !converged; iteration++) {
+        real largest = 0;
+        if (measure) {
+            xpi.x += dvi.x;
+            xpi.y += dvi.y;
+            xpi.z += dvi.z;
+            dvi = make_real3(0);
+            for (int k = 0; k < 3; k++) {
+                xpj[k].x += dvj[k].x;
+                xpj[k].y += dvj[k].y;
+                xpj[k].z += dvj[k].z;
+                dvj[k] = make_real3(0);
+                mixed3 rpij = make_mixed3(xpi.x-xpj[k].x, xpi.y-xpj[k].y, xpi.z-xpj[k].z);
+                rrpr0[k] = (real) (rpij.x*rij[k].x + rpij.y*rij[k].y + rpij.z*rij[k].z);
+                if (k < numBonds)
+                    largest = max(largest, fabs(2.0f*avgMass*rrpr0[k]/rijsq[k]));
+            }
+        }
+        real threshold = (measure ? (real) tol : max((real) tol, resolution));
+        bool small = true;
+        for (int k = 0; k < 3; k++) {
+            if (k >= numBonds)
+                continue;
+            real delta = -2.0f*avgMass*(rrpr0[k]+dot(dvi-dvj[k], r[k]))/rijsq[k];
+            real3 dr = r[k]*delta;
+            dvi += dr*invMassCentral;
+            dvj[k] -= dr*invMassPeripheral;
+            if (fabs(delta) > threshold)
+                small = false;
+        }
+        converged = (measure && small);
+        if (measure)
+            resolution = largest*0x1p-18f;
+        measure = small;
+    }
+    xpi.x += dvi.x;
+    xpi.y += dvi.y;
+    xpi.z += dvi.z;
+    vel[0] = xpi;
+    for (int k = 0; k < 3; k++) {
+        xpj[k].x += dvj[k].x;
+        xpj[k].y += dvj[k].y;
+        xpj[k].z += dvj[k].z;
+        vel[k+1] = xpj[k];
+    }
+}
+#else
 /**
  * Enforce velocity constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the
  * step, and vel their velocities, which this updates.
@@ -291,18 +450,9 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
     mixed3 rij1 = make_mixed3(pos.x-pos1.x, pos.y-pos1.y, pos.z-pos1.z);
     mixed3 rij2 = make_mixed3(pos.x-pos2.x, pos.y-pos2.y, pos.z-pos2.z);
     mixed3 rij3 = make_mixed3(pos.x-pos3.x, pos.y-pos3.y, pos.z-pos3.z);
-#ifdef EMULATED_MIXED_PRECISION
-    real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
-    real3 r2 = make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z);
-    real3 r3 = make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z);
-    real rij1sq = r1.x*r1.x + r1.y*r1.y + r1.z*r1.z;
-    real rij2sq = r2.x*r2.x + r2.y*r2.y + r2.z*r2.z;
-    real rij3sq = r3.x*r3.x + r3.y*r3.y + r3.z*r3.z;
-#else
     mixed rij1sq = rij1.x*rij1.x + rij1.y*rij1.y + rij1.z*rij1.z;
     mixed rij2sq = rij2.x*rij2.x + rij2.y*rij2.y + rij2.z*rij2.z;
     mixed rij3sq = rij3.x*rij3.x + rij3.y*rij3.y + rij3.z*rij3.z;
-#endif
 
     // Iterate until convergence.
 
@@ -312,13 +462,8 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
         converged = true;
         mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
         mixed rrpr = rpij.x*rij1.x + rpij.y*rij1.y + rpij.z*rij1.z;
-#ifdef EMULATED_MIXED_PRECISION
-        real delta = -2.0f*avgMass*(real) rrpr/rij1sq;
-        real3 dr = r1*delta;
-#else
         mixed delta = -2.0f*avgMass*rrpr/rij1sq;
         mixed3 dr = rij1*delta;
-#endif
         xpi.x += dr.x*invMassCentral;
         xpi.y += dr.y*invMassCentral;
         xpi.z += dr.z*invMassCentral;
@@ -330,13 +475,8 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
         if (atoms.z != -1) {
             rpij = make_mixed3(xpi.x-xpj2.x, xpi.y-xpj2.y, xpi.z-xpj2.z);
             rrpr = rpij.x*rij2.x + rpij.y*rij2.y + rpij.z*rij2.z;
-#ifdef EMULATED_MIXED_PRECISION
-            delta = -2.0f*avgMass*(real) rrpr/rij2sq;
-            dr = r2*delta;
-#else
             delta = -2.0f*avgMass*rrpr/rij2sq;
             dr = rij2*delta;
-#endif
             xpi.x += dr.x*invMassCentral;
             xpi.y += dr.y*invMassCentral;
             xpi.z += dr.z*invMassCentral;
@@ -349,13 +489,8 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
         if (atoms.w != -1) {
             rpij = make_mixed3(xpi.x-xpj3.x, xpi.y-xpj3.y, xpi.z-xpj3.z);
             rrpr = rpij.x*rij3.x + rpij.y*rij3.y + rpij.z*rij3.z;
-#ifdef EMULATED_MIXED_PRECISION
-            delta = -2.0f*avgMass*(real) rrpr/rij3sq;
-            dr = r3*delta;
-#else
             delta = -2.0f*avgMass*rrpr/rij3sq;
             dr = rij3*delta;
-#endif
             xpi.x += dr.x*invMassCentral;
             xpi.y += dr.y*invMassCentral;
             xpi.z += dr.z*invMassCentral;
@@ -372,6 +507,7 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
     vel[2] = xpj2;
     vel[3] = xpj3;
 }
+#endif
 
 /**
  * Enforce velocity constraints on SHAKE clusters
