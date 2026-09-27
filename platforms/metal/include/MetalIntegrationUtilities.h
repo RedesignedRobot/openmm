@@ -76,19 +76,19 @@ public:
      */
     bool canRemoveCenterOfMassMomentum() const;
     /**
-     * Remove center of mass motion as part of the next step.  calcCenterOfMassMomentum runs in the force computation's
-     * concurrent pass (see calcPendingCenterOfMassMomentum()), and the next integrateLangevinMiddle() subtracts the
-     * center of mass velocity from every atom as it loads it, in place of the removeCenterOfMassMomentum kernel.
+     * Remove center of mass motion as part of the next step.  calcKernel runs in the force computation's concurrent
+     * pass (see calcPendingCenterOfMassMomentum()) and writes the center of mass velocity to cmVelocity[0].  The next
+     * integrateLangevinMiddle() subtracts it from every atom as it loads it, in place of the
+     * removeCenterOfMassMomentum kernel.
      *
-     * @param calcKernel   the calcCenterOfMassMomentum kernel, with its arguments set
-     * @param cmMomentum   the array calcKernel writes one partial momentum per thread group to
-     * @param numGroups    the number of partial momenta, the thread groups calcKernel runs with
+     * @param calcKernel   the calcCenterOfMassVelocity kernel, with its arguments set
+     * @param blockSize    the size of calcKernel's single thread group
+     * @param cmVelocity   the array calcKernel writes to
      */
-    void removeCenterOfMassMomentum(ComputeKernel& calcKernel, ComputeArray& cmMomentum, int numGroups);
+    void removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity);
     /**
-     * Run the calcCenterOfMassMomentum kernel that removeCenterOfMassMomentum() left pending, if there is one.  It
-     * reads the velocities and writes only its own partial momenta, so it can share a concurrent pass with the force
-     * kernels.
+     * Run the calcCenterOfMassVelocity kernel that removeCenterOfMassMomentum() left pending, if there is one.  It
+     * reads the velocities and writes only its own output, so it can share a concurrent pass with the force kernels.
      */
     void calcPendingCenterOfMassMomentum();
 private:
@@ -99,10 +99,9 @@ private:
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
     int numLangevinMiddleUnits;
-    double totalMass;
     ComputeKernel pendingCMCalc;
-    ComputeArray* pendingCMMomentum;
-    int pendingCMGroups;
+    int pendingCMBlockSize;
+    ComputeArray* pendingCMVelocity;
 };
 
 } // namespace OpenMM

@@ -33,9 +33,7 @@ using namespace OpenMM;
 using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
-        ccmaConvergedMemory(NULL), totalMass(0.0), pendingCMMomentum(NULL), pendingCMGroups(0) {
-        for (int i = 0; i < system.getNumParticles(); i++)
-            totalMass += system.getParticleMass(i);
+        ccmaConvergedMemory(NULL), pendingCMBlockSize(0), pendingCMVelocity(NULL) {
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -169,16 +167,16 @@ bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
     return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision() && !context.getUseMixedPrecision();
 }
 
-void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, ComputeArray& cmMomentum, int numGroups) {
+void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity) {
     pendingCMCalc = calcKernel;
-    pendingCMMomentum = &cmMomentum;
-    pendingCMGroups = numGroups;
+    pendingCMBlockSize = blockSize;
+    pendingCMVelocity = &cmVelocity;
 }
 
 void MetalIntegrationUtilities::calcPendingCenterOfMassMomentum() {
     if (!pendingCMCalc)
         return;
-    pendingCMCalc->execute(context.getNumAtoms(), 64);
+    pendingCMCalc->execute(pendingCMBlockSize, pendingCMBlockSize);
     pendingCMCalc.reset();
 }
 
@@ -216,9 +214,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
             freeAtoms.initialize<int>(context, unconstrained.size(), "freeAtoms");
             freeAtoms.upload(unconstrained);
         }
-        map<string, string> fusedDefines = defines;
-        fusedDefines["INVERSE_TOTAL_MASS"] = context.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
-        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
+        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, defines);
         numLangevinMiddleUnits = numSettle+numShake+unconstrained.size();
         langevinMiddleKernel = program->createKernel("integrateLangevinMiddleFused");
         langevinMiddleKernel->addArg(numSettle);
@@ -253,11 +249,10 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
     calcPendingCenterOfMassMomentum();
-    langevinMiddleKernel->setArg(18, pendingCMGroups);
-    if (pendingCMMomentum != NULL)
-        langevinMiddleKernel->setArg(19, *pendingCMMomentum);
+    langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
+    if (pendingCMVelocity != NULL)
+        langevinMiddleKernel->setArg(19, *pendingCMVelocity);
     langevinMiddleKernel->execute(numLangevinMiddleUnits);
-    pendingCMMomentum = NULL;
-    pendingCMGroups = 0;
+    pendingCMVelocity = NULL;
     return true;
 }
