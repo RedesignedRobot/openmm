@@ -333,7 +333,8 @@ private:
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
     MetalArray displacementFlags, rebuildDispatch;
-    bool useIndirectRebuild;
+    MetalArray binRanks, binCounts, binOffsets;
+    bool useIndirectRebuild, sortBlocksByBins;
     ComputeSort blockSorter;
     std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
@@ -366,6 +367,7 @@ public:
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
     metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
+    metalFunction_t countBlockBinsKernel, sumBlockBinsKernel, scatterBlocksKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;
