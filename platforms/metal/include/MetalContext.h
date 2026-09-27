@@ -305,7 +305,8 @@ public:
      * @param blockSize    the size of each thread block to use
      * @param sharedSize   the amount of dynamic shared memory to allocated for the kernel, in bytes
      */
-    void executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize = -1, unsigned int sharedSize = 0);
+    void executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize = -1, unsigned int sharedSize = 0,
+            MTL::Buffer* indirect = NULL, size_t indirectOffset = 0);
     /**
      * Compute the largest thread block size that can be used for a kernel that requires a particular amount of
      * shared memory per thread.

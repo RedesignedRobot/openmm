@@ -33,10 +33,18 @@ using namespace std;
 // ahead of the GPU.
 static const int MaxBuffersInFlight = 8;
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0) {
+MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false) {
 }
 
 MetalQueue::~MetalQueue() {
+    if (committer.joinable()) {
+        {
+            lock_guard<recursive_mutex> guard(lock);
+            stopCommitter = true;
+        }
+        bufferOpened.notify_one();
+        committer.join();
+    }
     endEncoding();
     if (openBuffer != NULL)
         openBuffer->release();
@@ -61,6 +69,8 @@ MTL::CommandBuffer* MetalQueue::getCommandBuffer() {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         openBuffer = stream->commandBuffer()->retain();
         pool->release();
+        if (committer.joinable())
+            bufferOpened.notify_one();
     }
     return openBuffer;
 }
@@ -83,13 +93,7 @@ void MetalQueue::endEncoding() {
 
 void MetalQueue::commit() {
     lock_guard<recursive_mutex> guard(lock);
-    if (openBuffer != NULL) {
-        endEncoding();
-        openBuffer->commit();
-        pending.push_back(openBuffer);
-        openBuffer = NULL;
-        commitCount++;
-    }
+    submit();
     if ((int) pending.size() > MaxBuffersInFlight)
         pending.front()->waitUntilCompleted();
     while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
@@ -101,10 +105,58 @@ void MetalQueue::commit() {
     }
 }
 
+void MetalQueue::submit() {
+    if (openBuffer != NULL) {
+        endEncoding();
+        openBuffer->commit();
+        pending.push_back(openBuffer);
+        openBuffer = NULL;
+        commitCount++;
+    }
+}
+
 void MetalQueue::finish() {
     lock_guard<recursive_mutex> guard(lock);
     commit();
     for (MTL::CommandBuffer* buffer : pending)
         buffer->waitUntilCompleted();
     commit();
+}
+
+bool MetalQueue::isIdle() {
+    lock_guard<recursive_mutex> guard(lock);
+    return pending.empty() || pending.back()->status() >= MTL::CommandBufferStatusCompleted;
+}
+
+bool MetalQueue::isDrained() {
+    lock_guard<recursive_mutex> guard(lock);
+    return openBuffer == NULL && isIdle();
+}
+
+void MetalQueue::commitWhenIdle() {
+    lock_guard<recursive_mutex> guard(lock);
+    if (!committer.joinable())
+        committer = thread(&MetalQueue::runIdleCommits, this);
+}
+
+void MetalQueue::runIdleCommits() {
+    // Wait for the newest committed buffer without holding the lock, then commit the open buffer unless the
+    // host committed a newer one meanwhile.  Encoders are only used under the lock, so this never commits
+    // a kernel that is half encoded.  Errors are left for the host's next commit() to report.
+    unique_lock<recursive_mutex> guard(lock);
+    while (!stopCommitter) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        if (!pending.empty() && pending.back()->status() < MTL::CommandBufferStatusCompleted) {
+            MTL::CommandBuffer* newest = pending.back()->retain();
+            guard.unlock();
+            newest->waitUntilCompleted();
+            newest->release();
+            guard.lock();
+        }
+        else if (openBuffer != NULL)
+            submit();
+        else
+            bufferOpened.wait(guard);
+        pool->release();
+    }
 }

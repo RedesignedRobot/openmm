@@ -332,6 +332,8 @@ private:
     MetalArray largeBlockBoundingBox;
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
+    MetalArray displacementFlags, rebuildDispatch;
+    bool useIndirectRebuild;
     ComputeSort blockSorter;
     std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
@@ -349,7 +351,8 @@ private:
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
-    long long numTiles;
+    int uncommittedSteps;
+    long long numTiles, commitCountAfterLastStep;
     std::string kernelSource;
 };
 
@@ -362,7 +365,7 @@ public:
     bool hasForces;
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
-    metalFunction_t findBlockBoundsKernel;
+    metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;

@@ -745,7 +745,7 @@ void MetalContext::executeKernel(metalFunction_t kernel, void** arguments, int t
     executeKernelFlat(kernel, arguments, gridSize*blockSize, blockSize, sharedSize);
 }
 
-void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize, unsigned int sharedSize) {
+void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize, unsigned int sharedSize, MTL::Buffer* indirect, size_t indirectOffset) {
     if (blockSize == -1)
         blockSize = ThreadBlockSize;
     int gridSize = (threads+blockSize-1)/blockSize;
@@ -774,7 +774,10 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         encoder->setBytes(packed.data(), packed.size(), 0);
     }
     encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
-    encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
+    if (indirect != NULL)
+        encoder->dispatchThreadgroups(indirect, indirectOffset, MTL::Size(blockSize, 1, 1));
+    else
+        encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
 }
 
 int MetalContext::computeThreadBlockSize(double memory) const {

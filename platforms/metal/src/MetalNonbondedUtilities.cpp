@@ -28,6 +28,7 @@
 #include "MetalArray.h"
 #include "MetalContext.h"
 #include "MetalEvent.h"
+#include "MetalSort.h"
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
@@ -38,6 +39,10 @@
 using namespace OpenMM;
 using namespace std;
 
+// Steps without a host wait share a command buffer, up to this many.  Fewer buffers mean fewer boundaries
+// where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
+// it doesn't wait for MetalQueue's idle commit.
+static const int StepsPerCommandBuffer = 8;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -53,7 +58,12 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        uncommittedSteps(0), commitCountAfterLastStep(0) {
+    // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
+    // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
+    // this.  The block sort must fit the short-list kernel, which takes up to 1024 blocks.
+    useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && context.getNumAtomBlocks() <= 1024;
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
@@ -262,6 +272,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
         long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
+        if (!waitForCount)
+            context.getCurrentStream().commitWhenIdle();
         maxTiles = 20*numAtomBlocks;
         if (maxTiles > numTiles || !waitForCount)
             maxTiles = numTiles;
@@ -287,6 +299,10 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         largeBlockBoundingBox.initialize(context, numAtomBlocks*4, elementSize, "largeBlockBoundingBox");
         oldPositions.initialize(context, numAtoms, 4*elementSize, "oldPositions");
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
+        if (useIndirectRebuild) {
+            displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
+            rebuildDispatch.initialize<unsigned int>(context, 6, "rebuildDispatch");
+        }
         blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
         vector<unsigned int> count(2, 0);
         interactionCount.upload(count);
@@ -340,6 +356,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findBlockBoundsArgs.push_back(&blockBoundingBox.getDevicePointer());
         findBlockBoundsArgs.push_back(&rebuildNeighborList.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockSizeRange.getDevicePointer());
+        if (useIndirectRebuild) {
+            findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
+            findBlockBoundsArgs.push_back(&displacementFlags.getDevicePointer());
+            findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
+        }
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
         computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
         computeSortKeysArgs.push_back(&blockSizeRange.getDevicePointer());
@@ -425,15 +446,32 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // Compute the neighbor list.
 
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
-    context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
-    blockSorter->sort(sortedBlocks);
-    context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
-    context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
+    if (useIndirectRebuild) {
+        void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
+                &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
+                &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
+        int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
+        context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
+        MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
+        context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64, 0, dispatch, 0);
+        context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch,
+                findInteractingBlocksThreadBlockSize, 0, dispatch, 3*sizeof(unsigned int));
+    }
+    else {
+        context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
+        blockSorter->sort(sortedBlocks);
+        context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
+        context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
+    }
     forceRebuildNeighborList = false;
-    context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
+    // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
+    // which is all a step without the wait needs.
+    bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+    if (wait || !useIndirectRebuild)
+        context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
-    if (waitForCount || context.getStepsSinceReorder() == 0)
+    if (wait)
         downloadCountEvent->signal();
 }
 
@@ -459,10 +497,19 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
-        context.getCurrentStream().commit();
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
-        // guides reordering, which needs the exact count right after a reorder.
-        if (waitForCount || context.getStepsSinceReorder() == 0)
+        // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
+        // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
+        MetalQueue& queue = context.getCurrentStream();
+        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        if (queue.getCommitCount() != commitCountAfterLastStep)
+            uncommittedSteps = 0;
+        if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
+            queue.commit();
+            uncommittedSteps = 0;
+        }
+        commitCountAfterLastStep = queue.getCommitCount();
+        if (wait)
             downloadCountEvent->poll();
         updateNeighborListSize();
     }
@@ -590,6 +637,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
+        if (useIndirectRebuild)
+            defines["INDIRECT_REBUILD"] = "1";
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
@@ -597,6 +646,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         metalModule_t interactingBlocksProgram = context.createModule(MetalKernelSources::vectorOps+MetalKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
+        if (useIndirectRebuild)
+            kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");

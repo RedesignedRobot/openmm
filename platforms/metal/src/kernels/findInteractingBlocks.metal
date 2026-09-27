@@ -40,7 +40,11 @@ private:
  */
 extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
-        real2* __restrict__ blockSizeRange) {
+        real2* __restrict__ blockSizeRange
+#ifdef INDIRECT_REBUILD
+        , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
+#endif
+        ) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
     const int index = warpSize == TILE_SIZE ? blockIdx.x : (blockIdx.x*(warpSize/TILE_SIZE) + threadIdx.x/TILE_SIZE);
     const int base = index * TILE_SIZE;
@@ -48,6 +52,17 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         return;
 
     real4 tPos = posq[base + indexInTile < numAtoms ? base + indexInTile : 0];
+#ifdef INDIRECT_REBUILD
+    bool moved = forceRebuild;
+    if (!forceRebuild && base+indexInTile < numAtoms) {
+        real4 displacement = oldPositions[base+indexInTile]-tPos;
+        moved = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
+    }
+    bool tileMoved = simd_any(moved);
+    if (indexInTile == 0)
+        displacementFlags[index] = tileMoved;
+#endif
+
 #ifdef USE_PERIODIC
     real4 pos;
     pos.x = SHFL(tPos.x, 0);
@@ -188,6 +203,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         blockSizeRange->y = 0;
     }
 
+#ifndef INDIRECT_REBUILD
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
 
     bool rebuild = forceRebuild;
@@ -202,6 +218,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         interactionCount[0] = 0;
         interactionCount[1] = 0;
     }
+#endif
 }
 
 #if MAX_BITS_FOR_PAIRS > 0
@@ -653,3 +670,73 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
     pinnedInteractionCount[0] = interactionCount[0];
     pinnedInteractionCount[1] = interactionCount[1];
 }
+
+#ifdef INDIRECT_REBUILD
+// A separate dispatch supplies the device-wide ordering between the per-tile
+// displacement test and the decision.  It runs as one threadgroup, so on rebuild
+// steps it also computes the sort keys and sorts them, with only threadgroup
+// barriers.  Keys are unique, so ranking them gives sortShortList2's order.
+// It also does copyInteractionCounts' work for steps where the host doesn't wait
+// for the count, so those steps skip that dispatch.
+extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
+        int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
+        unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
+        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
+        unsigned int* __restrict__ dispatch) {
+    __shared__ unsigned int keys[NUM_BLOCKS];
+    __shared__ bool anyMoved;
+    if (threadIdx.x == 0)
+        anyMoved = false;
+    __syncthreads();
+    bool moved = false;
+    for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
+        moved = moved || displacementFlags[i] != 0;
+    if (simd_any(moved))
+        anyMoved = true;
+    __syncthreads();
+    bool rebuild = anyMoved;
+    if (threadIdx.x == 0) {
+        pinnedInteractionCount[0] = interactionCount[0];
+        pinnedInteractionCount[1] = interactionCount[1];
+        rebuildNeighborList[0] = rebuild;
+        if (rebuild) {
+            interactionCount[0] = 0;
+            interactionCount[1] = 0;
+        }
+        else {
+            // Nothing reads this step's range.  sortBoxData resets it on rebuild steps.
+            blockSizeRange->x = 1e38;
+            blockSizeRange->y = 0;
+        }
+        dispatch[0] = rebuild ? (NUM_ATOMS+63)/64 : 0;
+        dispatch[3] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
+        for (int i = 0; i < 2; i++) {
+            dispatch[3*i+1] = 1;
+            dispatch[3*i+2] = 1;
+        }
+    }
+    if (!rebuild)
+        return;
+
+    // The same keys as computeSortKeys.
+
+    real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
+    int numSizeBins = 20;
+    real scale = numSizeBins/(sizeRange.y-sizeRange.x);
+    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
+        real4 box = blockBoundingBox[i];
+        real size = LOG(box.x+box.y+box.z);
+        int bin = (size-sizeRange.x)*scale;
+        bin = max(0, min(bin, numSizeBins-1));
+        keys[i] = (((unsigned int) bin)<<BIN_SHIFT) + i;
+    }
+    __syncthreads();
+    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
+        unsigned int key = keys[i];
+        unsigned int rank = 0;
+        for (unsigned int j = 0; j < NUM_BLOCKS; j++)
+            rank += (keys[j] < key);
+        sortedBlocks[rank] = key;
+    }
+}
+#endif
