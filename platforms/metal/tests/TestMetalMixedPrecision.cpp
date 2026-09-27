@@ -334,6 +334,88 @@ void testReorderWrapKeepsPositions() {
         ASSERT_EQUAL_VEC(positions[i], found[i], 1e-12);
 }
 
+void testUnsupportedIntegratorExpressions(const string& precision) {
+    // Mixed precision has no double-single tanh or non-integer pow, so a per-DOF expression that needs one must be
+    // refused when the Context is created, naming the operation and the expression.  Globals run on the host
+    // in double and may use them.
+
+    System system;
+    system.addParticle(1.0);
+    for (string expression : {"v+tanh(x)", "v+abs(x)^1.5"}) {
+        CustomIntegrator integrator(0.001);
+        integrator.addComputePerDof("v", expression);
+        bool threwException = false;
+        try {
+            Context context(system, integrator, platform);
+            context.setPositions({Vec3(0.1, 0.2, 0.3)});
+            integrator.step(1);
+        }
+        catch (const OpenMMException& ex) {
+            string message = ex.what();
+            ASSERT(message.find(expression.find("tanh") != string::npos ? "evaluate tanh" : "evaluate ^1.5") != string::npos);
+            ASSERT(message.find("'"+expression+"'") != string::npos);
+            threwException = true;
+        }
+        ASSERT_EQUAL(precision == "mixed", threwException);
+    }
+}
+
+void testSupportedIntegratorExpressions() {
+    // openmmtools-style integrators: BAOAB Langevin splitting, and a GHMC step that sums the kinetic energy, draws
+    // an acceptance in globals that use tanh, erf and a non-integer power, and uses integer powers per DOF.
+
+    System system;
+    CustomExternalForce* force = new CustomExternalForce("x^2+y^2+z^2");
+    system.addForce(force);
+    for (int i = 0; i < 4; i++) {
+        system.addParticle(1.0+i);
+        force->addParticle(i);
+    }
+    vector<Vec3> positions = {Vec3(0.1, 0.2, 0.3), Vec3(-0.3, 0.1, 0.2), Vec3(0.2, -0.1, 0.4), Vec3(0.5, 0.3, -0.2)};
+    CustomIntegrator baoab(0.002);
+    baoab.addGlobalVariable("a", exp(-0.002));
+    baoab.addGlobalVariable("b", sqrt(1-exp(-0.004)));
+    baoab.addGlobalVariable("kT", 2.49);
+    baoab.addPerDofVariable("x1", 0);
+    baoab.addUpdateContextState();
+    baoab.addComputePerDof("v", "v+0.5*dt*f/m");
+    baoab.addComputePerDof("x", "x+0.5*dt*v");
+    baoab.addComputePerDof("v", "a*v+b*sqrt(kT/m)*gaussian");
+    baoab.addComputePerDof("x", "x+0.5*dt*v");
+    baoab.addComputePerDof("x1", "x");
+    baoab.addConstrainPositions();
+    baoab.addComputePerDof("v", "v+0.5*dt*f/m+(x-x1)/dt");
+    CustomIntegrator ghmc(0.002);
+    ghmc.addGlobalVariable("kT", 2.49);
+    ghmc.addGlobalVariable("ke", 0);
+    ghmc.addGlobalVariable("Eold", 0);
+    ghmc.addGlobalVariable("Enew", 0);
+    ghmc.addGlobalVariable("accept", 0);
+    ghmc.addGlobalVariable("lambda", 0);
+    ghmc.addPerDofVariable("xold", 0);
+    ghmc.addComputeGlobal("lambda", "0.5*(1+tanh(2*uniform-1))*erf(0.7)^1.5");
+    ghmc.addComputePerDof("v", "sqrt(kT/m)*gaussian");
+    ghmc.addComputeSum("ke", "0.5*m*v*v");
+    ghmc.addComputeGlobal("Eold", "ke+energy");
+    ghmc.addComputePerDof("xold", "x");
+    ghmc.addComputePerDof("v", "v+0.5*dt*f/m");
+    ghmc.addComputePerDof("x", "x+dt*v*(1+lambda*min(abs(x), 1)^2*step(x)/(1+x^4))");
+    ghmc.addComputePerDof("v", "v+0.5*dt*f/m");
+    ghmc.addComputeSum("ke", "0.5*m*v^2");
+    ghmc.addComputeGlobal("Enew", "ke+energy");
+    ghmc.addComputeGlobal("accept", "step(exp(-(Enew-Eold)/kT)-uniform)");
+    ghmc.addComputePerDof("x", "select(accept, x, xold)");
+    for (CustomIntegrator* integrator : {&baoab, &ghmc}) {
+        Context context(system, *integrator, platform);
+        context.setPositions(positions);
+        integrator->step(10);
+        State state = context.getState(State::Positions | State::Energy);
+        ASSERT(std::isfinite(state.getPotentialEnergy()));
+        for (const Vec3& position : state.getPositions())
+            ASSERT(std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]));
+    }
+}
+
 int main(int argc, char* argv[]) {
     try {
         string precision = (argc > 1 ? argv[1] : "single");
@@ -341,12 +423,14 @@ int main(int argc, char* argv[]) {
         testMathFunctions(precision);
         testUnsupportedFunctions(precision);
         testDoublePrecisionRejected();
+        testUnsupportedIntegratorExpressions(precision);
         if (precision == "mixed") {
             testLongConversion();
             testIntegrationStep();
             testVariableStep();
             testExpressionConstants();
             testReorderWrapKeepsPositions();
+            testSupportedIntegratorExpressions();
         }
     }
     catch(const exception& e) {

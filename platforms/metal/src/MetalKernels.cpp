@@ -36,11 +36,18 @@
 #include "MetalNonbondedUtilities.h"
 #include "MetalKernelSources.h"
 #include "MetalQueue.h"
+#include "ReferenceTabulatedFunction.h"
 #include "SimTKOpenMMRealType.h"
 #include "SimTKOpenMMUtilities.h"
+#include "lepton/CustomFunction.h"
+#include "lepton/Operation.h"
+#include "lepton/Parser.h"
+#include "lepton/ParsedExpression.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <memory>
+#include <sstream>
 #include <set>
 #include <assert.h>
 
@@ -119,6 +126,83 @@ void MetalCalcConstantPotentialForceKernel::initialize(const System& system, con
     bool usePmeQueue, useFixedPointChargeSpreading;
     getMetalPmeParameters(cu, usePmeQueue, useFixedPointChargeSpreading);
     commonInitialize(system, force, false, useFixedPointChargeSpreading);
+}
+
+/**
+ * Find an operation in an expression that Metal mixed precision cannot evaluate per DOF, where every value is a
+ * double-single pair.  Integer powers are multiplied out, so only other exponents need pow().  Returns an empty
+ * string if there is none.
+ */
+static string findUnsupportedMixedOperation(const Lepton::ExpressionTreeNode& node) {
+    const Lepton::Operation& op = node.getOperation();
+    switch (op.getId()) {
+        case Lepton::Operation::TAN:
+        case Lepton::Operation::ASIN:
+        case Lepton::Operation::ACOS:
+        case Lepton::Operation::ATAN:
+        case Lepton::Operation::ATAN2:
+        case Lepton::Operation::SINH:
+        case Lepton::Operation::COSH:
+        case Lepton::Operation::TANH:
+        case Lepton::Operation::ERF:
+        case Lepton::Operation::ERFC:
+            return op.getName();
+        case Lepton::Operation::POWER:
+            return "^ with a variable exponent";
+        case Lepton::Operation::POWER_CONSTANT: {
+            double exponent = dynamic_cast<const Lepton::Operation::PowerConstant&>(op).getValue();
+            if (exponent != (int) exponent) {
+                stringstream name;
+                name << "^" << exponent;
+                return name.str();
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    for (auto& child : node.getChildren()) {
+        string found = findUnsupportedMixedOperation(child);
+        if (!found.empty())
+            return found;
+    }
+    return "";
+}
+
+static void checkMixedPrecisionExpression(const string& expression, const string& where, const map<string, Lepton::CustomFunction*>& functions) {
+    string operation = findUnsupportedMixedOperation(Lepton::Parser::parse(expression, functions).optimize().getRootNode());
+    if (!operation.empty())
+        throw OpenMMException("Metal mixed precision cannot evaluate "+operation+" in the CustomIntegrator "+where+" '"+expression+
+            "'.  In mixed precision, per-DOF expressions cannot use tan, asin, acos, atan, atan2, sinh, cosh, tanh, erf, erfc or a non-integer power."
+            "  Use Precision=single, or compute the value in a global expression.");
+}
+
+void MetalIntegrateCustomStepKernel::initialize(const System& system, const CustomIntegrator& integrator) {
+    if (cu.getUseMixedPrecision()) {
+        // Parse per-DOF expressions the way CustomIntegratorUtilities::analyzeComputations does.
+
+        vector<unique_ptr<Lepton::CustomFunction> > tables;
+        map<string, Lepton::CustomFunction*> functions;
+        for (int i = 0; i < integrator.getNumTabulatedFunctions(); i++) {
+            tables.emplace_back(createReferenceTabulatedFunction(integrator.getTabulatedFunction(i)));
+            functions[integrator.getTabulatedFunctionName(i)] = tables.back().get();
+        }
+        Lepton::PlaceholderFunction fn1(1), fn2(2), fn3(3);
+        for (string name : {"_x", "_y", "_z"})
+            functions[name] = &fn1;
+        for (string name : {"deriv", "dot", "cross"})
+            functions[name] = &fn2;
+        functions["vector"] = &fn3;
+        for (int step = 0; step < integrator.getNumComputations(); step++) {
+            CustomIntegrator::ComputationType type;
+            string variable, expression;
+            integrator.getComputationStep(step, type, variable, expression);
+            if (type == CustomIntegrator::ComputePerDof || type == CustomIntegrator::ComputeSum)
+                checkMixedPrecisionExpression(expression, "step "+cu.intToString(step)+" expression", functions);
+        }
+        checkMixedPrecisionExpression(integrator.getKineticEnergyExpression(), "kinetic energy expression", functions);
+    }
+    CommonIntegrateCustomStepKernel::initialize(system, integrator);
 }
 
 void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
