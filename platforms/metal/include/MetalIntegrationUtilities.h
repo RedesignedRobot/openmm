@@ -98,7 +98,7 @@ private:
     ComputeEvent ccmaEvent;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
-    int numLangevinMiddleUnits;
+    int numLangevinMiddleThreads;
     ComputeKernel pendingCMCalc;
     int pendingCMBlockSize;
     ComputeArray* pendingCMVelocity;
