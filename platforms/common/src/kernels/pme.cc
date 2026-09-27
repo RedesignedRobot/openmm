@@ -34,6 +34,168 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
         GLOBAL const real* RESTRICT charges
 #endif
         ) {
+#if defined(USE_METAL) && !defined(USE_FIXED_POINT_CHARGE_SPREADING)
+    // Metal with float atomics (Apple9).  Atoms arrive in a spatially coherent order, so a few
+    // consecutive atoms share most of their stencil points, and the device atomics, not the math,
+    // bound the one-atom-per-thread kernel below.  Each SIMD group computes the splines of 32
+    // atoms, one per lane, then sums spans of SPREAD_SPAN consecutive atoms into a private slab of
+    // threadgroup memory covering the span's stencil bounding box, and adds each nonzero slab point
+    // to the grid with one atomic.  Atom data stays in the owning lane's registers and is broadcast
+    // one atom at a time; lane l < 25 adds the atom's footprint column (dy, dz) = (l/5, l%5), so no
+    // two lanes write one slab address in an atom step and the slab needs no atomics.  A span whose
+    // box exceeds SPREAD_SLAB points halves down to 4 atoms, and a span that still doesn't fit
+    // spreads its atoms directly, one atom at a time with the same lane columns.
+
+    LOCAL real slabs[SPREAD_GROUPS][SPREAD_SLAB];
+    const int lane = LOCAL_ID%32;
+    const int group = LOCAL_ID/32;
+    const int groups = min((int) (LOCAL_SIZE/32), SPREAD_GROUPS);
+    if (group >= groups)
+        return;
+    LOCAL real* slab = slabs[group];
+    for (int v = lane; v < SPREAD_SLAB; v += 32)
+        slab[v] = 0;
+    const real scale = RECIP((real) (PME_ORDER-1));
+    const int dy = lane/PME_ORDER;
+    const int dz = lane-PME_ORDER*dy;
+    const int numBlocks = (NUM_ATOMS+31)/32;
+    for (int block = GROUP_ID*groups+group; block < numBlocks; block += NUM_GROUPS*groups) {
+        const int first = block*32;
+        const int count = min(32, NUM_ATOMS-first);
+        real3 data[PME_ORDER];
+        int3 gridIndex = make_int3(0, 0, 0);
+        if (lane < count) {
+            int atom = pmeAtomGridIndex[first+lane].x;
+            real4 pos = posq[atom];
+#ifdef CHARGE_FROM_SIGEPS
+            const float2 sigEps = sigmaEpsilon[atom];
+            const real charge = 8*sigEps.x*sigEps.x*sigEps.x*sigEps.y;
+#else
+            const real charge = (CHARGE)*EPSILON_FACTOR;
+#endif
+            APPLY_PERIODIC_TO_POS(pos)
+            real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
+                                 pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
+                                 pos.z*recipBoxVecZ.z);
+            t.x = (t.x-floor(t.x))*GRID_SIZE_X;
+            t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
+            t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
+            gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
+                                  ((int) t.y) % GRID_SIZE_Y,
+                                  ((int) t.z) % GRID_SIZE_Z);
+            real3 dr = make_real3(t.x-(int) t.x, t.y-(int) t.y, t.z-(int) t.z);
+            data[PME_ORDER-1] = make_real3(0);
+            data[1] = dr;
+            data[0] = make_real3(1)-dr;
+            for (int j = 3; j < PME_ORDER; j++) {
+                real div = RECIP((real) (j-1));
+                data[j-1] = div*dr*data[j-2];
+                for (int k = 1; k < (j-1); k++)
+                    data[j-k-1] = div*((dr+make_real3(k))*data[j-k-2] + (make_real3(j-k)-dr)*data[j-k-1]);
+                data[0] = div*(make_real3(1)-dr)*data[0];
+            }
+            data[PME_ORDER-1] = scale*dr*data[PME_ORDER-2];
+            for (int j = 1; j < (PME_ORDER-1); j++)
+                data[PME_ORDER-j-1] = scale*((dr+make_real3(j))*data[PME_ORDER-j-2] + (make_real3(PME_ORDER-j)-dr)*data[PME_ORDER-j-1]);
+            data[0] = scale*(make_real3(1)-dr)*data[0];
+            for (int k = 0; k < PME_ORDER; k++)
+                data[k].z *= charge;
+        }
+        int start = 0, span = SPREAD_SPAN;
+        while (start < count) {
+            const int end = min(count, start+span);
+            const bool inSpan = (lane >= start && lane < end);
+
+            // The span's bounding box, in grid points relative to its first atom, wrapped to the
+            // nearest periodic image.  lo <= 0, so the box origin is in [-GRID_SIZE/2, GRID_SIZE),
+            // and with every extent at most the grid size one wrap maps a slab point onto the grid.
+
+            const int3 origin = simd_broadcast(gridIndex, (ushort) start);
+            int3 d = gridIndex-origin;
+            d.x += (d.x > GRID_SIZE_X/2 ? -GRID_SIZE_X : (d.x < -GRID_SIZE_X/2 ? GRID_SIZE_X : 0));
+            d.y += (d.y > GRID_SIZE_Y/2 ? -GRID_SIZE_Y : (d.y < -GRID_SIZE_Y/2 ? GRID_SIZE_Y : 0));
+            d.z += (d.z > GRID_SIZE_Z/2 ? -GRID_SIZE_Z : (d.z < -GRID_SIZE_Z/2 ? GRID_SIZE_Z : 0));
+            const int3 lo = make_int3(simd_min(inSpan ? d.x : GRID_SIZE_X), simd_min(inSpan ? d.y : GRID_SIZE_Y), simd_min(inSpan ? d.z : GRID_SIZE_Z));
+            const int3 hi = make_int3(simd_max(inSpan ? d.x : -GRID_SIZE_X), simd_max(inSpan ? d.y : -GRID_SIZE_Y), simd_max(inSpan ? d.z : -GRID_SIZE_Z));
+            const int3 extent = hi-lo+make_int3(PME_ORDER);
+            const int volume = extent.x*extent.y*extent.z;
+            const bool fits = (volume <= SPREAD_SLAB && extent.x <= GRID_SIZE_X && extent.y <= GRID_SIZE_Y && extent.z <= GRID_SIZE_Z);
+            if (!fits && span > 4) {
+                span /= 2;
+                continue;
+            }
+            const int strideX = extent.y*extent.z;
+            const int3 corner = d-lo;
+            const int packed = corner.x*strideX+corner.y*extent.z+corner.z;
+            const int laneOffset = dy*extent.z+dz;
+            for (int a = start; a < end; a++) {
+                const ushort src = (ushort) a;
+                real wy = 0, wz = 0;
+                for (int k = 0; k < PME_ORDER; k++) {
+                    real y = simd_broadcast(data[k].y, src);
+                    real z = simd_broadcast(data[k].z, src);
+                    wy = (k == dy ? y : wy);
+                    wz = (k == dz ? z : wz);
+                }
+                const real w = wy*wz;
+                real wx[PME_ORDER];
+                for (int k = 0; k < PME_ORDER; k++)
+                    wx[k] = w*simd_broadcast(data[k].x, src);
+                if (!fits) {
+                    const int3 atomIndex = simd_broadcast(gridIndex, src);
+                    if (dy < PME_ORDER) {
+                        int y = atomIndex.y+dy;
+                        y -= (y >= GRID_SIZE_Y ? GRID_SIZE_Y : 0);
+                        int z = atomIndex.z+dz;
+                        z -= (z >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
+                        for (int k = 0; k < PME_ORDER; k++) {
+                            int x = atomIndex.x+k;
+                            x -= (x >= GRID_SIZE_X ? GRID_SIZE_X : 0);
+                            if (fabs(wx[k]) > 2.3e-10f)
+                                ATOMIC_ADD(&pmeGrid[(x*GRID_SIZE_Y+y)*GRID_SIZE_Z+z], wx[k]);
+                        }
+                    }
+                    continue;
+                }
+                const int index = simd_broadcast(packed, src)+laneOffset;
+                if (dy < PME_ORDER)
+                    for (int k = 0; k < PME_ORDER; k++)
+                        slab[index+k*strideX] += wx[k];
+                SYNC_WARPS;
+            }
+            start = end;
+            if (!fits)
+                continue;
+
+            // Add each nonzero point to the grid and leave the slab zeroed for the next span.
+            // Float reciprocals recover the coordinates exactly for volumes this small.
+
+            const int3 base = origin+lo;
+            const float invStrideX = 1.0f/strideX;
+            const float invExtentZ = 1.0f/extent.z;
+            for (int v = lane; v < volume; v += 32) {
+                real value = slab[v];
+                if (value == 0)
+                    continue;
+                slab[v] = 0;
+                if (fabs(value) <= 2.3e-10f)
+                    continue;
+                int x = (int) ((v+0.5f)*invStrideX);
+                int yz = v-x*strideX;
+                int y = (int) ((yz+0.5f)*invExtentZ);
+                int z = yz-y*extent.z;
+                x += base.x;
+                x += (x < 0 ? GRID_SIZE_X : (x >= GRID_SIZE_X ? -GRID_SIZE_X : 0));
+                y += base.y;
+                y += (y < 0 ? GRID_SIZE_Y : (y >= GRID_SIZE_Y ? -GRID_SIZE_Y : 0));
+                z += base.z;
+                z += (z < 0 ? GRID_SIZE_Z : (z >= GRID_SIZE_Z ? -GRID_SIZE_Z : 0));
+                ATOMIC_ADD(&pmeGrid[(x*GRID_SIZE_Y+y)*GRID_SIZE_Z+z], value);
+            }
+            SYNC_WARPS;
+        }
+    }
+#else
     // Process the atoms in spatially sorted order.  This improves efficiency when writing
     // the grid values.  PME_ORDER threads process one atom.
 
@@ -118,6 +280,7 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
             }
         }
     }
+#endif
 }
 
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
