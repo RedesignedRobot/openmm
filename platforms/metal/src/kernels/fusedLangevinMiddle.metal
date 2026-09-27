@@ -4,7 +4,7 @@
  * bath, the position constraints and the final velocity correction on its atoms in registers, so the displacements
  * never pass through device memory.  Each atom sees the same operations as in integrateLangevinMiddlePart1-3.
  *
- * In single precision, when removeCM is nonzero, it also does removeCenterOfMassMomentum's work: it subtracts the
+ * When removeCM is nonzero, it also does removeCenterOfMassMomentum's work: it subtracts the
  * center of mass velocity that calcCenterOfMassVelocity wrote to cmVelocity[0] from every atom as it loads it.  That
  * saves removeCenterOfMassMomentum's dispatch and its pass over velm.
  */
@@ -15,9 +15,7 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
         GLOBAL const float4* RESTRICT cmVelocity) {
-#ifndef USE_MIXED_PRECISION
     float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
-#endif
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
     mixed noisescale = paramBuffer[1];
@@ -49,7 +47,6 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
                 continue;
             pos[i] = loadPos(posq, posqCorrection, atom);
             mixed4 velocity = velm[atom];
-#ifndef USE_MIXED_PRECISION
             if (removeCM) {
                 velocity.x -= cm.x;
                 velocity.y -= cm.y;
@@ -57,7 +54,6 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
                 if (velocity.w == 0.0)
                     velm[atom] = velocity; // The loops below skip massless atoms, but removeCenterOfMassMomentum shifts them too.
             }
-#endif
             if (velocity.w != 0.0) {
                 velocity.x += fscale*velocity.w*force[atom];
                 velocity.y += fscale*velocity.w*force[atom+paddedNumAtoms];
