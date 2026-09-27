@@ -384,6 +384,11 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
     defines["FIND_NEIGHBORS_WORKGROUP_SIZE"] = cc.intToString(findNeighborsWorkgroupSize);
     ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonKernelSources::pointFunctions+CommonKernelSources::customManyParticle, replacements), defines);
     forceKernel = program->createKernel("computeInteraction");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyKernel = cc.compileProgram(cc.replaceStrings(CommonKernelSources::pointFunctions+CommonKernelSources::customManyParticle, replacements), forceDefines)->createKernel("computeInteraction");
+    }
     blockBoundsKernel = program->createKernel("findBlockBounds");
     neighborsKernel = program->createKernel("findNeighbors");
     startIndicesKernel = program->createKernel("computeNeighborStartIndices");
@@ -398,31 +403,35 @@ double CommonCalcCustomManyParticleForceKernel::execute(ContextImpl& context, bo
 
         // Set arguments for the force kernel.
 
-        forceKernel->addArg(cc.getLongForceBuffer());
-        forceKernel->addArg(cc.getEnergyBuffer());
-        forceKernel->addArg(cc.getPosq());
-        for (int i = 0; i < 5; i++)
-            forceKernel->addArg();
-        setPeriodicBoxArgs(cc, forceKernel, 3);
-        if (nonbondedMethod != NoCutoff) {
-            forceKernel->addArg(neighbors);
-            forceKernel->addArg(neighborStartIndex);
+        for (ComputeKernel forceKernel : {this->forceKernel, forceOnlyKernel}) {
+            if (!forceKernel)
+                continue;
+            forceKernel->addArg(cc.getLongForceBuffer());
+            forceKernel->addArg(cc.getEnergyBuffer());
+            forceKernel->addArg(cc.getPosq());
+            for (int i = 0; i < 5; i++)
+                forceKernel->addArg();
+            setPeriodicBoxArgs(cc, forceKernel, 3);
+            if (nonbondedMethod != NoCutoff) {
+                forceKernel->addArg(neighbors);
+                forceKernel->addArg(neighborStartIndex);
+            }
+            if (particleTypes.isInitialized()) {
+                forceKernel->addArg(particleTypes);
+                forceKernel->addArg(orderIndex);
+                forceKernel->addArg(particleOrder);
+            }
+            if (exclusions.isInitialized()) {
+                forceKernel->addArg(exclusions);
+                forceKernel->addArg(exclusionStartIndex);
+            }
+            if (needGlobalParams)
+                forceKernel->addArg(cc.getGlobalParamValues());
+            for (auto& parameter : params->getParameterInfos())
+                forceKernel->addArg(parameter.getArray());
+            for (auto& function : tabulatedFunctionArrays)
+                forceKernel->addArg(function);
         }
-        if (particleTypes.isInitialized()) {
-            forceKernel->addArg(particleTypes);
-            forceKernel->addArg(orderIndex);
-            forceKernel->addArg(particleOrder);
-        }
-        if (exclusions.isInitialized()) {
-            forceKernel->addArg(exclusions);
-            forceKernel->addArg(exclusionStartIndex);
-        }
-        if (needGlobalParams)
-            forceKernel->addArg(cc.getGlobalParamValues());
-        for (auto& parameter : params->getParameterInfos())
-            forceKernel->addArg(parameter.getArray());
-        for (auto& function : tabulatedFunctionArrays)
-            forceKernel->addArg(function);
 
         if (nonbondedMethod != NoCutoff) {
             // Set arguments for the block bounds kernel.
@@ -467,6 +476,7 @@ double CommonCalcCustomManyParticleForceKernel::execute(ContextImpl& context, bo
             copyPairsKernel->addArg(neighborStartIndex);
        }
     }
+    ComputeKernel forceKernel = (!includeEnergy && forceOnlyKernel ? forceOnlyKernel : this->forceKernel);
     while (true) {
         int* numPairs = (int*) cc.getPinnedBuffer();
         if (nonbondedMethod != NoCutoff) {

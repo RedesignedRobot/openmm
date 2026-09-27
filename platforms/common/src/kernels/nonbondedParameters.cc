@@ -63,8 +63,10 @@ KERNEL void computeParameters(GLOBAL mixed* RESTRICT energyBuffer, int includeSe
         exceptionParams[i] = make_float4((float) (ONE_4PI_EPS0*params.x), (float) params.y, (float) (4*params.z), 0);
     }
 #endif
+#ifndef FORCE_ONLY
     if (includeSelfEnergy)
         energyBuffer[GLOBAL_ID] += energy;
+#endif
 
     // Record the total charge from particles processed by this block.
 

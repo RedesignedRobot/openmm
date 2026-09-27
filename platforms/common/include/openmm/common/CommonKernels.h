@@ -696,7 +696,7 @@ private:
     std::vector<ComputeArray> tabulatedFunctionArrays;
     std::map<std::string, int> tabulatedFunctionUpdateCount;
     std::vector<void*> groupForcesArgs;
-    ComputeKernel computeCentersKernel, groupForcesKernel, applyForcesKernel;
+    ComputeKernel computeCentersKernel, groupForcesKernel, forceOnlyGroupKernel, applyForcesKernel;
     const System& system;
 };
 
@@ -790,7 +790,7 @@ private:
     std::vector<bool> isRealParticle;
     std::vector<std::pair<int, int> > exceptionAtoms;
     std::vector<std::pair<int, int> > excludedPairs;
-    ComputeKernel framesKernel, blockBoundsKernel, neighborsKernel, forceKernel, torqueKernel;
+    ComputeKernel framesKernel, blockBoundsKernel, neighborsKernel, forceKernel, forceOnlyKernel, torqueKernel;
     ComputeEvent event;
 };
 
@@ -899,7 +899,7 @@ private:
     ComputeArray activeParticles, parameters;
     ComputeArray condensedPos, blockCenter, blockBoundingBox;
     ComputeArray numNeighborPairs, numNeighborsForAtom, neighborStartIndex, neighborPairs, neighbors, neighborData;
-    ComputeKernel condensePosKernel, findBlockBoundsKernel, findNeighborsKernel, computeNeighborStartIndicesKernel, copyPairsToNeighborListKernel, computeInteractionKernel;
+    ComputeKernel condensePosKernel, findBlockBoundsKernel, findNeighborsKernel, computeNeighborStartIndicesKernel, copyPairsToNeighborListKernel, computeInteractionKernel, forceOnlyInteractionKernel;
     ComputeEvent downloadStartEvent, downloadFinishEvent;
     ComputeQueue downloadQueue;
 };
@@ -1246,7 +1246,7 @@ private:
     ComputeContext& cc;
     int blockSize;
     ComputeArray particles, centerBuffer, rgBuffer;
-    ComputeKernel centerKernel, rgKernel, forceKernel;
+    ComputeKernel centerKernel, rgKernel, forceKernel, forceOnlyKernel;
 };
 
 /**

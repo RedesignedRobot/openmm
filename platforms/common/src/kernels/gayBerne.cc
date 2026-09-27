@@ -482,7 +482,9 @@ KERNEL void computeForce(
         }
 #endif
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
 }
 
 /**

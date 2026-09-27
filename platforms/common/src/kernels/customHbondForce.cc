@@ -208,5 +208,7 @@ KERNEL void computeHbondForces(
         applyForce(atoms2.y, localData[LOCAL_ID].f2, force);
         applyForce(atoms2.z, localData[LOCAL_ID].f3, force);
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
 }

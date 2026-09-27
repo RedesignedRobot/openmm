@@ -628,6 +628,11 @@ void CommonCalcCustomNonbondedForceKernel::initInteractionGroups(const CustomNon
         defines["PARAMETER_SIZE_IS_EVEN"] = "1";
     ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonKernelSources::customNonbondedGroups, replacements), defines);
     interactionGroupKernel = program->createKernel("computeInteractionGroups");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyGroupKernel = cc.compileProgram(cc.replaceStrings(CommonKernelSources::customNonbondedGroups, replacements), forceDefines)->createKernel("computeInteractionGroups");
+    }
     prepareNeighborListKernel = program->createKernel("prepareToBuildNeighborList");
     buildNeighborListKernel = program->createKernel("buildNeighborList");
     numGroupThreadBlocks = cc.getNonbondedUtilities().getNumForceThreadBlocks();
@@ -670,25 +675,29 @@ double CommonCalcCustomNonbondedForceKernel::execute(ContextImpl& context, bool 
     if (interactionGroupData.isInitialized()) {
         if (!hasInitializedKernel) {
             hasInitializedKernel = true;
-            interactionGroupKernel->addArg(cc.getLongForceBuffer());
-            interactionGroupKernel->addArg(cc.getEnergyBuffer());
-            interactionGroupKernel->addArg(cc.getPosq());
-            interactionGroupKernel->addArg((useNeighborList ? filteredGroupData : interactionGroupData));
-            interactionGroupKernel->addArg(numGroupTiles);
-            interactionGroupKernel->addArg((int) useNeighborList);
-            for (int i = 0; i < 5; i++)
-                interactionGroupKernel->addArg(); // Periodic box information will be set just before it is executed.
-            interactionGroupKernel->addArg((int) cc.getEnergyParamDerivNames().size());
-            for (auto& buffer : paramBuffers)
-                interactionGroupKernel->addArg(buffer.getArray());
-            for (auto& buffer : computedValueBuffers)
-                interactionGroupKernel->addArg(buffer.getArray());
-            for (auto& function : tabulatedFunctionArrays)
-                interactionGroupKernel->addArg(function);
-            if (needGlobalParams)
-                interactionGroupKernel->addArg(cc.getGlobalParamValues());
-            if (hasParamDerivs)
-                interactionGroupKernel->addArg(cc.getEnergyParamDerivBuffer());
+            for (ComputeKernel interactionGroupKernel : {this->interactionGroupKernel, forceOnlyGroupKernel}) {
+                if (!interactionGroupKernel)
+                    continue;
+                interactionGroupKernel->addArg(cc.getLongForceBuffer());
+                interactionGroupKernel->addArg(cc.getEnergyBuffer());
+                interactionGroupKernel->addArg(cc.getPosq());
+                interactionGroupKernel->addArg((useNeighborList ? filteredGroupData : interactionGroupData));
+                interactionGroupKernel->addArg(numGroupTiles);
+                interactionGroupKernel->addArg((int) useNeighborList);
+                for (int i = 0; i < 5; i++)
+                    interactionGroupKernel->addArg(); // Periodic box information will be set just before it is executed.
+                interactionGroupKernel->addArg((int) cc.getEnergyParamDerivNames().size());
+                for (auto& buffer : paramBuffers)
+                    interactionGroupKernel->addArg(buffer.getArray());
+                for (auto& buffer : computedValueBuffers)
+                    interactionGroupKernel->addArg(buffer.getArray());
+                for (auto& function : tabulatedFunctionArrays)
+                    interactionGroupKernel->addArg(function);
+                if (needGlobalParams)
+                    interactionGroupKernel->addArg(cc.getGlobalParamValues());
+                if (hasParamDerivs)
+                    interactionGroupKernel->addArg(cc.getEnergyParamDerivBuffer());
+            }
             if (useNeighborList) {
                 // Initialize kernels for building the interaction group neighbor list.
 
@@ -703,6 +712,7 @@ double CommonCalcCustomNonbondedForceKernel::execute(ContextImpl& context, bool 
                     buildNeighborListKernel->addArg(); // Periodic box information will be set just before it is executed.
             }
         }
+        ComputeKernel interactionGroupKernel = (!includeEnergy && forceOnlyGroupKernel ? forceOnlyGroupKernel : this->interactionGroupKernel);
         int forceThreadBlockSize = max(32, cc.getNonbondedUtilities().getForceThreadBlockSize());
         if (useNeighborList) {
             // Rebuild the neighbor list, if necessary.

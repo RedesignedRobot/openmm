@@ -84,7 +84,7 @@ private:
     std::vector<ComputeArray> tabulatedFunctionArrays;
     std::map<std::string, int> tabulatedFunctionUpdateCount;
     const System& system;
-    ComputeKernel blockBoundsKernel, forceKernel;
+    ComputeKernel blockBoundsKernel, forceKernel, forceOnlyKernel;
 };
 
 } // namespace OpenMM

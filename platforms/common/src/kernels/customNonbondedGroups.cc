@@ -120,7 +120,9 @@ KERNEL void computeInteractionGroups(
         ATOMIC_ADD(&forceBuffers[atom2+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fz));
         SYNC_WARPS;
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
     SAVE_DERIVATIVES
 }
 

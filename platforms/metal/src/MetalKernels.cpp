@@ -87,14 +87,14 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
 
     // The bonded and nonbonded kernels share no written buffer except the force buffer, and both only add
     // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
-    // a plain += into the energy buffer (bonded on every step, nonbonded only with energy), and each writes
+    // a plain += into the energy buffer only with energy, and each writes
     // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
     // boundaries on either side order them against the clear before and the readers after.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
-        cu.getBondedUtilities().computeInteractions(groups);
+        cu.getBondedUtilities().computeInteractions(groups, includeEnergy);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
     double sum = 0.0;

@@ -42,7 +42,9 @@ KERNEL void calculateEwaldCosSinSums(GLOBAL mixed* RESTRICT energyBuffer, GLOBAL
         energy += reciprocalCoefficient*ak*(sum.x*sum.x + sum.y*sum.y);
         index += GLOBAL_SIZE;
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
 }
 
 /**

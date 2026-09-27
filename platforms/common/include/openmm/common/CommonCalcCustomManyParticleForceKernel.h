@@ -84,7 +84,7 @@ private:
     std::vector<ComputeArray> tabulatedFunctionArrays;
     std::map<std::string, int> tabulatedFunctionUpdateCount;
     const System& system;
-    ComputeKernel forceKernel, blockBoundsKernel, neighborsKernel, startIndicesKernel, copyPairsKernel;
+    ComputeKernel forceKernel, forceOnlyKernel, blockBoundsKernel, neighborsKernel, startIndicesKernel, copyPairsKernel;
     ComputeEvent event;
 };
 

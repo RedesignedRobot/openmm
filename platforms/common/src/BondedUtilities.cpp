@@ -120,7 +120,7 @@ void BondedUtilities::initialize(const System& system) {
         s<<"mixed energyParamDeriv"<<i<<" = 0;\n";
     for (int force = 0; force < numForces; force++)
         s<<createForceSource(force, forceAtoms[force].size(), forceAtoms[force][0].size(), forceGroup[force], forceSource[force]);
-    s<<"energyBuffer[GLOBAL_ID] += energy;\n";
+    s<<"#ifndef FORCE_ONLY\nenergyBuffer[GLOBAL_ID] += energy;\n#endif\n";
     const vector<string>& allParamDerivNames = context.getEnergyParamDerivNames();
     int numDerivs = allParamDerivNames.size();
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
@@ -132,6 +132,10 @@ void BondedUtilities::initialize(const System& system) {
     defines["PADDED_NUM_ATOMS"] = context.intToString(context.getPaddedNumAtoms());
     ComputeProgram program = context.compileProgram(s.str(), defines);
     kernel = program->createKernel("computeBondedForces");
+    if (useEnergyVariants) {
+        defines["FORCE_ONLY"] = "1";
+        forceOnlyKernel = context.compileProgram(s.str(), defines)->createKernel("computeBondedForces");
+    }
     forceAtoms.clear();
     forceSource.clear();
 }
@@ -167,26 +171,31 @@ string BondedUtilities::createForceSource(int forceIndex, int numBonds, int numA
     return s.str();
 }
 
-void BondedUtilities::computeInteractions(int groups) {
+void BondedUtilities::computeInteractions(int groups, bool includeEnergy) {
     if ((groups&allGroups) == 0)
         return;
     if (!hasInitializedKernels) {
         hasInitializedKernels = true;
-        kernel->addArg(context.getLongForceBuffer());
-        kernel->addArg(context.getEnergyBuffer());
-        kernel->addArg(context.getPosq());
-        for (int i = 0; i < 6; i++)
-            kernel->addArg();
-        for (int i = 0; i < (int) atomIndices.size(); i++)
-            for (int j = 0; j < (int) atomIndices[i].size(); j++)
-                kernel->addArg(atomIndices[i][j]);
-        for (int i = 0; i < (int) arguments.size(); i++)
-            kernel->addArg(*arguments[i]);
-        if (energyParameterDerivatives.size() > 0)
-            kernel->addArg(context.getEnergyParamDerivBuffer());
+        for (ComputeKernel kernel : {this->kernel, forceOnlyKernel}) {
+            if (!kernel)
+                continue;
+            kernel->addArg(context.getLongForceBuffer());
+            kernel->addArg(context.getEnergyBuffer());
+            kernel->addArg(context.getPosq());
+            for (int i = 0; i < 6; i++)
+                kernel->addArg();
+            for (int i = 0; i < (int) atomIndices.size(); i++)
+                for (int j = 0; j < (int) atomIndices[i].size(); j++)
+                    kernel->addArg(atomIndices[i][j]);
+            for (int i = 0; i < (int) arguments.size(); i++)
+                kernel->addArg(*arguments[i]);
+            if (energyParameterDerivatives.size() > 0)
+                kernel->addArg(context.getEnergyParamDerivBuffer());
+        }
     }
     if (!hasInteractions)
         return;
+    ComputeKernel kernel = (!includeEnergy && forceOnlyKernel ? forceOnlyKernel : this->kernel);
     kernel->setArg(3, groups);
     Vec3 a, b, c;
     context.getPeriodicBoxVectors(a, b, c);

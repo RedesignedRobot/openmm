@@ -1855,21 +1855,30 @@ void CommonCalcCustomCentroidBondForceKernel::initialize(const System& system, c
     computeCentersKernel->addArg(groupOffsets);
     computeCentersKernel->addArg(centerPositions);
     groupForcesKernel = program->createKernel("computeGroupForces");
-    groupForcesKernel->addArg(numGroups);
-    groupForcesKernel->addArg(groupForces);
-    groupForcesKernel->addArg(); // Energy buffer hasn't been created yet
-    groupForcesKernel->addArg(centerPositions);
-    groupForcesKernel->addArg(bondGroups);
-    for (int i = 0; i < 5; i++)
-        groupForcesKernel->addArg(); // Periodic box information will be set just before it is executed.
-    if (needEnergyParamDerivs)
-        groupForcesKernel->addArg(); // Deriv buffer hasn't been created yet.
-    for (auto& function : tabulatedFunctionArrays)
-        groupForcesKernel->addArg(function);
-    if (needGlobalParams)
-        groupForcesKernel->addArg();
-    for (auto& parameter : params->getParameterInfos())
-        groupForcesKernel->addArg(parameter.getArray());
+    if (getPlatform().getName() == "Metal") {
+        map<string, string> defines;
+        defines["FORCE_ONLY"] = "1";
+        forceOnlyGroupKernel = cc.compileProgram(cc.replaceStrings(CommonKernelSources::pointFunctions+CommonKernelSources::customCentroidBond, replacements), defines)->createKernel("computeGroupForces");
+    }
+    for (ComputeKernel groupForcesKernel : {this->groupForcesKernel, forceOnlyGroupKernel}) {
+        if (!groupForcesKernel)
+            continue;
+        groupForcesKernel->addArg(numGroups);
+        groupForcesKernel->addArg(groupForces);
+        groupForcesKernel->addArg(); // Energy buffer hasn't been created yet
+        groupForcesKernel->addArg(centerPositions);
+        groupForcesKernel->addArg(bondGroups);
+        for (int i = 0; i < 5; i++)
+            groupForcesKernel->addArg(); // Periodic box information will be set just before it is executed.
+        if (needEnergyParamDerivs)
+            groupForcesKernel->addArg(); // Deriv buffer hasn't been created yet.
+        for (auto& function : tabulatedFunctionArrays)
+            groupForcesKernel->addArg(function);
+        if (needGlobalParams)
+            groupForcesKernel->addArg();
+        for (auto& parameter : params->getParameterInfos())
+            groupForcesKernel->addArg(parameter.getArray());
+    }
     applyForcesKernel = program->createKernel("applyForcesToAtoms");
     applyForcesKernel->addArg(numGroups);
     applyForcesKernel->addArg(groupParticles);
@@ -1883,6 +1892,7 @@ double CommonCalcCustomCentroidBondForceKernel::execute(ContextImpl& context, bo
     if (numBonds == 0)
         return 0.0;
     ContextSelector selector(cc);
+    ComputeKernel groupForcesKernel = (!includeEnergy && forceOnlyGroupKernel ? forceOnlyGroupKernel : this->groupForcesKernel);
     computeCentersKernel->execute(32*numGroups);
     groupForcesKernel->setArg(2, cc.getEnergyBuffer());
     setPeriodicBoxArgs(cc, groupForcesKernel, 5);
@@ -2305,6 +2315,11 @@ void CommonCalcGayBerneForceKernel::initialize(const System& system, const GayBe
     blockBoundsKernel = program->createKernel("findBlockBounds");
     neighborsKernel = program->createKernel("findNeighbors");
     forceKernel = program->createKernel("computeForce");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyKernel = cc.compileProgram(CommonKernelSources::gayBerne, forceDefines)->createKernel("computeForce");
+    }
     torqueKernel = program->createKernel("applyTorques");
     info = new ForceInfo(force);
     cc.addForce(info);
@@ -2346,29 +2361,34 @@ double CommonCalcGayBerneForceKernel::execute(ContextImpl& context, bool include
         neighborsKernel->addArg(neighborBlockCount);
         neighborsKernel->addArg(exclusions);
         neighborsKernel->addArg(exclusionStartIndex);
-        forceKernel->addArg(cc.getLongForceBuffer());
-        forceKernel->addArg(torque);
-        forceKernel->addArg(numRealParticles);
-        forceKernel->addArg((int) exceptionAtoms.size());
-        forceKernel->addArg(cc.getEnergyBuffer());
-        forceKernel->addArg(sortedPos);
-        forceKernel->addArg(sigParams);
-        forceKernel->addArg(epsParams);
-        forceKernel->addArg(sortedParticles);
-        forceKernel->addArg(aMatrix);
-        forceKernel->addArg(bMatrix);
-        forceKernel->addArg(gMatrix);
-        forceKernel->addArg(exclusions);
-        forceKernel->addArg(exclusionStartIndex);
-        forceKernel->addArg(exceptionParticles);
-        forceKernel->addArg(exceptionParams);
-        if (nonbondedMethod != GayBerneForce::NoCutoff) {
-            forceKernel->addArg(maxNeighborBlocks);
-            forceKernel->addArg(neighbors);
-            forceKernel->addArg(neighborIndex);
-            forceKernel->addArg(neighborBlockCount);
-            for (int i = 0; i < 5; i++)
-                forceKernel->addArg(); // Periodic box information will be set just before it is executed.
+        for (ComputeKernel forceKernel : {this->forceKernel, forceOnlyKernel}) {
+            if (!forceKernel)
+                continue;
+            forceKernel->addArg(cc.getLongForceBuffer());
+            forceKernel->addArg(torque);
+            forceKernel->addArg(numRealParticles);
+            forceKernel->addArg((int) exceptionAtoms.size());
+            forceKernel->addArg(cc.getEnergyBuffer());
+            forceKernel->addArg(sortedPos);
+            forceKernel->addArg(sigParams);
+            forceKernel->addArg(epsParams);
+            forceKernel->addArg(sortedParticles);
+            forceKernel->addArg(aMatrix);
+            forceKernel->addArg(bMatrix);
+            forceKernel->addArg(gMatrix);
+            forceKernel->addArg(exclusions);
+            forceKernel->addArg(exclusionStartIndex);
+            forceKernel->addArg(exceptionParticles);
+            forceKernel->addArg(exceptionParams);
+            if (nonbondedMethod != GayBerneForce::NoCutoff) {
+                forceKernel->addArg(maxNeighborBlocks);
+                forceKernel->addArg(neighbors);
+                forceKernel->addArg(neighborIndex);
+                forceKernel->addArg(neighborBlockCount);
+                for (int i = 0; i < 5; i++)
+                    forceKernel->addArg(); // Periodic box information will be set just before it is executed.
+            }
+
         }
         torqueKernel->addArg(cc.getLongForceBuffer());
         torqueKernel->addArg(torque);
@@ -2377,6 +2397,7 @@ double CommonCalcGayBerneForceKernel::execute(ContextImpl& context, bool include
         torqueKernel->addArg(axisParticleIndices);
         torqueKernel->addArg(sortedParticles);
     }
+    ComputeKernel forceKernel = (!includeEnergy && forceOnlyKernel ? forceOnlyKernel : this->forceKernel);
     framesKernel->execute(numRealParticles);
     setPeriodicBoxArgs(cc, blockBoundsKernel, 1);
     blockBoundsKernel->execute((numRealParticles+31)/32);
@@ -2402,8 +2423,12 @@ double CommonCalcGayBerneForceKernel::execute(ContextImpl& context, bool include
             neighborIndex.resize(maxNeighborBlocks);
             neighborsKernel->setArg(10, neighbors);
             neighborsKernel->setArg(11, neighborIndex);
-            forceKernel->setArg(17, neighbors);
-            forceKernel->setArg(18, neighborIndex);
+            for (ComputeKernel kernel : {this->forceKernel, forceOnlyKernel}) {
+                if (kernel) {
+                    kernel->setArg(17, neighbors);
+                    kernel->setArg(18, neighborIndex);
+                }
+            }
         }
     }
     torqueKernel->execute(numRealParticles);
@@ -2869,6 +2894,11 @@ void CommonCalcLCPOForceKernel::initialize(const System& system, const LCPOForce
     computeNeighborStartIndicesKernel = program->createKernel("computeNeighborStartIndices");
     copyPairsToNeighborListKernel = program->createKernel("copyPairsToNeighborList");
     computeInteractionKernel = program->createKernel("computeInteraction");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyInteractionKernel = cc.compileProgram(CommonKernelSources::lcpo, forceDefines)->createKernel("computeInteraction");
+    }
 
     downloadStartEvent = cc.createEvent();
     downloadFinishEvent = cc.createEvent();
@@ -2939,25 +2969,30 @@ double CommonCalcLCPOForceKernel::execute(ContextImpl& context, bool includeForc
         copyPairsToNeighborListKernel->addArg(neighborData);
         copyPairsToNeighborListKernel->addArg(maxNeighborPairs);
 
-        for (int i = 0; i < 5; i++) {
-            computeInteractionKernel->addArg();
+        for (ComputeKernel computeInteractionKernel : {this->computeInteractionKernel, forceOnlyInteractionKernel}) {
+            if (!computeInteractionKernel)
+                continue;
+            for (int i = 0; i < 5; i++) {
+                computeInteractionKernel->addArg();
+            }
+            setPeriodicBoxArgs(cc, computeInteractionKernel, 0);
+            computeInteractionKernel->addArg(condensedPos);
+            computeInteractionKernel->addArg(cc.getLongForceBuffer());
+            computeInteractionKernel->addArg(cc.getEnergyBuffer());
+            computeInteractionKernel->addArg(activeParticles);
+            computeInteractionKernel->addArg(parameters);
+            computeInteractionKernel->addArg(numNeighborPairs);
+            computeInteractionKernel->addArg(neighborStartIndex);
+            computeInteractionKernel->addArg(neighborPairs);
+            computeInteractionKernel->addArg(neighbors);
+            computeInteractionKernel->addArg(neighborData);
+            computeInteractionKernel->addArg(maxNeighborPairs);
         }
-        setPeriodicBoxArgs(cc, computeInteractionKernel, 0);
-        computeInteractionKernel->addArg(condensedPos);
-        computeInteractionKernel->addArg(cc.getLongForceBuffer());
-        computeInteractionKernel->addArg(cc.getEnergyBuffer());
-        computeInteractionKernel->addArg(activeParticles);
-        computeInteractionKernel->addArg(parameters);
-        computeInteractionKernel->addArg(numNeighborPairs);
-        computeInteractionKernel->addArg(neighborStartIndex);
-        computeInteractionKernel->addArg(neighborPairs);
-        computeInteractionKernel->addArg(neighbors);
-        computeInteractionKernel->addArg(neighborData);
-        computeInteractionKernel->addArg(maxNeighborPairs);
 
         hasInitializedKernel = true;
     }
 
+    ComputeKernel computeInteractionKernel = (!includeEnergy && forceOnlyInteractionKernel ? forceOnlyInteractionKernel : this->computeInteractionKernel);
     if (usePeriodic) {
         setPeriodicBoxArgs(cc, findBlockBoundsKernel, 0);
         setPeriodicBoxArgs(cc, findNeighborsKernel, 0);
@@ -2992,7 +3027,9 @@ double CommonCalcLCPOForceKernel::execute(ContextImpl& context, bool includeForc
             findNeighborsKernel->setArg(13, maxNeighborPairs);
             computeNeighborStartIndicesKernel->setArg(3, maxNeighborPairs);
             copyPairsToNeighborListKernel->setArg(13, maxNeighborPairs);
-            computeInteractionKernel->setArg(15, maxNeighborPairs);
+            for (ComputeKernel kernel : {this->computeInteractionKernel, forceOnlyInteractionKernel})
+                if (kernel)
+                    kernel->setArg(15, maxNeighborPairs);
         }
         else {
             break;
@@ -3959,6 +3996,11 @@ void CommonCalcRGForceKernel::initialize(const System& system, const RGForce& fo
     centerKernel = program->createKernel("computeCenterPosition");
     rgKernel = program->createKernel("computeRg");
     forceKernel = program->createKernel("computeForces");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyKernel = cc.compileProgram(CommonKernelSources::rg, forceDefines)->createKernel("computeForces");
+    }
     centerKernel->addArg(numParticles);
     centerKernel->addArg(cc.getPosq());
     centerKernel->addArg(particles);
@@ -3968,13 +4010,17 @@ void CommonCalcRGForceKernel::initialize(const System& system, const RGForce& fo
     rgKernel->addArg(particles);
     rgKernel->addArg(centerBuffer);
     rgKernel->addArg(rgBuffer);
-    forceKernel->addArg(numParticles);
-    forceKernel->addArg(cc.getPosq());
-    forceKernel->addArg(particles);
-    forceKernel->addArg(centerBuffer);
-    forceKernel->addArg(rgBuffer);
-    forceKernel->addArg(cc.getLongForceBuffer());
-    forceKernel->addArg(cc.getEnergyBuffer());
+    for (ComputeKernel forceKernel : {this->forceKernel, forceOnlyKernel}) {
+        if (!forceKernel)
+            continue;
+        forceKernel->addArg(numParticles);
+        forceKernel->addArg(cc.getPosq());
+        forceKernel->addArg(particles);
+        forceKernel->addArg(centerBuffer);
+        forceKernel->addArg(rgBuffer);
+        forceKernel->addArg(cc.getLongForceBuffer());
+        forceKernel->addArg(cc.getEnergyBuffer());
+    }
 
     // Create the listener for updating the list of particles.
 
@@ -3995,6 +4041,7 @@ double CommonCalcRGForceKernel::execute(ContextImpl& context, bool includeForces
     ContextSelector selector(cc);
     centerKernel->execute(particles.getSize(), blockSize);
     rgKernel->execute(particles.getSize(), blockSize);
+    ComputeKernel forceKernel = (!includeEnergy && forceOnlyKernel ? forceOnlyKernel : this->forceKernel);
     forceKernel->execute(particles.getSize(), blockSize);
     return 0.0;
 }

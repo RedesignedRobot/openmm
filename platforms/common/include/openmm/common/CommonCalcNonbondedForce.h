@@ -150,8 +150,8 @@ private:
     Kernel cpuPme;
     PmeIO* pmeio;
     SyncQueuePostComputation* syncQueue;
-    ComputeKernel computeParamsKernel, computeExclusionParamsKernel, computePlasmaCorrectionKernel;
-    ComputeKernel ewaldSumsKernel, ewaldForcesKernel;
+    ComputeKernel computeParamsKernel, forceOnlyParamsKernel, computeExclusionParamsKernel, computePlasmaCorrectionKernel;
+    ComputeKernel ewaldSumsKernel, ewaldForceOnlySumsKernel, ewaldForcesKernel;
     ComputeKernel pmeGridIndexKernel, pmeDispersionGridIndexKernel;
     ComputeKernel pmeSpreadChargeKernel, pmeDispersionSpreadChargeKernel;
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;

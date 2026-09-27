@@ -441,6 +441,11 @@ void CommonCalcCustomHbondForceKernel::initialize(const System& system, const Cu
     ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonKernelSources::customHbondForce, replacements), defines);
     blockBoundsKernel = program->createKernel("findBlockBounds");
     forceKernel = program->createKernel("computeHbondForces");
+    if (getPlatform().getName() == "Metal") {
+        auto forceDefines = defines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyKernel = cc.compileProgram(cc.replaceStrings(CommonKernelSources::customHbondForce, replacements), forceDefines)->createKernel("computeHbondForces");
+    }
 }
 
 double CommonCalcCustomHbondForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy) {
@@ -460,29 +465,34 @@ double CommonCalcCustomHbondForceKernel::execute(ContextImpl& context, bool incl
             blockBoundsKernel->addArg(acceptorBlockCenter);
             blockBoundsKernel->addArg(acceptorBlockSize);
         }
-        forceKernel->addArg(cc.getLongForceBuffer());
-        forceKernel->addArg(cc.getEnergyBuffer());
-        forceKernel->addArg(cc.getPosq());
-        forceKernel->addArg(donorExclusions);
-        forceKernel->addArg(donors);
-        forceKernel->addArg(acceptors);
-        for (int i = 0; i < 5; i++)
-            forceKernel->addArg(); // Periodic box size arguments are set when the kernel is executed.
-        if (useBoundingBoxes) {
-            forceKernel->addArg(donorBlockCenter);
-            forceKernel->addArg(donorBlockSize);
-            forceKernel->addArg(acceptorBlockCenter);
-            forceKernel->addArg(acceptorBlockSize);
+        for (ComputeKernel forceKernel : {this->forceKernel, forceOnlyKernel}) {
+            if (!forceKernel)
+                continue;
+            forceKernel->addArg(cc.getLongForceBuffer());
+            forceKernel->addArg(cc.getEnergyBuffer());
+            forceKernel->addArg(cc.getPosq());
+            forceKernel->addArg(donorExclusions);
+            forceKernel->addArg(donors);
+            forceKernel->addArg(acceptors);
+            for (int i = 0; i < 5; i++)
+                forceKernel->addArg(); // Periodic box size arguments are set when the kernel is executed.
+            if (useBoundingBoxes) {
+                forceKernel->addArg(donorBlockCenter);
+                forceKernel->addArg(donorBlockSize);
+                forceKernel->addArg(acceptorBlockCenter);
+                forceKernel->addArg(acceptorBlockSize);
+            }
+            if (needGlobalParams)
+                forceKernel->addArg(cc.getGlobalParamValues());
+            for (auto& parameter : donorParams->getParameterInfos())
+                forceKernel->addArg(parameter.getArray());
+            for (auto& parameter : acceptorParams->getParameterInfos())
+                forceKernel->addArg(parameter.getArray());
+            for (auto& function : tabulatedFunctionArrays)
+                forceKernel->addArg(function);
         }
-        if (needGlobalParams)
-            forceKernel->addArg(cc.getGlobalParamValues());
-        for (auto& parameter : donorParams->getParameterInfos())
-            forceKernel->addArg(parameter.getArray());
-        for (auto& parameter : acceptorParams->getParameterInfos())
-            forceKernel->addArg(parameter.getArray());
-        for (auto& function : tabulatedFunctionArrays)
-            forceKernel->addArg(function);
     }
+    ComputeKernel forceKernel = (!includeEnergy && forceOnlyKernel ? forceOnlyKernel : this->forceKernel);
     if (useBoundingBoxes) {
         setPeriodicBoxArgs(cc, blockBoundsKernel, 2);
         blockBoundsKernel->execute(max(numDonors, numAcceptors));

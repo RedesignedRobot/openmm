@@ -360,6 +360,11 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
             replacements["M_PI"] = cc.doubleToString(M_PI);
             ComputeProgram program = cc.compileProgram(CommonKernelSources::ewald, replacements);
             ewaldSumsKernel = program->createKernel("calculateEwaldCosSinSums");
+            if (getPlatform().getName() == "Metal") {
+                auto forceDefines = replacements;
+                forceDefines["FORCE_ONLY"] = "1";
+                ewaldForceOnlySumsKernel = cc.compileProgram(CommonKernelSources::ewald, forceDefines)->createKernel("calculateEwaldCosSinSums");
+            }
             ewaldForcesKernel = program->createKernel("calculateEwaldForces");
             int elementSize = (cc.getUseDoublePrecision() ? sizeof(mm_double2) : sizeof(mm_float2));
             cosSinSums.initialize(cc, (2*kmaxx-1)*(2*kmaxy-1)*(2*kmaxz-1), elementSize, "cosSinSums");
@@ -720,6 +725,11 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
 
     ComputeProgram program = cc.compileProgram(CommonKernelSources::nonbondedParameters, paramsDefines);
     computeParamsKernel = program->createKernel("computeParameters");
+    if (getPlatform().getName() == "Metal" && hasOffsets) {
+        auto forceDefines = paramsDefines;
+        forceDefines["FORCE_ONLY"] = "1";
+        forceOnlyParamsKernel = cc.compileProgram(CommonKernelSources::nonbondedParameters, forceDefines)->createKernel("computeParameters");
+    }
     computeExclusionParamsKernel = program->createKernel("computeExclusionParameters");
     computePlasmaCorrectionKernel = program->createKernel("computePlasmaCorrection");
     info = new ForceInfo(force);
@@ -730,23 +740,27 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
     ContextSelector selector(cc);
     if (!hasInitializedKernel) {
         hasInitializedKernel = true;
-        computeParamsKernel->addArg(cc.getEnergyBuffer());
-        computeParamsKernel->addArg();
-        computeParamsKernel->addArg(cc.getGlobalParamValues());
-        computeParamsKernel->addArg(cc.getPaddedNumAtoms());
-        computeParamsKernel->addArg(baseParticleParams);
-        computeParamsKernel->addArg(cc.getPosq());
-        computeParamsKernel->addArg(charges);
-        computeParamsKernel->addArg(sigmaEpsilon);
-        computeParamsKernel->addArg(particleParamOffsets);
-        computeParamsKernel->addArg(particleOffsetIndices);
-        computeParamsKernel->addArg(chargeBuffer);
-        if (exceptionParams.isInitialized()) {
-            computeParamsKernel->addArg((int) exceptionParams.getSize());
-            computeParamsKernel->addArg(baseExceptionParams);
-            computeParamsKernel->addArg(exceptionParams);
-            computeParamsKernel->addArg(exceptionParamOffsets);
-            computeParamsKernel->addArg(exceptionOffsetIndices);
+        for (ComputeKernel computeParamsKernel : {this->computeParamsKernel, forceOnlyParamsKernel}) {
+            if (!computeParamsKernel)
+                continue;
+            computeParamsKernel->addArg(cc.getEnergyBuffer());
+            computeParamsKernel->addArg();
+            computeParamsKernel->addArg(cc.getGlobalParamValues());
+            computeParamsKernel->addArg(cc.getPaddedNumAtoms());
+            computeParamsKernel->addArg(baseParticleParams);
+            computeParamsKernel->addArg(cc.getPosq());
+            computeParamsKernel->addArg(charges);
+            computeParamsKernel->addArg(sigmaEpsilon);
+            computeParamsKernel->addArg(particleParamOffsets);
+            computeParamsKernel->addArg(particleOffsetIndices);
+            computeParamsKernel->addArg(chargeBuffer);
+            if (exceptionParams.isInitialized()) {
+                computeParamsKernel->addArg((int) exceptionParams.getSize());
+                computeParamsKernel->addArg(baseExceptionParams);
+                computeParamsKernel->addArg(exceptionParams);
+                computeParamsKernel->addArg(exceptionParamOffsets);
+                computeParamsKernel->addArg(exceptionOffsetIndices);
+            }
         }
         if (exclusionParams.isInitialized()) {
             computeExclusionParamsKernel->addArg(cc.getPosq());
@@ -764,10 +778,14 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             computePlasmaCorrectionKernel->addArg((float) alpha);
         computePlasmaCorrectionKernel->addArg();
         if (cosSinSums.isInitialized()) {
-            ewaldSumsKernel->addArg(cc.getEnergyBuffer());
-            ewaldSumsKernel->addArg(cc.getPosq());
-            ewaldSumsKernel->addArg(cosSinSums);
-            ewaldSumsKernel->addArg();
+            for (ComputeKernel ewaldSumsKernel : {this->ewaldSumsKernel, ewaldForceOnlySumsKernel}) {
+                if (!ewaldSumsKernel)
+                    continue;
+                ewaldSumsKernel->addArg(cc.getEnergyBuffer());
+                ewaldSumsKernel->addArg(cc.getPosq());
+                ewaldSumsKernel->addArg(cosSinSums);
+                ewaldSumsKernel->addArg();
+            }
             ewaldForcesKernel->addArg(cc.getLongForceBuffer());
             ewaldForcesKernel->addArg(cc.getPosq());
             ewaldForcesKernel->addArg(cosSinSums);
@@ -900,13 +918,14 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         }
     }
     double energy = 0.0;
-    if (includeReciprocal && (pmeGrid1.isInitialized() || cosSinSums.isInitialized())) {
+    if (includeEnergy && includeReciprocal && (pmeGrid1.isInitialized() || cosSinSums.isInitialized())) {
         Vec3 a, b, c;
         cc.getPeriodicBoxVectors(a, b, c);
         double volume = a[0]*b[1]*c[2];
         energy = ewaldSelfEnergy - totalCharge*totalCharge/(8*EPSILON0*volume*alpha*alpha);
     }
     if (recomputeParams || hasOffsets) {
+        ComputeKernel computeParamsKernel = (!(includeEnergy && includeReciprocal) && forceOnlyParamsKernel ? forceOnlyParamsKernel : this->computeParamsKernel);
         computeParamsKernel->setArg(1, (int) (includeEnergy && includeReciprocal));
         computeParamsKernel->execute(cc.getNumAtoms());
         if (exclusionParams.isInitialized())
@@ -919,7 +938,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             // The Ewald self energy was computed in the kernel.
 
             energy = 0.0;
-            if ((pmeGrid1.isInitialized() || cosSinSums.isInitialized()) && includeReciprocal) {
+            if ((pmeGrid1.isInitialized() || cosSinSums.isInitialized()) && includeEnergy && includeReciprocal) {
                 // Invoke a kernel to compute the correction for the neutralizing plasma.
 
                 Vec3 a, b, c;
@@ -938,6 +957,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
     // Do reciprocal space calculations.
 
     if (cosSinSums.isInitialized() && includeReciprocal) {
+        ComputeKernel ewaldSumsKernel = (!includeEnergy && ewaldForceOnlySumsKernel ? ewaldForceOnlySumsKernel : this->ewaldSumsKernel);
         Vec3 a, b, c;
         cc.getPeriodicBoxVectors(a, b, c);
         if (cc.getUseDoublePrecision()) {

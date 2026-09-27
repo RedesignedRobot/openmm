@@ -43,6 +43,7 @@ namespace OpenMM {
 class OPENMM_EXPORT_COMMON MetalBondedUtilities : public BondedUtilities {
 public:
     MetalBondedUtilities(ComputeContext& context) : BondedUtilities(context) {
+        useEnergyVariants = true;
     }
     /**
      * Initialize this object in preparation for a simulation.

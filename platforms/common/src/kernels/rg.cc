@@ -92,8 +92,10 @@ KERNEL void computeForces(int numParticles, GLOBAL const real4* RESTRICT posq, G
     for (int i = LOCAL_ID; i < NUM_GROUPS; i += LOCAL_SIZE)
         rg2 += rgBuffer[i];
     real rg = SQRT(reduceValue(rg2, temp)/numParticles);
+#ifndef FORCE_ONLY
     if (GLOBAL_ID == 0)
         energyBuffer[0] += rg;
+#endif
 
     // Compute the forces.
 

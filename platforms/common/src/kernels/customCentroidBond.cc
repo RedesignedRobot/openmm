@@ -72,7 +72,9 @@ KERNEL void computeGroupForces(int numParticleGroups, GLOBAL mm_ulong* RESTRICT 
     for (int index = GLOBAL_ID; index < NUM_BONDS; index += GLOBAL_SIZE) {
         COMPUTE_FORCE
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
     SAVE_PARAM_DERIVS
 }
 

@@ -126,12 +126,13 @@ public:
      * Compute the bonded interactions.
      * 
      * @param groups        a set of bit flags for which force groups to include
+     * @param includeEnergy whether to accumulate energy (parameter derivatives are always computed)
      */
-    void computeInteractions(int groups);
+    void computeInteractions(int groups, bool includeEnergy = true);
 protected:
     virtual std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
     ComputeContext& context;
-    ComputeKernel kernel;
+    ComputeKernel kernel, forceOnlyKernel;
     std::vector<std::vector<std::vector<int> > > forceAtoms;
     std::vector<std::vector<int> > indexWidth;
     std::vector<std::string> forceSource;
@@ -143,6 +144,7 @@ protected:
     std::vector<std::string> energyParameterDerivatives;
     int numForceBuffers, maxBonds, allGroups;
     bool hasInitializedKernels, hasInteractions;
+    bool useEnergyVariants = false;
 };
 
 } // namespace OpenMM

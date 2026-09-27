@@ -103,7 +103,9 @@ KERNEL void computeInteraction(
             }
         }
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
 }
 
 /**

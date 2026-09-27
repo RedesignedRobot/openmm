@@ -418,5 +418,7 @@ KERNEL void computeInteraction(
         storeForce(activeParticles[i], iForce, forceBuffers);
         storeForce(activeParticles[j], jForce, forceBuffers);
     }
+#ifndef FORCE_ONLY
     energyBuffer[GLOBAL_ID] += energy;
+#endif
 }

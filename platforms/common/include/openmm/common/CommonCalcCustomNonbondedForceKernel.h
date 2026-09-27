@@ -81,7 +81,7 @@ private:
     ComputeParameterSet* params;
     ComputeParameterSet* computedValues;
     ComputeArray interactionGroupData, filteredGroupData, numGroupTiles;
-    ComputeKernel interactionGroupKernel, prepareNeighborListKernel, buildNeighborListKernel, computedValuesKernel;
+    ComputeKernel interactionGroupKernel, forceOnlyGroupKernel, prepareNeighborListKernel, buildNeighborListKernel, computedValuesKernel;
     std::vector<void*> interactionGroupArgs;
     std::vector<std::string> globalParamNames;
     std::vector<float> globalParamValues;
