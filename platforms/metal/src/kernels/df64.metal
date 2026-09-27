@@ -67,6 +67,15 @@ struct alignas(8) df64 {
     df64(int x) : df64((long) x) {}
     df64(uint x) : df64((long) x) {}
     df64(long x) {
+        // Below 2^48 in magnitude, x = p*2^24 + q with p and q exact floats, and one fast two-sum gives the same
+        // pair as the general path without 64-bit integer conversions.  Fixed point forces take this path.
+        int top = (int) (x >> 32);
+        if (top >= -0x10000 && top < 0x10000) {
+            float2 z = df64_fast_two_sum((float) (int) (x >> 24) * 0x1p24f, (float) (int) (x & 0xFFFFFF));
+            hi = z.x;
+            lo = z.y;
+            return;
+        }
         hi = (float) x;
         long rest = hi >= 0x1p63f ? (x - LONG_MAX) - 1 : x - (long) hi;
         lo = (float) rest;
