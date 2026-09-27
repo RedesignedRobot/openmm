@@ -138,19 +138,13 @@ void MetalCalcConstantPotentialForceKernel::initialize(const System& system, con
  * string if there is none.
  */
 static string findUnsupportedMixedOperation(const Lepton::ExpressionTreeNode& node) {
+    // Functions are matched by name: SimTKOpenMMRealType.h defines TAN, ASIN and the rest as macros, which would
+    // rewrite the Lepton::Operation names.
+    static const set<string> unsupportedFunctions = {"tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "erf", "erfc"};
     const Lepton::Operation& op = node.getOperation();
+    if (unsupportedFunctions.count(op.getName()) != 0)
+        return op.getName();
     switch (op.getId()) {
-        case Lepton::Operation::TAN:
-        case Lepton::Operation::ASIN:
-        case Lepton::Operation::ACOS:
-        case Lepton::Operation::ATAN:
-        case Lepton::Operation::ATAN2:
-        case Lepton::Operation::SINH:
-        case Lepton::Operation::COSH:
-        case Lepton::Operation::TANH:
-        case Lepton::Operation::ERF:
-        case Lepton::Operation::ERFC:
-            return op.getName();
         case Lepton::Operation::POWER:
             return "^ with a variable exponent";
         case Lepton::Operation::POWER_CONSTANT: {
