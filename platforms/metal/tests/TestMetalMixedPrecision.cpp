@@ -35,6 +35,7 @@
 #include "openmm/CustomExternalForce.h"
 #include "openmm/CustomIntegrator.h"
 #include "openmm/LangevinMiddleIntegrator.h"
+#include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/VariableVerletIntegrator.h"
 #include "openmm/VerletIntegrator.h"
@@ -366,6 +367,35 @@ void testDoublePrecisionRejected() {
     throw OpenMMException("Precision=double was accepted");
 }
 
+void testReorderWrapKeepsPositions() {
+    // Reordering moves each molecule whose center is outside the periodic box back inside.  In mixed
+    // precision that shift must keep the bits stored in posqCorrection, or every wrapped atom moves by
+    // up to half a float ulp of the box size and constraints break by about 1e-5 until the next step.
+
+    const int numParticles = 64;
+    const double width = 7.3;
+    System system;
+    system.setDefaultPeriodicBoxVectors(Vec3(width, 0, 0), Vec3(0, width, 0), Vec3(0, 0, width));
+    NonbondedForce* nonbonded = new NonbondedForce();
+    nonbonded->setNonbondedMethod(NonbondedForce::CutoffPeriodic);
+    nonbonded->setCutoffDistance(1.0);
+    system.addForce(nonbonded);
+    OpenMM_SFMT::SFMT sfmt;
+    init_gen_rand(0, sfmt);
+    vector<Vec3> positions;
+    for (int i = 0; i < numParticles; i++) {
+        system.addParticle(1.0);
+        nonbonded->addParticle(0.0, 0.3, 0.0);
+        positions.push_back(Vec3(-0.5*genrand_real2(sfmt), width+0.5*genrand_real2(sfmt), width*genrand_real2(sfmt)));
+    }
+    VerletIntegrator integrator(0.001);
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    vector<Vec3> found = context.getState(State::Positions).getPositions();
+    for (int i = 0; i < numParticles; i++)
+        ASSERT_EQUAL_VEC(positions[i], found[i], 1e-12);
+}
+
 int main(int argc, char* argv[]) {
     try {
         string precision = (argc > 1 ? argv[1] : "single");
@@ -379,6 +409,7 @@ int main(int argc, char* argv[]) {
             testIntegrationStep();
             testVariableStep();
             testExpressionConstants();
+            testReorderWrapKeepsPositions();
         }
     }
     catch(const exception& e) {
