@@ -523,6 +523,14 @@ void MetalNonbondedUtilities::setAtomBlockRange(double startFraction, double end
 }
 
 int MetalNonbondedUtilities::getMaxBitsForPairs() const {
+    // Small non-LJPME systems avoid sparse-pair atomics on Apple9 and later.
+    // Preserve the large-system policy: disabling its two-bit pair list regresses
+    // cellulose.  Older devices and double precision retain their existing policy.
+    // Zero bits shrink the worst-case list, so more systems fit the wait-free budget in
+    // initialize() and allocate every tile: growth stays under 1/256 of the unused working set.
+    if (!useLJPME && !context.getUseDoublePrecision() && context.getNumAtoms() < 100000 &&
+            context.getDevice()->supportsFamily(MTL::GPUFamilyApple9))
+        return 0;
     int maxBits = 0;
     if (canUsePairList) {
         if (context.getUseDoublePrecision()) {
