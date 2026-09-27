@@ -127,9 +127,6 @@ void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
         CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
 }
 
-// Lanes that share one atom in the reduction kernels.
-static const int REDUCE_LANES = 8;
-
 // The block-pair kernels win when the half-list launch leaves the GPU short of work, so that its tail after the last
 // atomics is exposed, and lose when the launch already fills the GPU, since they read and write one partial per atom
 // per block.  gbsa (78 blocks) has 1.27 block pairs per SIMD group of the launch on the M3 Ultra (60 cores), where
@@ -156,6 +153,8 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     partialBornSum.initialize<float>(cu, numBlocks*paddedAtoms, "partialBornSum");
     partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
     atomData.initialize<mm_float4>(cu, paddedAtoms, "gbsaAtomData");
+    blockCount.initialize<int>(cu, numBlocks, "gbsaBlockCount");
+    blockCount.upload(vector<int>(numBlocks, 0));
     map<string, string> defines;
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
@@ -168,7 +167,9 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     defines["NUM_BLOCKS"] = cu.intToString(numBlocks);
     defines["NUM_BLOCK_PAIRS"] = cu.intToString(numBlocks*(numBlocks+1)/2);
     defines["TILE_SIZE"] = "32";
-    defines["REDUCE_LANES"] = cu.intToString(REDUCE_LANES);
+    defines["OBC_ALPHA"] = "1.0f";
+    defines["OBC_BETA"] = "0.8f";
+    defines["OBC_GAMMA"] = "4.85f";
     defines["DIELECTRIC_OFFSET"] = "0.009f";
     defines["PROBE_RADIUS"] = "0.14f";
     ComputeProgram program = cu.compileProgram(MetalKernelSources::gbsaObcOwned, defines);
@@ -180,16 +181,11 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedBornSumKernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
-    ownedReduceBornSumKernel = program->createKernel("reduceBornSumOwned");
-    ownedReduceBornSumKernel->addArg(1.0f);
-    ownedReduceBornSumKernel->addArg(0.8f);
-    ownedReduceBornSumKernel->addArg(4.85f);
-    ownedReduceBornSumKernel->addArg(partialBornSum);
-    ownedReduceBornSumKernel->addArg(params);
-    ownedReduceBornSumKernel->addArg(charges);
-    ownedReduceBornSumKernel->addArg(bornRadii);
-    ownedReduceBornSumKernel->addArg(obcChain);
-    ownedReduceBornSumKernel->addArg(atomData);
+    ownedBornSumKernel->addArg(charges);
+    ownedBornSumKernel->addArg(bornRadii);
+    ownedBornSumKernel->addArg(obcChain);
+    ownedBornSumKernel->addArg(atomData);
+    ownedBornSumKernel->addArg(blockCount);
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
     ownedForce1Kernel->addArg(partialForce);
     ownedForce1Kernel->addArg(cu.getEnergyBuffer());
@@ -200,14 +196,12 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
-    ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
-    ownedReduceBornForceKernel->addArg(partialForce);
-    ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
-    ownedReduceBornForceKernel->addArg(bornForce);
-    ownedReduceBornForceKernel->addArg(cu.getEnergyBuffer());
-    ownedReduceBornForceKernel->addArg(params);
-    ownedReduceBornForceKernel->addArg(bornRadii);
-    ownedReduceBornForceKernel->addArg(obcChain);
+    ownedForce1Kernel->addArg(cu.getLongForceBuffer());
+    ownedForce1Kernel->addArg(bornForce);
+    ownedForce1Kernel->addArg(params);
+    ownedForce1Kernel->addArg(bornRadii);
+    ownedForce1Kernel->addArg(obcChain);
+    ownedForce1Kernel->addArg(blockCount);
     return true;
 }
 
@@ -226,8 +220,6 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
     setPeriodicBoxArgs(cu, ownedForce1Kernel, 5);
     ownedBornSumKernel->execute(threads, nb.getForceThreadBlockSize());
-    ownedReduceBornSumKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     ownedForce1Kernel->execute(threads, nb.getForceThreadBlockSize());
-    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     return 0.0;
 }
