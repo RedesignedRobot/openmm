@@ -45,10 +45,11 @@ public:
             CommonCalcAmoebaMultipoleForceKernel(name, platform, cu, system), cu(cu) {
     }
     /**
-     * Get whether charge spreading should be done in fixed point.
+     * Get whether charge spreading should be done in fixed point.  Float atomics add in whatever order the
+     * threads arrive, so DeterministicForces needs fixed point, as core PME does.
      */
     bool useFixedPointChargeSpreading() const {
-        return cc.getUseDoublePrecision() || !dynamic_cast<MetalContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+        return cc.getUseDoublePrecision() || !cu.getSupportsHardwareFloatGlobalAtomicAdd() || cu.getPlatformData().deterministicForces;
     }
 private:
     MetalContext& cu;
@@ -70,10 +71,11 @@ public:
      */
     void initialize(const System& system, const HippoNonbondedForce& force);
     /**
-     * Get whether charge spreading should be done in fixed point.
+     * Get whether charge spreading should be done in fixed point.  Float atomics add in whatever order the
+     * threads arrive, so DeterministicForces needs fixed point, as core PME does.
      */
     bool useFixedPointChargeSpreading() const {
-        return cc.getUseDoublePrecision() || !dynamic_cast<MetalContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+        return cc.getUseDoublePrecision() || !cu.getSupportsHardwareFloatGlobalAtomicAdd() || cu.getPlatformData().deterministicForces;
     }
     /**
      * Sort the atom grid indices.

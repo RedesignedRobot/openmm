@@ -381,7 +381,13 @@ inline df64 floor(df64 x) {
 inline df64 ceil(df64 x) { return -floor(-x); }
 
 inline df64::operator long() const thread {
+    // An out of range float to long cast saturates on the M2 but wraps modulo 2^64 on the M3 (#5434), so
+    // saturate here.  t.lo is at most half an ulp of t.hi, which keeps every cast below in range.
     df64 t = hi < 0.0f ? ceil(*this) : floor(*this);
+    if (t.hi >= 0x1p63f)
+        return t.hi == 0x1p63f && t.lo < 0.0f ? LONG_MAX + ((long) t.lo + 1) : LONG_MAX;
+    if (t.hi <= -0x1p63f)
+        return t.hi == -0x1p63f && t.lo > 0.0f ? LONG_MIN + (long) t.lo : LONG_MIN;
     return (long) t.hi + (long) t.lo;
 }
 

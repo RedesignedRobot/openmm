@@ -566,6 +566,10 @@ KERNEL void computeFixedField(
 #endif
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef USE_METAL
+                // The next step reads the entry another lane just updated.  Metal promises no lockstep.
+                SYNC_WARPS;
+#endif
             }
             SYNC_WARPS;
         }

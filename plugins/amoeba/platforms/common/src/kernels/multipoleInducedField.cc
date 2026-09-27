@@ -467,6 +467,10 @@ KERNEL void computeInducedField(
                 if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS)
                     computeOneInteraction(&data, &localData[tbx+tj], delta, false);
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef USE_METAL
+                // The next step reads the entry another lane just updated.  Metal promises no lockstep.
+                SYNC_WARPS;
+#endif
             }
             SYNC_WARPS;
         }
