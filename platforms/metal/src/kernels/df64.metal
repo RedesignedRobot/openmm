@@ -94,6 +94,10 @@ struct alignas(8) df64 {
     thread df64& operator=(const volatile threadgroup df64& o) thread { return *this = df64(o); }
     df64(const threadgroup df64& o) : hi(o.hi), lo(o.lo) {}
     df64(const volatile threadgroup df64& o) : hi(o.hi), lo(o.lo) {}
+    // Without these two, every thread temporary binds to the volatile rvalue overloads below, which spill it to the
+    // stack and read it back.
+    df64(thread df64&&) = default;
+    thread df64& operator=(thread df64&&) thread = default;
     df64(const volatile thread df64&& o) : hi(o.hi), lo(o.lo) {}
     thread df64& operator=(const volatile thread df64&& o) thread { hi = o.hi; lo = o.lo; return *this; }
     threadgroup df64& operator=(df64 v) threadgroup { hi = v.hi; lo = v.lo; return *this; }
