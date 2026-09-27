@@ -506,7 +506,7 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
         real forceX = -q*(force.x*GRID_SIZE_X*recipBoxVecX.x);
         real forceY = -q*(force.x*GRID_SIZE_X*recipBoxVecY.x+force.y*GRID_SIZE_Y*recipBoxVecY.y);
         real forceZ = -q*(force.x*GRID_SIZE_X*recipBoxVecZ.x+force.y*GRID_SIZE_Y*recipBoxVecZ.y+force.z*GRID_SIZE_Z*recipBoxVecZ.z);
-#ifdef USE_PME_STREAM
+#if defined(USE_PME_STREAM) || defined(ATOMIC_PME_FORCES)
         ATOMIC_ADD(&forceBuffers[atom], (mm_ulong) realToFixedPoint(forceX));
         ATOMIC_ADD(&forceBuffers[atom+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(forceY));
         ATOMIC_ADD(&forceBuffers[atom+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(forceZ));
