@@ -86,18 +86,19 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     ContextSelector selector(cu);
 
     // The bonded and nonbonded kernels share no written buffer except the force buffer, and both only add
-    // to it with integer atomics, so they can run side by side and still give the same bits.  A pending
-    // calcCenterOfMassMomentum joins them: it only reads the velocities, which no force kernel writes.  Each also does
+    // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
     // a plain += into the energy buffer (bonded on every step, nonbonded only with energy), and each writes
     // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
-    // boundaries on either side order them against the clear before and the readers after.
+    // boundaries on either side order them against the clear before and the readers after.  A pending
+    // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
+    // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
+        cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
-        cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
     }
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
@@ -152,7 +153,8 @@ void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionR
         totalMass += system.getParticleMass(i);
     map<string, string> defines;
     defines["INVERSE_TOTAL_MASS"] = cu.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
-    ComputeProgram program = cu.compileProgram(CommonKernelSources::removeCM, defines);
+    defines["CM_BLOCK_SIZE"] = cu.intToString(cu.getMaxThreadBlockSize());
+    ComputeProgram program = cu.compileProgram(CommonKernelSources::removeCM+MetalKernelSources::centerOfMass, defines);
     kernel1 = program->createKernel("calcCenterOfMassMomentum");
     kernel1->addArg(numAtoms);
     kernel1->addArg(cu.getVelm());
@@ -161,6 +163,11 @@ void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionR
     kernel2->addArg(numAtoms);
     kernel2->addArg(cu.getVelm());
     kernel2->addArg(cmMomentum);
+    cmVelocity.initialize<mm_float4>(cu, 1, "cmVelocity");
+    kernel3 = program->createKernel("calcCenterOfMassVelocity");
+    kernel3->addArg(numAtoms);
+    kernel3->addArg(cu.getVelm());
+    kernel3->addArg(cmVelocity);
 }
 
 void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
@@ -169,9 +176,7 @@ void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
     MetalIntegrationUtilities& integration = cu.getIntegrationUtilities();
     if (laterForcesIgnoreVelocities && integration.canRemoveCenterOfMassMomentum() &&
             dynamic_cast<LangevinMiddleIntegrator*>(&context.getIntegrator()) != NULL) {
-        // calcCenterOfMassMomentum writes one partial momentum per thread group.
-        int numGroups = min((numAtoms+63)/64, cu.getNumThreadBlocks());
-        integration.removeCenterOfMassMomentum(kernel1, cmMomentum, numGroups);
+        integration.removeCenterOfMassMomentum(kernel3, cu.getMaxThreadBlockSize(), cmVelocity);
         return;
     }
     kernel1->execute(numAtoms, 64);

@@ -4,45 +4,19 @@
  * bath, the position constraints and the final velocity correction on its atoms in registers, so the displacements
  * never pass through device memory.  Each atom sees the same operations as in integrateLangevinMiddlePart1-3.
  *
- * In single precision, when numCMGroups is nonzero, it also does removeCenterOfMassMomentum's work: it sums the
- * numCMGroups partial momenta that calcCenterOfMassMomentum wrote, in the same order that kernel does, and subtracts the
- * center of mass velocity from every atom as it loads it.  The velocities come out bitwise the same as running
- * removeCenterOfMassMomentum first, and the step saves that kernel's dispatch and its pass over velm.  This needs
- * threadgroups of 64 threads.
+ * In single precision, when removeCM is nonzero, it also does removeCenterOfMassMomentum's work: it subtracts the
+ * center of mass velocity that calcCenterOfMassVelocity wrote to cmVelocity[0] from every atom as it loads it.  That
+ * saves removeCenterOfMassMomentum's dispatch and its pass over velm.
  */
 KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
         GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT velm,
         GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
-        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int numCMGroups,
-        GLOBAL const float4* RESTRICT cmMomentum) {
+        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
+        GLOBAL const float4* RESTRICT cmVelocity) {
 #ifndef USE_MIXED_PRECISION
-    LOCAL float4 temp[64];
-    float4 cm = make_float4(0);
-    if (numCMGroups > 0) {
-        for (int index = LOCAL_ID; index < numCMGroups; index += LOCAL_SIZE)
-            cm += cmMomentum[index];
-        int thread = LOCAL_ID;
-        temp[thread] = cm;
-        SYNC_THREADS;
-        if (thread < 32)
-            temp[thread] += temp[thread+32];
-        SYNC_THREADS;
-        if (thread < 16)
-            temp[thread] += temp[thread+16];
-        SYNC_THREADS;
-        if (thread < 8)
-            temp[thread] += temp[thread+8];
-        SYNC_THREADS;
-        if (thread < 4)
-            temp[thread] += temp[thread+4];
-        SYNC_THREADS;
-        if (thread < 2)
-            temp[thread] += temp[thread+2];
-        SYNC_THREADS;
-        cm = make_float4(INVERSE_TOTAL_MASS*(temp[0].x+temp[1].x), INVERSE_TOTAL_MASS*(temp[0].y+temp[1].y), INVERSE_TOTAL_MASS*(temp[0].z+temp[1].z), 0);
-    }
+    float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
 #endif
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
@@ -76,7 +50,7 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             pos[i] = loadPos(posq, posqCorrection, atom);
             mixed4 velocity = velm[atom];
 #ifndef USE_MIXED_PRECISION
-            if (numCMGroups > 0) {
+            if (removeCM) {
                 velocity.x -= cm.x;
                 velocity.y -= cm.y;
                 velocity.z -= cm.z;
