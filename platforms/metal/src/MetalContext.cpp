@@ -559,6 +559,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
     string header = src.str();
+    // Common kernels use "thread" as a variable name, a reserved word in MSL, so the program source and its defines
+    // rename it.  That also renames the address space qualifier: program sources must write PRIVATE, never thread.
     string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
     string log;
     metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);

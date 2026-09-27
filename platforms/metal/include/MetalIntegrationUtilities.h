@@ -77,7 +77,7 @@ private:
     ComputeEvent ccmaEvent;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
-    int numLangevinMiddleUnits;
+    int numLangevinMiddleThreads;
 };
 
 } // namespace OpenMM
