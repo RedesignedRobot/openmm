@@ -251,6 +251,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     // Create data structures for the neighbor list.
 
     maxCutoff = getMaxCutoffDistance();
+    // Sub-tile masks let computeNonbonded skip the 8x4 parts of a neighbor list tile that have no atom pair within the
+    // padded cutoff.  findBlocksWithInteractions packs a 4 bit mask into each buffered atom index, so the padded atom
+    // count must fit in 27 bits.
+    useSubtiles = (useNeighborList && kernelSource == MetalKernelSources::nonbonded && !context.getUseDoublePrecision() &&
+            context.getSIMDWidth() == MetalContext::TileSize && context.getPaddedNumAtoms() < (1<<27));
     if (useCutoff) {
         // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
         // the list could ever hold fit in 1/256 of the device's unused working set, it can't overflow, and
@@ -259,7 +264,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         // make a fairly arbitrary guess, but if this turns out to be too small we'll increase it later.
 
         long long maxPossiblePairs = getMaxBitsForPairs()*(long long) MetalContext::TileSize*numTiles;
-        long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
+        long long maxListBytes = numTiles*(MetalContext::TileSize+(useSubtiles ? 2 : 1))*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
         long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
         maxTiles = 20*numAtomBlocks;
@@ -267,13 +272,16 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             maxTiles = numTiles;
         if (maxTiles < 1)
             maxTiles = 1;
-        maxSinglePairs = 5*numAtoms;
+        // Without single pairs (sub-tiles), the array is never written.
+        maxSinglePairs = (useSubtiles ? 1 : 5*numAtoms);
         if (!waitForCount && maxSinglePairs < maxPossiblePairs)
             maxSinglePairs = maxPossiblePairs;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
         numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
+        if (useSubtiles)
+            interactingMasks.initialize<unsigned int>(context, maxTiles, "interactingMasks");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
         singlePairs.initialize<int2>(context, maxSinglePairs, "singlePairs");
         int elementSize = (context.getUseDoublePrecision() ? sizeof(double) : sizeof(float));
@@ -321,6 +329,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         forceArgs.push_back(&interactingAtoms.getDevicePointer());
         forceArgs.push_back(&maxSinglePairs);
         forceArgs.push_back(&singlePairs.getDevicePointer());
+        if (useSubtiles)
+            forceArgs.push_back(&interactingMasks.getDevicePointer());
     }
     hasInitializedParams = false;
     paramStartIndex = forceArgs.size();
@@ -388,6 +398,10 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&exclusionRowIndices.getDevicePointer());
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        if (useSubtiles) {
+            subtileMaskArgIndex = findInteractingBlocksArgs.size();
+            findInteractingBlocksArgs.push_back(&interactingMasks.getDevicePointer());
+        }
         copyInteractionCountsArgs.push_back(&interactionCount.getDevicePointer());
         copyInteractionCountsArgs.push_back(&pinnedCountDeviceMemory);
     }
@@ -495,6 +509,12 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
         if (forceArgs.size() > 0)
             forceArgs[17] = &interactingAtoms.getDevicePointer();
         findInteractingBlocksArgs[7] = &interactingAtoms.getDevicePointer();
+        if (useSubtiles) {
+            interactingMasks.resize(maxTiles);
+            if (forceArgs.size() > 0)
+                forceArgs[20] = &interactingMasks.getDevicePointer();
+            findInteractingBlocksArgs[subtileMaskArgIndex] = &interactingMasks.getDevicePointer();
+        }
     }
     if (pinnedCountBuffer[1] > maxSinglePairs) {
         maxSinglePairs = (unsigned int) (1.2*pinnedCountBuffer[1]);
@@ -523,6 +543,9 @@ void MetalNonbondedUtilities::setAtomBlockRange(double startFraction, double end
 }
 
 int MetalNonbondedUtilities::getMaxBitsForPairs() const {
+    // Sub-tile masks skip the sparse parts of a tile, which is what the single pairs were for.
+    if (useSubtiles)
+        return 0;
     // Small non-LJPME systems avoid sparse-pair atomics on Apple9 and later.
     // Preserve the large-system policy: disabling its two-bit pair list regresses
     // cellulose.  Older devices and double precision retain their existing policy.
@@ -589,6 +612,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
+        if (useSubtiles)
+            defines["USE_SUBTILES"] = "1";
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
@@ -686,6 +711,24 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         load2j<<param.getType()<<" "<<param.getName()<<"2 = shfl"<<param.getName()<<";\n";
     replacements["LOAD_ATOM2_PARAMETERS"] = load2j.str();
 
+    // Macros for the 8x4 sub-tiles.  Each lane keeps the parameters of one x atom from each of the four clusters,
+    // and takes those of a y atom from the lane that loaded it.
+    stringstream loadClusters;
+    for (const ComputeParameterInfo& param : params) {
+        loadClusters<<param.getType()<<" "<<param.getName()<<"1c[4];\n";
+        for (int c = 0; c < 4; c++)
+            loadClusters<<param.getName()<<"1c["<<c<<"] = "<<loadParameter(param, "(clusterAtom+"+context.intToString(8*c)+")")<<";\n";
+    }
+    replacements["LOAD_CLUSTER_PARAMETERS"] = loadClusters.str();
+    stringstream load1c;
+    for (const ComputeParameterInfo& param : params)
+        load1c<<param.getType()<<" "<<param.getName()<<"1 = "<<param.getName()<<"1c[c];\n";
+    replacements["LOAD_ATOM1_PARAMETERS_FROM_CLUSTER"] = load1c.str();
+    stringstream load2lane;
+    for (const ComputeParameterInfo& param : params)
+        load2lane<<param.getType()<<" "<<param.getName()<<"2 = SHFL(shfl"<<param.getName()<<", srcLane);\n";
+    replacements["LOAD_ATOM2_PARAMETERS_FROM_LANE"] = load2lane.str();
+
     stringstream clearLocal;
     for (const ComputeParameterInfo& param : params) {
         clearLocal<<"shfl";
@@ -729,6 +772,8 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    if (useSubtiles)
+        defines["USE_SUBTILES"] = "1";
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";

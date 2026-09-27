@@ -313,6 +313,7 @@ private:
     MetalArray exclusionRowIndices;
     MetalArray interactingTiles;
     MetalArray interactingAtoms;
+    MetalArray interactingMasks;
     MetalArray interactionCount;
     MetalArray singlePairs;
     MetalArray singlePairCount;
@@ -340,6 +341,8 @@ private:
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams, waitForCount;
     bool useLJPME = false;
+    bool useSubtiles = false;
+    int subtileMaskArgIndex = -1;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;

@@ -80,6 +80,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, unsigned int maxTiles, const real4* __restrict__ blockCenter,
         const real4* __restrict__ blockSize, const unsigned int* __restrict__ interactingAtoms, unsigned int maxSinglePairs,
         const int2* __restrict__ singlePairs
+#ifdef USE_SUBTILES
+        , const unsigned int* __restrict__ interactingMasks
+#endif
 #endif
         PARAMETER_ARGUMENTS) {
     const unsigned int totalWarps = (blockDim.x*gridDim.x)/TILE_SIZE;
@@ -245,6 +248,145 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
     }
 
+#ifdef USE_SUBTILES
+    // Second loop: neighbor list tiles in 8x4 sub-tiles.  Bit 4*q+c of a tile's mask is set when y atoms 4q to 4q+3
+    // may be within the cutoff of x atoms 8c to 8c+7.  A step computes one sub-tile with lane tgx taking x atom 8c+t
+    // and y atom 4q+h, and sub-tiles with no bit set are skipped.  The masks are uniform across the SIMD group, so
+    // skipping never diverges.  Forces are summed in a fixed order and converted to fixed point once per tile, as
+    // in the loop below, so DeterministicForces stays bitwise.
+    const unsigned int numTiles = interactionCount[0];
+    if (numTiles > maxTiles)
+        return; // There wasn't enough memory for the neighbor list.
+    const unsigned int t = tgx&7;
+    const unsigned int h = tgx>>3;
+    mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
+    const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
+    for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
+        const int x = tiles[pos];
+        const unsigned int tileMask = interactingMasks[pos];
+        real4 blockSizeX = blockSize[x];
+        const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.z-blockSizeX.z >= MAX_CUTOFF);
+        const unsigned int clusterAtom = x*TILE_SIZE + t;
+        real4 posq1c[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++)
+            posq1c[c] = posq[clusterAtom+8*c];
+        LOAD_CLUSTER_PARAMETERS
+        unsigned int j = interactingAtoms[pos*TILE_SIZE+tgx];
+        DECLARE_LOCAL_PARAMETERS
+        real4 shflPosq;
+        if (j < PADDED_NUM_ATOMS) {
+            shflPosq = posq[j];
+            LOAD_LOCAL_PARAMETERS_FROM_GLOBAL
+        }
+        else {
+            shflPosq = make_real4(0, 0, 0, 0);
+            CLEAR_LOCAL_PARAMETERS
+        }
+#ifdef USE_PERIODIC
+        if (singlePeriodicCopy) {
+            // Translate all the atoms into a single periodic box, so the loop can skip periodic boundary conditions.
+            real4 blockCenterX = blockCenter[x];
+            #pragma unroll
+            for (int c = 0; c < 4; c++)
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1c[c], blockCenterX)
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
+        }
+#endif
+        real3 xForce[4] = {make_real3(0), make_real3(0), make_real3(0), make_real3(0)};
+        real3 yForce = make_real3(0);
+        #pragma unroll 1
+        for (unsigned int q = 0; q < 8; q++) {
+            const unsigned int quadMask = (tileMask >> (4*q)) & 15;
+            if (quadMask == 0)
+                continue;
+            const ushort srcLane = 4*q+h;
+            real4 posq2 = SHFL(shflPosq, srcLane);
+            const int atom2 = SHFL((int) j, srcLane);
+            LOAD_ATOM2_PARAMETERS_FROM_LANE
+            real3 quadForce = make_real3(0);
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if ((quadMask & (1<<c)) != 0) {
+                    const unsigned int atom1 = clusterAtom+8*c;
+                    real4 posq1 = posq1c[c];
+                    LOAD_ATOM1_PARAMETERS_FROM_CLUSTER
+                    real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+#ifdef USE_PERIODIC
+                    if (!singlePeriodicCopy)
+                        APPLY_PERIODIC_TO_DELTA(delta)
+#endif
+                    real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+                    if (r2 < MAX_CUTOFF_SQUARED) {
+                        real invR = RSQRT(r2);
+                        real r = r2*invR;
+#ifdef USE_SYMMETRIC
+                        real dEdR = 0.0f;
+#else
+                        real3 dEdR1 = make_real3(0);
+                        real3 dEdR2 = make_real3(0);
+#endif
+#ifdef USE_EXCLUSIONS
+                        bool isExcluded = !(atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+#endif
+                        real tempEnergy = 0.0f;
+                        const real interactionScale = 1.0f;
+                        COMPUTE_INTERACTION
+#ifdef INCLUDE_ENERGY
+                        energy += tempEnergy;
+#endif
+#ifdef INCLUDE_FORCES
+#ifdef USE_SYMMETRIC
+                        delta *= dEdR;
+                        xForce[c] -= delta;
+                        quadForce += delta;
+#else
+                        xForce[c] -= dEdR1;
+                        quadForce += dEdR2;
+#endif
+#endif
+                    }
+                }
+            }
+#ifdef INCLUDE_FORCES
+            // Sum over the 8 x atoms of a cluster, then give y atom 4q+h the sum from lane 8h.
+            quadForce += simd_shuffle_xor(quadForce, 1);
+            quadForce += simd_shuffle_xor(quadForce, 2);
+            quadForce += simd_shuffle_xor(quadForce, 4);
+            real3 total = SHFL(quadForce, (ushort) (8*(tgx&3)));
+            if ((tgx>>2) == q)
+                yForce = total;
+#endif
+        }
+
+        // Write results.
+#ifdef INCLUDE_FORCES
+        // Sum each cluster's force over the four y columns, leaving the force on x atom tgx in lane tgx.
+        const bool high1 = (h&2) != 0;
+        const real3 keep0 = (high1 ? xForce[2] : xForce[0]) + simd_shuffle_xor(high1 ? xForce[0] : xForce[2], 16);
+        const real3 keep1 = (high1 ? xForce[3] : xForce[1]) + simd_shuffle_xor(high1 ? xForce[1] : xForce[3], 16);
+        const bool high0 = (h&1) != 0;
+        const real3 force = (high0 ? keep1 : keep0) + simd_shuffle_xor(high0 ? keep0 : keep1, 8);
+        xForceX += realToFixedPoint(force.x);
+        xForceY += realToFixedPoint(force.y);
+        xForceZ += realToFixedPoint(force.z);
+        if (pos+1 == end || tiles[pos+1] != x) {
+            const unsigned int atom1 = x*TILE_SIZE + tgx;
+            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
+            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
+            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+            xForceX = xForceY = xForceZ = 0;
+        }
+        if (j < PADDED_NUM_ATOMS) {
+            atomicAdd(&forceBuffers[j], static_cast<unsigned long long>(realToFixedPoint(yForce.x)));
+            atomicAdd(&forceBuffers[j+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(yForce.y)));
+            atomicAdd(&forceBuffers[j+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(yForce.z)));
+        }
+#endif
+    }
+#else
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
@@ -471,6 +613,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
         }
     }
+#endif // USE_SUBTILES
 
     // Third loop: single pairs that aren't part of a tile.
 

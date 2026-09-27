@@ -204,7 +204,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
     }
 }
 
-#if MAX_BITS_FOR_PAIRS > 0
+#if MAX_BITS_FOR_PAIRS > 0 || defined(USE_SUBTILES)
 
 __device__ inline
 void collectInteractions(PRIVATE unsigned int& interacts, float d, int bit) {
@@ -241,6 +241,67 @@ void mfma4x4(const float4& pos1, const float4& pos2, const vfloat& c, unsigned i
     for (int i = 0; i < 4; i++) {
         collectInteractions(interacts, d[i], BlockId * 4 + i);
     }
+}
+
+#endif
+
+#ifdef USE_SUBTILES
+
+/**
+ * The 4 bit sub-tile mask of a y atom: bit c is set if it may interact with any of x atoms 8c to 8c+7.
+ */
+__device__ inline unsigned int clusterMask(unsigned int interacts) {
+    return ((interacts&0xFFu) != 0 ? 1 : 0) | ((interacts&0xFF00u) != 0 ? 2 : 0) |
+           ((interacts&0xFF0000u) != 0 ? 4 : 0) | ((interacts&0xFF000000u) != 0 ? 8 : 0);
+}
+
+/**
+ * Sort the first n buffer entries by their cluster masks (the low 4 bits), so the y atoms in a quad tend to share
+ * one and computeNonbonded skips more sub-tiles.  It is a stable counting sort, so the list stays deterministic.
+ */
+__device__ inline void sortByClusterMask(threadgroup int* buffer, int n, int indexInWarp, unsigned int warpMask) {
+    constexpr int rows = BUFFER_SIZE/TILE_SIZE;
+    int entry[rows];
+    int dest[rows];
+    unsigned int present = 0;
+    #pragma unroll
+    for (int r = 0; r < rows; r++) {
+        // A real entry always has a nonzero mask, so 0 marks an empty slot.
+        entry[r] = (r*TILE_SIZE+indexInWarp < n ? buffer[r*TILE_SIZE+indexInWarp] : 0);
+        present |= 1u << (entry[r]&15);
+    }
+    present = simd_or(present) & ~1u;
+    int start = 0;
+    while (present != 0) {
+        const int key = ctz(present);
+        present &= present-1;
+        #pragma unroll
+        for (int r = 0; r < rows; r++) {
+            const bool match = ((entry[r]&15) == key);
+            const unsigned int flags = BALLOT(match);
+            if (match)
+                dest[r] = start+popcount(flags&warpMask);
+            start += popcount(flags);
+        }
+    }
+    SYNC_WARPS;
+    #pragma unroll
+    for (int r = 0; r < rows; r++)
+        if ((entry[r]&15) != 0)
+            buffer[dest[r]] = entry[r];
+    SYNC_WARPS;
+}
+
+/**
+ * Store one tile of buffered entries: the atom indices, and the tile's sub-tile mask, in which bit 4*q+c is set if
+ * any of y atoms 4q to 4q+3 may interact with x cluster c.
+ */
+__device__ inline void storeSubtile(int entry, unsigned int tile, int indexInWarp, device unsigned int* interactingAtoms,
+        device unsigned int* interactingMasks) {
+    interactingAtoms[tile*TILE_SIZE+indexInWarp] = entry>>4;
+    const unsigned int mask = simd_or((unsigned int) (entry&15) << (4*(indexInWarp/4)));
+    if (indexInWarp == 0)
+        interactingMasks[tile] = mask;
 }
 
 #endif
@@ -303,7 +364,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
 #endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
-        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList
+#ifdef USE_SUBTILES
+        , unsigned int* __restrict__ interactingMasks
+#endif
+        ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
@@ -316,6 +381,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     constexpr int warpSize = 64;
 #endif
     constexpr int tilesPerWarp = warpSize/TILE_SIZE;
+#ifdef USE_SUBTILES
+    static_assert(tilesPerWarp == 1, "Sub-tile masks need one tile per SIMD group");
+#endif
     constexpr int warpsPerBlock = GROUP_SIZE/warpSize;
     const int indexInWarp = threadIdx.x%warpSize;
     const int indexInTile = threadIdx.x%TILE_SIZE;
@@ -590,13 +658,20 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 warpflags includeAtomFlags = __ballot(interactCount > MAX_BITS_FOR_PAIRS);
                 if (interactCount > MAX_BITS_FOR_PAIRS) {
                     int index = neighborsInBuffer+warpPopc(includeAtomFlags&warpMask);
+#ifdef USE_SUBTILES
+                    buffer[index] = (atom2<<4) | clusterMask(interacts);
+#else
                     buffer[index] = atom2;
+#endif
                 }
                 neighborsInBuffer += warpPopc(includeAtomFlags);
                 SYNC_WARPS;
                 if (neighborsInBuffer > BUFFER_SIZE-warpSize) {
                     // Store the new tiles to memory.
 
+#ifdef USE_SUBTILES
+                    sortByClusterMask(buffer, neighborsInBuffer, indexInWarp, warpMask);
+#endif
                     unsigned int tilesToStore = neighborsInBuffer/warpSize*tilesPerWarp;
                     unsigned int tileStartIndex = 0;
                     if (indexInWarp == 0)
@@ -605,8 +680,13 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     if (newTileStartIndex+tilesToStore <= maxTiles) {
                         if (indexInWarp < tilesToStore)
                             interactingTiles[newTileStartIndex+indexInWarp] = x;
+#ifdef USE_SUBTILES
+                        for (int j = 0; j < tilesToStore; j++)
+                            storeSubtile(buffer[j*warpSize+indexInWarp], newTileStartIndex+j, indexInWarp, interactingAtoms, interactingMasks);
+#else
                         for (int j = 0; j < tilesToStore/tilesPerWarp; j++)
                             interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = buffer[j*warpSize+indexInWarp];
+#endif
                     }
                     if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE)
                         buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
@@ -624,6 +704,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         // If we have a partially filled buffer,  store it to memory.
 
         if (neighborsInBuffer > 0) {
+#ifdef USE_SUBTILES
+            sortByClusterMask(buffer, neighborsInBuffer, indexInWarp, warpMask);
+#endif
             unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
             unsigned int tileStartIndex = 0;
             if (indexInWarp == 0)
@@ -632,10 +715,17 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             if (newTileStartIndex+tilesToStore <= maxTiles) {
                 if (indexInWarp < tilesToStore)
                     interactingTiles[newTileStartIndex+indexInWarp] = x;
+#ifdef USE_SUBTILES
+                for (int j = 0; j < tilesToStore; j++) {
+                    const int index = j*warpSize+indexInWarp;
+                    storeSubtile(index < neighborsInBuffer ? buffer[index] : PADDED_NUM_ATOMS<<4, newTileStartIndex+j, indexInWarp, interactingAtoms, interactingMasks);
+                }
+#else
                 for (int j = 0; j <= tilesToStore/tilesPerWarp; j++) {
                     if (j*warpSize+indexInWarp < tilesToStore*TILE_SIZE)
                         interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = (j*warpSize+indexInWarp < neighborsInBuffer ? buffer[j*warpSize+indexInWarp] : PADDED_NUM_ATOMS);
                 }
+#endif
             }
         }
     }
