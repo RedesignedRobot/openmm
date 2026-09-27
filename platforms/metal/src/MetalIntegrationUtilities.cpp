@@ -33,7 +33,7 @@ using namespace OpenMM;
 using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
-        ccmaConvergedMemory(NULL) {
+        ccmaConvergedMemory(NULL), pendingCMBlockSize(0), pendingCMVelocity(NULL) {
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -163,6 +163,23 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
+    return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision();
+}
+
+void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity) {
+    pendingCMCalc = calcKernel;
+    pendingCMBlockSize = blockSize;
+    pendingCMVelocity = &cmVelocity;
+}
+
+void MetalIntegrationUtilities::calcPendingCenterOfMassMomentum() {
+    if (!pendingCMCalc)
+        return;
+    pendingCMCalc->execute(pendingCMBlockSize, pendingCMBlockSize);
+    pendingCMCalc.reset();
+}
+
 bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
     if (ccmaConstraintAtoms.isInitialized() || context.getUseDoublePrecision())
         return false;
@@ -225,6 +242,8 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
             else
                 langevinMiddleKernel->addArg(nullptr);
         }
+        langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
+        langevinMiddleKernel->addArg(nullptr);
     }
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
@@ -232,6 +251,11 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         langevinMiddleKernel->setArg(4, (float) tol);
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
+    calcPendingCenterOfMassMomentum();
+    langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
+    if (pendingCMVelocity != NULL)
+        langevinMiddleKernel->setArg(19, *pendingCMVelocity);
     langevinMiddleKernel->execute(numLangevinMiddleUnits);
+    pendingCMVelocity = NULL;
     return true;
 }

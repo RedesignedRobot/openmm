@@ -96,11 +96,14 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
     // a plain += into the energy buffer (bonded on every step, nonbonded only with energy), and each writes
     // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
-    // boundaries on either side order them against the clear before and the readers after.
+    // boundaries on either side order them against the clear before and the readers after.  A pending
+    // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
+    // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
+        cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
@@ -201,6 +204,65 @@ void MetalIntegrateCustomStepKernel::initialize(const System& system, const Cust
         checkMixedPrecisionExpression(integrator.getKineticEnergyExpression(), "kinetic energy expression", functions);
     }
     CommonIntegrateCustomStepKernel::initialize(system, integrator);
+}
+
+/**
+ * Get whether a force leaves the velocities alone in updateContextState() and calcForcesAndEnergy().  Unknown forces,
+ * thermostats, barostats and forces that evaluate an inner Context count as touching them.
+ */
+static bool ignoresVelocities(const Force& force) {
+    return dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
+           dynamic_cast<const PeriodicTorsionForce*>(&force) != NULL || dynamic_cast<const RBTorsionForce*>(&force) != NULL ||
+           dynamic_cast<const CMAPTorsionForce*>(&force) != NULL || dynamic_cast<const NonbondedForce*>(&force) != NULL ||
+           dynamic_cast<const GBSAOBCForce*>(&force) != NULL || dynamic_cast<const CustomBondForce*>(&force) != NULL ||
+           dynamic_cast<const CustomAngleForce*>(&force) != NULL || dynamic_cast<const CustomTorsionForce*>(&force) != NULL ||
+           dynamic_cast<const CustomNonbondedForce*>(&force) != NULL || dynamic_cast<const CustomGBForce*>(&force) != NULL ||
+           dynamic_cast<const CustomExternalForce*>(&force) != NULL || dynamic_cast<const CustomCompoundBondForce*>(&force) != NULL;
+}
+
+void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionRemover& force) {
+    ContextSelector selector(cu);
+    int forceIndex = 0;
+    while (&system.getForce(forceIndex) != &force)
+        forceIndex++;
+    laterForcesIgnoreVelocities = true;
+    for (int i = forceIndex+1; i < system.getNumForces(); i++)
+        laterForcesIgnoreVelocities &= ignoresVelocities(system.getForce(i));
+    int numAtoms = cu.getNumAtoms();
+    cmMomentum.initialize<mm_float4>(cu, cu.getPaddedNumAtoms(), "cmMomentum");
+    double totalMass = 0.0;
+    for (int i = 0; i < numAtoms; i++)
+        totalMass += system.getParticleMass(i);
+    map<string, string> defines;
+    defines["INVERSE_TOTAL_MASS"] = cu.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
+    defines["CM_BLOCK_SIZE"] = cu.intToString(cu.getMaxThreadBlockSize());
+    ComputeProgram program = cu.compileProgram(CommonKernelSources::removeCM+MetalKernelSources::centerOfMass, defines);
+    kernel1 = program->createKernel("calcCenterOfMassMomentum");
+    kernel1->addArg(numAtoms);
+    kernel1->addArg(cu.getVelm());
+    kernel1->addArg(cmMomentum);
+    kernel2 = program->createKernel("removeCenterOfMassMomentum");
+    kernel2->addArg(numAtoms);
+    kernel2->addArg(cu.getVelm());
+    kernel2->addArg(cmMomentum);
+    cmVelocity.initialize<mm_float4>(cu, 1, "cmVelocity");
+    kernel3 = program->createKernel("calcCenterOfMassVelocity");
+    kernel3->addArg(numAtoms);
+    kernel3->addArg(cu.getVelm());
+    kernel3->addArg(cmVelocity);
+}
+
+void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
+    ContextSelector selector(cu);
+    int numAtoms = cu.getNumAtoms();
+    MetalIntegrationUtilities& integration = cu.getIntegrationUtilities();
+    if (laterForcesIgnoreVelocities && integration.canRemoveCenterOfMassMomentum() &&
+            dynamic_cast<LangevinMiddleIntegrator*>(&context.getIntegrator()) != NULL) {
+        integration.removeCenterOfMassMomentum(kernel3, cu.getMaxThreadBlockSize(), cmVelocity);
+        return;
+    }
+    kernel1->execute(numAtoms, 64);
+    kernel2->execute(numAtoms, 64);
 }
 
 void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {

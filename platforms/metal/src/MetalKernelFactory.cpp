@@ -128,7 +128,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == ApplyMonteCarloBarostatKernel::Name())
         return new CommonApplyMonteCarloBarostatKernel(name, platform, cu);
     if (name == RemoveCMMotionKernel::Name())
-        return new CommonRemoveCMMotionKernel(name, platform, cu);
+        return new MetalRemoveCMMotionKernel(name, platform, cu);
     if (name == CalcATMForceKernel::Name() )
         return new MetalCalcATMForceKernel(name, platform, cu);
     throw OpenMMException((std::string("Tried to create kernel with illegal kernel name '")+name+"'").c_str());
