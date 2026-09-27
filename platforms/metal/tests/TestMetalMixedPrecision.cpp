@@ -350,6 +350,22 @@ void testExpressionConstants() {
     ASSERT_EQUAL_VEC(velocity*0.1+Vec3(1.3, 1.3, 1.3), context.getState(State::Velocities).getVelocities()[0], 1e-12);
 }
 
+void testDoublePrecisionRejected() {
+    ASSERT(!platform.supportsDoublePrecision());
+    System system;
+    system.addParticle(1.0);
+    VerletIntegrator integrator(0.001);
+    map<string, string> properties = {{"Precision", "double"}};
+    try {
+        Context context(system, integrator, platform, properties);
+    }
+    catch (const OpenMMException& ex) {
+        ASSERT(string(ex.what()).find("Precision=double") != string::npos);
+        return;
+    }
+    throw OpenMMException("Precision=double was accepted");
+}
+
 int main(int argc, char* argv[]) {
     try {
         string precision = (argc > 1 ? argv[1] : "single");
@@ -357,6 +373,7 @@ int main(int argc, char* argv[]) {
         testMathFunctions(precision);
         testUnsupportedFunctions(precision);
         testFixedPointConversion(precision);
+        testDoublePrecisionRejected();
         if (precision == "mixed") {
             testLongConversion();
             testIntegrationStep();
