@@ -301,7 +301,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
         if (useIndirectRebuild) {
             displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
-            rebuildDispatch.initialize<unsigned int>(context, 6, "rebuildDispatch");
+            rebuildDispatch.initialize<unsigned int>(context, 3, "rebuildDispatch");
         }
         blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
         vector<unsigned int> count(2, 0);
@@ -449,13 +449,12 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (useIndirectRebuild) {
         void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
                 &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
-                &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
+                &blockCenter.getDevicePointer(), &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(),
+                &sortedBlockCenter.getDevicePointer(), &sortedBlockBoundingBox.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
         int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
         context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
-        MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
-        context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64, 0, dispatch, 0);
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch,
-                findInteractingBlocksThreadBlockSize, 0, dispatch, 3*sizeof(unsigned int));
+                findInteractingBlocksThreadBlockSize, 0, rebuildDispatch.getDevicePointer(), 0);
     }
     else {
         context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());

@@ -674,16 +674,21 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 #ifdef INDIRECT_REBUILD
 // A separate dispatch supplies the device-wide ordering between the per-tile
 // displacement test and the decision.  It runs as one threadgroup, so on rebuild
-// steps it also computes the sort keys and sorts them, with only threadgroup
-// barriers.  Keys are unique, so ranking them gives sortShortList2's order.
+// steps it also does computeSortKeys', the sort's and sortBoxData's work, with
+// only threadgroup barriers.  Keys are unique, so ranking them gives
+// sortShortList2's order.
+#ifdef USE_LARGE_BLOCKS
+#error "The indirect rebuild doesn't compute large blocks"
+#endif
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
 extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
         int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
         unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
-        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
-        unsigned int* __restrict__ dispatch) {
+        const real4* __restrict__ blockCenter, const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
+        real4* __restrict__ sortedBlockCenter, BoundingBox* __restrict__ sortedBlockBoundingBox, unsigned int* __restrict__ dispatch) {
     __shared__ unsigned int keys[NUM_BLOCKS];
+    __shared__ unsigned int sorted[NUM_BLOCKS];
     __shared__ bool anyMoved;
     if (threadIdx.x == 0)
         anyMoved = false;
@@ -703,20 +708,18 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
             interactionCount[0] = 0;
             interactionCount[1] = 0;
         }
-        else {
-            // Nothing reads this step's range.  sortBoxData resets it on rebuild steps.
+        dispatch[0] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
+        dispatch[1] = 1;
+        dispatch[2] = 1;
+    }
+    if (!rebuild) {
+        // Initialize min and max for the atomic reduction in findBlockBounds (for the next step)
+        if (threadIdx.x == 0) {
             blockSizeRange->x = 1e38;
             blockSizeRange->y = 0;
         }
-        dispatch[0] = rebuild ? (NUM_ATOMS+63)/64 : 0;
-        dispatch[3] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
-        for (int i = 0; i < 2; i++) {
-            dispatch[3*i+1] = 1;
-            dispatch[3*i+2] = 1;
-        }
-    }
-    if (!rebuild)
         return;
+    }
 
     // The same keys as computeSortKeys.
 
@@ -731,12 +734,26 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         keys[i] = (((unsigned int) bin)<<BIN_SHIFT) + i;
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+        blockSizeRange->x = 1e38;
+        blockSizeRange->y = 0;
+    }
     for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
         unsigned int key = keys[i];
         unsigned int rank = 0;
         for (unsigned int j = 0; j < NUM_BLOCKS; j++)
             rank += (keys[j] < key);
+        sorted[rank] = key;
         sortedBlocks[rank] = key;
+    }
+    __syncthreads();
+
+    // sortBoxData's work.  Only systems small enough to skip large blocks get here.
+
+    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
+        unsigned int index = sorted[i] & BLOCK_INDEX_MASK;
+        sortedBlockCenter[i] = blockCenter[index];
+        sortedBlockBoundingBox[i] = BoundingBox(trimTo3(blockBoundingBox[index]));
     }
 }
 #endif
