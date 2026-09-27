@@ -166,6 +166,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     defines["NUM_ATOMS"] = cu.intToString(cu.getNumAtoms());
     defines["PADDED_NUM_ATOMS"] = cu.intToString(paddedAtoms);
     defines["NUM_BLOCKS"] = cu.intToString(numBlocks);
+    defines["NUM_BLOCK_PAIRS"] = cu.intToString(numBlocks*(numBlocks+1)/2);
     defines["TILE_SIZE"] = "32";
     defines["REDUCE_LANES"] = cu.intToString(REDUCE_LANES);
     defines["DIELECTRIC_OFFSET"] = "0.009f";

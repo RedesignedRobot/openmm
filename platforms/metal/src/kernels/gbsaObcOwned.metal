@@ -7,9 +7,9 @@
  * kernels add the slots of each atom through 64-bit fixed point.  Integer addition is exact, so the result doesn't
  * depend on scheduling, and the pair kernels need no atomics, threadgroup memory or barriers.
  *
- * The Born sum evaluates every ordered pair (x, y): each lane owns one x atom and takes the y atoms by broadcast.
- * That costs the same arithmetic as the half-list kernel, which also evaluates both directed terms of a pair.  The
- * first force pass evaluates each unordered pair once and sends the y atoms' sums round the SIMD group.
+ * The Born sum evaluates both directed terms of every pair, as the half-list kernel does: each lane owns one atom of
+ * one block and takes the other block's atoms by broadcast.  The first force pass evaluates each unordered pair once
+ * and sends the y atoms' sums round the SIMD group.
  */
 
 #define CULL_SQUARED (CUTOFF_SQUARED*1.0001f)
@@ -30,7 +30,63 @@ DEVICE bool blocksInRange(real4 centerX, real4 sizeX, real4 centerY, real4 sizeY
 }
 
 /**
- * Compute each atom's Born sum over each block.
+ * Decode the index of an unordered block pair (x, y) with x <= y, where pairs are numbered row by row in y.
+ */
+DEVICE uint2 decodeBlockPair(unsigned int index) {
+    unsigned int y = (unsigned int) ((SQRT(8.0f*index+1.0f)-1.0f)*0.5f);
+    if (y*(y+1)/2 > index)
+        y--;
+    else if ((y+1)*(y+2)/2 <= index)
+        y++;
+    return uint2(index-y*(y+1)/2, y);
+}
+
+/**
+ * The Born sum of this lane's atom in block a over the atoms of block b.
+ */
+DEVICE real bornSumOverBlock(unsigned int a, unsigned int b, unsigned int tgx, GLOBAL const real4* RESTRICT posq,
+        GLOBAL const float2* RESTRICT global_params, real4 periodicBoxSize, real4 invPeriodicBoxSize,
+        real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ) {
+    const unsigned int atom1 = a*TILE_SIZE + tgx;
+    const real4 posq1 = posq[atom1];
+    const float2 params1 = global_params[atom1];
+    const real invRadius1 = RECIP(params1.x);
+    const real4 posqB = posq[b*TILE_SIZE + tgx];
+    const float2 paramsB = global_params[b*TILE_SIZE + tgx];
+    real bornSum = 0;
+    for (unsigned int j = 0; j < TILE_SIZE; j++) {
+        const unsigned int atom2 = b*TILE_SIZE + j;
+        const real4 posq2 = simd_broadcast(posqB, (ushort) j);
+        const float2 params2 = simd_broadcast(paramsB, (ushort) j);
+        real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+#ifdef USE_PERIODIC
+        APPLY_PERIODIC_TO_DELTA(delta)
+#endif
+        real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+        if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS && atom1 != atom2 && r2 < CUTOFF_SQUARED) {
+            real invR = RSQRT(r2);
+            real r = r2*invR;
+            real rScaledRadiusJ = r+params2.y;
+            if (params1.x < rScaledRadiusJ) {
+                real lowerLimit = max((real) params1.x, fabs(r-params2.y));
+                real invProduct = RECIP(lowerLimit*rScaledRadiusJ);
+                real l_ij = rScaledRadiusJ*invProduct;
+                real u_ij = lowerLimit*invProduct;
+                real l_ij2 = l_ij*l_ij;
+                real u_ij2 = u_ij*u_ij;
+                real ratio = LOG(u_ij*lowerLimit);
+                bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
+                                 (params2.y*params2.y*invR)*(l_ij2-u_ij2));
+                bornSum += (params1.x < params2.y-r ? 2.0f*(invRadius1-l_ij) : 0);
+            }
+        }
+    }
+    return bornSum;
+}
+
+/**
+ * Compute each atom's Born sum over each block.  A SIMD group owns an unordered block pair (x, y) and computes the
+ * sums of block x over y, then of block y over x, so the launch has half as many owners as ordered pairs.
  */
 KERNEL void computeBornSumOwned(GLOBAL real* RESTRICT partialBornSum, GLOBAL const real4* RESTRICT posq,
         GLOBAL const float2* RESTRICT global_params, real4 periodicBoxSize, real4 invPeriodicBoxSize,
@@ -38,46 +94,19 @@ KERNEL void computeBornSumOwned(GLOBAL real* RESTRICT partialBornSum, GLOBAL con
         GLOBAL const real4* RESTRICT blockSize) {
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
-    for (unsigned int owner = GLOBAL_ID/TILE_SIZE; owner < NUM_BLOCKS*NUM_BLOCKS; owner += totalWarps) {
-        const unsigned int x = owner%NUM_BLOCKS;
-        const unsigned int y = owner/NUM_BLOCKS;
-        const unsigned int atom1 = x*TILE_SIZE + tgx;
-        real bornSum = 0;
+    for (unsigned int owner = GLOBAL_ID/TILE_SIZE; owner < NUM_BLOCK_PAIRS; owner += totalWarps) {
+        const uint2 pair = decodeBlockPair(owner);
+        const unsigned int x = pair.x;
+        const unsigned int y = pair.y;
+        real sumX = 0, sumY = 0;
         if (blocksInRange(blockCenter[x], blockSize[x], blockCenter[y], blockSize[y], periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ)) {
-            const real4 posq1 = posq[atom1];
-            const float2 params1 = global_params[atom1];
-            const real invRadius1 = RECIP(params1.x);
-            const real4 posqY = posq[y*TILE_SIZE + tgx];
-            const float2 paramsY = global_params[y*TILE_SIZE + tgx];
-            for (unsigned int j = 0; j < TILE_SIZE; j++) {
-                const unsigned int atom2 = y*TILE_SIZE + j;
-                const real4 posq2 = simd_broadcast(posqY, (ushort) j);
-                const float2 params2 = simd_broadcast(paramsY, (ushort) j);
-                real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
-#ifdef USE_PERIODIC
-                APPLY_PERIODIC_TO_DELTA(delta)
-#endif
-                real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
-                if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS && atom1 != atom2 && r2 < CUTOFF_SQUARED) {
-                    real invR = RSQRT(r2);
-                    real r = r2*invR;
-                    real rScaledRadiusJ = r+params2.y;
-                    if (params1.x < rScaledRadiusJ) {
-                        real lowerLimit = max((real) params1.x, fabs(r-params2.y));
-                        real invProduct = RECIP(lowerLimit*rScaledRadiusJ);
-                        real l_ij = rScaledRadiusJ*invProduct;
-                        real u_ij = lowerLimit*invProduct;
-                        real l_ij2 = l_ij*l_ij;
-                        real u_ij2 = u_ij*u_ij;
-                        real ratio = LOG(u_ij*lowerLimit);
-                        bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                         (params2.y*params2.y*invR)*(l_ij2-u_ij2));
-                        bornSum += (params1.x < params2.y-r ? 2.0f*(invRadius1-l_ij) : 0);
-                    }
-                }
-            }
+            sumX = bornSumOverBlock(x, y, tgx, posq, global_params, periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ);
+            if (x != y)
+                sumY = bornSumOverBlock(y, x, tgx, posq, global_params, periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ);
         }
-        partialBornSum[y*PADDED_NUM_ATOMS + atom1] = bornSum;
+        partialBornSum[y*PADDED_NUM_ATOMS + x*TILE_SIZE + tgx] = sumX;
+        if (x != y)
+            partialBornSum[x*PADDED_NUM_ATOMS + y*TILE_SIZE + tgx] = sumY;
     }
 }
 
@@ -115,11 +144,10 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
     mixed energy = 0;
-    for (unsigned int owner = GLOBAL_ID/TILE_SIZE; owner < NUM_BLOCKS*NUM_BLOCKS; owner += totalWarps) {
-        const unsigned int x = owner%NUM_BLOCKS;
-        const unsigned int y = owner/NUM_BLOCKS;
-        if (y < x)
-            continue;
+    for (unsigned int owner = GLOBAL_ID/TILE_SIZE; owner < NUM_BLOCK_PAIRS; owner += totalWarps) {
+        const uint2 pair = decodeBlockPair(owner);
+        const unsigned int x = pair.x;
+        const unsigned int y = pair.y;
         const unsigned int atom1 = x*TILE_SIZE + tgx;
         const unsigned int atomY = y*TILE_SIZE + tgx;
         real4 force = make_real4(0);
