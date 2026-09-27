@@ -40,6 +40,7 @@
 #include "openmm/VerletIntegrator.h"
 #include "sfmt/SFMT.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <iostream>
 
@@ -47,6 +48,16 @@ using namespace OpenMM;
 using namespace std;
 
 static MetalPlatform platform;
+
+static long long saturateToLong(double x) {
+    if (isnan(x))
+        return 0;
+    if (x >= 0x1p63)
+        return LLONG_MAX;
+    if (x <= -0x1p63)
+        return LLONG_MIN;
+    return (long long) x;
+}
 
 void testMathFunctions(const string& precision) {
     System system;
@@ -128,8 +139,11 @@ KERNEL void convert(GLOBAL mixed* values, GLOBAL mm_long* results, int numValues
 }
 )";
 
+    // Values from 2^63 up are out of range and must saturate, as they do on the M2.  The M3 wraps a plain
+    // cast modulo 2^64 (#5434).
     vector<double> exact = {0.0, 0.75, 1.5, 3.0-pow(2.0, -30), pow(2.0, 24)-0.5, pow(2.0, 31)+0.25, pow(2.0, 40)+0.75,
-            1234.5*pow(2.0, 32), pow(2.0, 52)-0.5, pow(2.0, 53)-1, pow(2.0, 53)+2, pow(2.0, 62)+pow(2.0, 40)};
+            1234.5*pow(2.0, 32), pow(2.0, 52)-0.5, pow(2.0, 53)-1, pow(2.0, 53)+2, pow(2.0, 62)+pow(2.0, 40),
+            pow(2.0, 63)-1024, pow(2.0, 63)-pow(2.0, 40), pow(2.0, 63), pow(2.0, 63)+pow(2.0, 41), pow(2.0, 64), pow(2.0, 100)};
     vector<double> values;
     for (double x : exact) {
         values.push_back(x);
@@ -140,6 +154,8 @@ KERNEL void convert(GLOBAL mixed* values, GLOBAL mm_long* results, int numValues
     init_gen_rand(0, sfmt);
     for (int i = 0; i < 1000; i++)
         values.push_back((genrand_real2(sfmt) < 0.5 ? -1 : 1)*(1+genrand_real2(sfmt))*pow(2.0, 61*genrand_real2(sfmt)));
+    for (double x : {1e30, -1e30, (double) INFINITY, (double) -INFINITY, (double) NAN})
+        values.push_back(x);
     int numValues = values.size();
 
     MetalArray valuesArray, resultsArray;
@@ -160,10 +176,56 @@ KERNEL void convert(GLOBAL mixed* values, GLOBAL mm_long* results, int numValues
         if (i < numExact) {
             ASSERT_EQUAL(values[i], stored[i]);
         }
-        else {
+        else if (isfinite(values[i])) {
             ASSERT_EQUAL_TOL(values[i], stored[i], 1e-14);
         }
-        ASSERT_EQUAL((long long) stored[i], results[i]);
+        ASSERT_EQUAL(saturateToLong(stored[i]), results[i]);
+    }
+}
+
+void testFixedPointConversion(const string& precision) {
+    // The minimizer finds forces too large for fixed point by looking for values beyond 2^62, so
+    // realToFixedPoint() has to saturate on every chip.
+
+    System system;
+    system.addParticle(1.0);
+    MetalPlatform::PlatformData platformData(NULL, system, "", "true", precision, "false", platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()), "false", "false", 1, NULL);
+    MetalContext& context = *platformData.contexts[0];
+    const string source = R"(
+KERNEL void convert(GLOBAL const float* values, GLOBAL mm_long* results, int numValues) {
+    for (int i = GLOBAL_ID; i < numValues; i += GLOBAL_SIZE)
+        results[i] = realToFixedPoint(values[i]);
+}
+)";
+    vector<float> values;
+    for (float x : {0.0f, 0.75f, 1.5f, 1234.5678f, 0x1p31f-128, 0x1p31f, 0x1p40f, 1e30f, INFINITY}) {
+        values.push_back(x);
+        values.push_back(-x);
+    }
+    int numValues = values.size();
+    MetalArray valuesArray, resultsArray;
+    valuesArray.initialize<float>(context, numValues, "values");
+    resultsArray.initialize<long long>(context, numValues, "results");
+    valuesArray.upload(values);
+    ComputeKernel kernel = context.compileProgram(source)->createKernel("convert");
+    kernel->addArg(valuesArray);
+    kernel->addArg(resultsArray);
+    kernel->addArg(numValues);
+    kernel->execute(numValues);
+    vector<long long> results;
+    resultsArray.download(results);
+    const long long limit = 0x4000000000000000LL;
+    for (int i = 0; i < numValues; i++) {
+        double scaled = values[i]*0x1p32;
+        if (fabs(scaled) < 0x1p63) {
+            ASSERT_EQUAL((long long) scaled, results[i]);
+        }
+        else if (scaled > 0) {
+            ASSERT(results[i] > limit);
+        }
+        else {
+            ASSERT(results[i] < -limit);
+        }
     }
 }
 
@@ -294,6 +356,7 @@ int main(int argc, char* argv[]) {
         platform.setPropertyDefaultValue("Precision", precision);
         testMathFunctions(precision);
         testUnsupportedFunctions(precision);
+        testFixedPointConversion(precision);
         if (precision == "mixed") {
             testLongConversion();
             testIntegrationStep();
