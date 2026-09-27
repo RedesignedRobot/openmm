@@ -76,7 +76,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == CalcCustomNonbondedForceKernel::Name())
         return new CommonCalcCustomNonbondedForceKernel(name, platform, cu, context.getSystem());
     if (name == CalcGBSAOBCForceKernel::Name())
-        return new CommonCalcGBSAOBCForceKernel(name, platform, cu);
+        return new MetalCalcGBSAOBCForceKernel(name, platform, cu);
     if (name == CalcCustomGBForceKernel::Name())
         return new CommonCalcCustomGBForceKernel(name, platform, cu, context.getSystem());
     if (name == CalcCustomExternalForceKernel::Name())
