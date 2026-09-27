@@ -103,6 +103,10 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
     if (includeEnergy)
         sum += cu.reduceEnergy();
+    // Without a neighbor list nothing else inside step() commits, and the GPU would sit idle until the host
+    // next waits for a result.
+    if (!cu.getNonbondedUtilities().getUseNeighborList())
+        cu.getCurrentStream().commit();
     if (!cu.getForcesValid())
         valid = false;
     return sum;

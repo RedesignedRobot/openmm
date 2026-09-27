@@ -101,12 +101,13 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
 void testCommitsPerStep() {
     // Each step is submitted once.  With a neighbor list, the buffer holds the neighbor list and the
     // force kernels, and is submitted before the host waits for the interaction count, if it has to.
-    // The rest of the step goes with the next step's neighbor list.
+    // The rest of the step goes with the next step's neighbor list.  Without one, the step is submitted
+    // after the forces, so the GPU doesn't wait for the host to ask for a result.
 
     double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
     double pme = measureCommitsPerStep(NonbondedForce::PME);
     cout << "Commits per step: NoCutoff " << noCutoff << ", PME " << pme << endl;
-    ASSERT(noCutoff <= 1.1);
+    ASSERT(noCutoff >= 0.9 && noCutoff <= 1.1);
     ASSERT(pme <= 1.1);
 }
 

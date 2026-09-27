@@ -135,6 +135,12 @@ public:
         return useCutoff;
     }
     /**
+     * Get whether a neighbor list is being used.  computeInteractions() commits the queue each step when it is.
+     */
+    bool getUseNeighborList() {
+        return useNeighborList;
+    }
+    /**
      * Get whether periodic boundary conditions are being used.
      */
     bool getUsePeriodic() {
