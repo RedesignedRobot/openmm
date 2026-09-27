@@ -622,6 +622,19 @@ public:
      */
     virtual void flushQueue() = 0;
     /**
+     * Get whether addForcePassKernel() defers kernels.  A kernel given to it must add to the force buffers only with
+     * integer atomics, since it may run at the same time as the bonded and nonbonded kernels.
+     */
+    virtual bool getSupportsForcePassKernels() const {
+        return false;
+    }
+    /**
+     * Run a kernel in the pass that computes bonded and nonbonded forces instead of now, on platforms where
+     * getSupportsForcePassKernels() returns true.
+     */
+    virtual void addForcePassKernel(ComputeKernel kernel, int workUnits) {
+    }
+    /**
      * Register a global parameter whose value should be stored in the array returned by
      * getGlobalParamValues().  This may safely be called multiple times with the same
      * parameter name, and it returns the same index each time.

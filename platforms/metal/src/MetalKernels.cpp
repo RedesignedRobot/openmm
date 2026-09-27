@@ -97,11 +97,14 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
     // a plain += into the energy buffer (bonded on every step, nonbonded only with energy), and each writes
     // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
-    // boundaries on either side order them against the clear before and the readers after.
+    // boundaries on either side order them against the clear before and the readers after.  Force pass
+    // kernels (PME interpolation) also add to the force buffer only with integer atomics and write nothing
+    // else.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
+        cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }

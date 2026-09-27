@@ -833,3 +833,13 @@ double MetalContext::reduceEnergy() {
 void MetalContext::flushQueue() {
     getCurrentStream().commit();
 }
+
+bool MetalContext::getSupportsForcePassKernels() const {
+    return device->supportsFamily(MTL::GPUFamilyApple9);
+}
+
+void MetalContext::executeForcePassKernels() {
+    for (auto& kernel : forcePassKernels)
+        kernel.first->execute(kernel.second);
+    forcePassKernels.clear();
+}

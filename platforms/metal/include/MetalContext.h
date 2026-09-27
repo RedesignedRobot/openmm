@@ -485,6 +485,22 @@ public:
      * expense of reduced simulation performance.
      */
     void flushQueue();
+    /**
+     * Get whether addForcePassKernel() defers kernels.  Only Apple9 does: the M3 Ultra has idle cores during the
+     * tail of the nonbonded kernel, and Apple8 was never measured.
+     */
+    bool getSupportsForcePassKernels() const;
+    /**
+     * Run a kernel at the start of the next force pass (MetalCalcForcesAndEnergyKernel::finishComputation).  It
+     * must add to the force buffers only with integer atomics.
+     */
+    void addForcePassKernel(ComputeKernel kernel, int workUnits) {
+        forcePassKernels.push_back(std::make_pair(kernel, workUnits));
+    }
+    /**
+     * Execute the kernels given to addForcePassKernel() since the last call, in order.
+     */
+    void executeForcePassKernels();
 private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
@@ -512,6 +528,7 @@ private:
     int sharedMemPerBlock;
     bool supportsHardwareFloatGlobalAtomicAdd;
     bool useBlockingSync, contextIsValid;
+    std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
