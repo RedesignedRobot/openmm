@@ -214,10 +214,8 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
         useDoublePrecision = false;
         useMixedPrecision = true;
     }
-    else if (precision == "double") {
-        useDoublePrecision = true;
-        useMixedPrecision = false;
-    }
+    else if (precision == "double")
+        throw OpenMMException("The Metal platform does not support Precision=double, because Apple GPUs have no 64-bit floating point.  Use single or mixed.");
     else
         throw OpenMMException("Illegal value for Precision: "+precision);
 #ifdef WIN32
