@@ -30,6 +30,8 @@
 
 #include "openmm/common/FFT3D.h"
 #include "openmm/common/ArrayInterface.h"
+#include "openmm/common/ComputeKernel.h"
+#include <vector>
 
 namespace OpenMM {
 
@@ -80,15 +82,33 @@ public:
      */
     void execFFT(ArrayInterface& in, ArrayInterface& out, bool forward=true);
     /**
+     * Perform the PME reciprocal space convolution in three kernels on Apple GPU family 9 and later in single and
+     * mixed precision, when the grid's y-z and x-z planes fit in threadgroup memory and each size has no prime
+     * factor above 7.  Otherwise return false.  See FFT3DImpl::execPmeConvolution().
+     */
+    bool execPmeConvolution(ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX, ArrayInterface& moduliY,
+            ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor);
+    /**
+     * Get whether execPmeConvolution() can run for a real-to-complex transform of this size.
+     */
+    static bool canUsePmeConvolution(MetalContext& context, int xsize, int ysize, int zsize);
+    /**
      * Get the smallest legal size for a dimension of the grid (that is, a size with no prime
      * factors other than 2, 3, 5, 7, 11, 13).  VkFFT supports arbitrary sizes but they may work
      * slower.
      *
-     * @param minimum   the minimum size the return value must be greater than or equal to
+     * @param minimum    the minimum size the return value must be greater than or equal to
+     * @param maxFactor  the largest prime factor to allow
      */
-    static int findLegalDimension(int minimum);
+    static int findLegalDimension(int minimum, int maxFactor=13);
 private:
+    void createPmeConvolution();
     MetalContext& context;
+    int xsize, ysize, zsize;
+    bool usePmeConvolution;
+    std::vector<int> radicesX, radicesY, radicesZ;
+    ComputeKernel planesForwardKernel, convolveLinesKernel, planesInverseKernel;
+    MetalArray rootsX, rootsY, rootsZ;
     MTL::Buffer* inputBuffer;
     MTL::Buffer* outputBuffer;
     uint64_t inputBufferSize;

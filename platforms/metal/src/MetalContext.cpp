@@ -723,7 +723,13 @@ FFT3D MetalContext::createFFT(int xsize, int ysize, int zsize, bool realToComple
 }
 
 int MetalContext::findLegalFFTDimension(int minimum) {
-    return MetalFFT3D::findLegalDimension(minimum);
+    // MetalFFT3D's PME convolution kernels take 30% longer at 55^3 than at 56^3 because of the radix 11 stages, so a
+    // size those kernels would run on a cubic grid avoids the factors 11 and 13.
+    int size = MetalFFT3D::findLegalDimension(minimum);
+    int smooth = MetalFFT3D::findLegalDimension(minimum, 7);
+    if (smooth != size && MetalFFT3D::canUsePmeConvolution(*this, smooth, smooth, smooth))
+        return smooth;
+    return size;
 }
 
 ComputeProgram MetalContext::compileProgram(const std::string source, const std::map<std::string, std::string>& defines) {
