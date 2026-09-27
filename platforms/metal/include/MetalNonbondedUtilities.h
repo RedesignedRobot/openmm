@@ -284,7 +284,9 @@ public:
      * @param includeForces whether this kernel should compute forces
      * @param includeEnergy whether this kernel should compute potential energy
      */
-    metalFunction_t createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy);
+    metalFunction_t createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy, const std::string& kernelTemplate = "");
+    /** Evaluate a separately emitted 16x32 list. The ordinary list stays intact. */
+    void computeCompactInteractions(int groups, MetalArray& tiles, MetalArray& atoms, MetalArray& counts);
     /**
      * Create the set of kernels that will be needed for a particular combination of force groups.
      *
@@ -356,6 +358,7 @@ public:
     bool hasForces;
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
+    metalFunction_t compactForceKernel = NULL;
     metalFunction_t findBlockBoundsKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;

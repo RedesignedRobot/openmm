@@ -620,7 +620,7 @@ static string loadParameter(const ComputeParameterInfo& param, const string& ind
     return "make_"+param.getType()+"("+array+"[3*"+index+"], "+array+"[3*"+index+"+1], "+array+"[3*"+index+"+2])";
 }
 
-metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
+metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy, const string& kernelTemplate) {
     map<string, string> replacements;
     replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
@@ -761,11 +761,32 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     int endExclusionIndex = (context.getContextIndex()+1)*numExclusionTiles/numContexts;
     defines["FIRST_EXCLUSION_TILE"] = context.intToString(startExclusionIndex);
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
-    metalModule_t program = context.createModule(MetalKernelSources::vectorOps+context.replaceStrings(kernelSource, replacements), defines);
+    metalModule_t program = context.createModule(MetalKernelSources::vectorOps+context.replaceStrings(kernelTemplate.empty() ? kernelSource : kernelTemplate, replacements), defines);
     metalFunction_t kernel = context.getKernel(program, "computeNonbonded");
     return kernel;
 }
 
 void MetalNonbondedUtilities::setKernelSource(const string& source) {
     kernelSource = source;
+}
+
+void MetalNonbondedUtilities::computeCompactInteractions(int groups, MetalArray& tiles, MetalArray& atoms, MetalArray& counts) {
+    if (!useNeighborList || kernelSource != MetalKernelSources::nonbonded || groupKernels.find(groups) == groupKernels.end())
+        throw OpenMMException("Compact replay requires an initialized default neighbor-list kernel");
+    KernelSet& kernels = groupKernels[groups];
+    if (kernels.compactForceKernel == NULL) {
+        map<string, string> replacement;
+        replacement["NB16_NEIGHBOR_LOOP"] = MetalKernelSources::nonbonded16;
+        string source = "#define USE_NB16 1\n"+context.replaceStrings(kernelSource, replacement);
+        kernels.compactForceKernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, groups, true, false, source);
+    }
+    if (!hasInitializedParams)
+        initParamArgs();
+    vector<void*> args = forceArgs;
+    unsigned int capacity = tiles.getSize();
+    args[7] = &tiles.getDevicePointer();
+    args[8] = &counts.getDevicePointer();
+    args[14] = &capacity;
+    args[17] = &atoms.getDevicePointer();
+    context.executeKernelFlat(kernels.compactForceKernel, &args[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
 }

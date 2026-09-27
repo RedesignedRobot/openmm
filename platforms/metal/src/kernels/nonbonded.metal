@@ -245,6 +245,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
     }
 
+#ifdef USE_NB16
+    NB16_NEIGHBOR_LOOP
+#else
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
@@ -472,6 +475,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         }
     }
 
+#endif
     // Third loop: single pairs that aren't part of a tile.
 
 #if USE_NEIGHBOR_LIST
