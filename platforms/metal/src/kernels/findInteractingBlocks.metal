@@ -666,15 +666,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 }
 
 extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict__ interactionCount,
-        unsigned int* __restrict__ pinnedInteractionCount
-#ifdef INDIRECT_REBUILD
-        , real2* __restrict__ blockSizeRange
-#endif
-        ) {
-#ifdef INDIRECT_REBUILD
-    blockSizeRange->x = 1e38;
-    blockSizeRange->y = 0;
-#endif
+        unsigned int* __restrict__ pinnedInteractionCount) {
     pinnedInteractionCount[0] = interactionCount[0];
     pinnedInteractionCount[1] = interactionCount[1];
 }
@@ -682,18 +674,28 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 #ifdef INDIRECT_REBUILD
 // A separate dispatch supplies the device-wide ordering between the per-tile
 // displacement test and the decision. No threadgroup waits for another group.
+// It also does copyInteractionCounts' work for steps where the host doesn't wait
+// for the count, so those steps skip that dispatch.
 extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
         int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
+        unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
         unsigned int* __restrict__ dispatch) {
     bool moved = false;
     for (int i = threadIdx.x; i < NUM_BLOCKS; i += 32)
         moved = moved || displacementFlags[i] != 0;
     bool rebuild = simd_any(moved);
     if (threadIdx.x == 0) {
+        pinnedInteractionCount[0] = interactionCount[0];
+        pinnedInteractionCount[1] = interactionCount[1];
         rebuildNeighborList[0] = rebuild;
         if (rebuild) {
             interactionCount[0] = 0;
             interactionCount[1] = 0;
+        }
+        else {
+            // computeSortKeys won't read this step's range.  sortBoxData resets it on rebuild steps.
+            blockSizeRange->x = 1e38;
+            blockSizeRange->y = 0;
         }
         dispatch[0] = rebuild ? (NUM_BLOCKS+63)/64 : 0;
         dispatch[3] = rebuild ? (NUM_BLOCKS*32+SORT_BLOCK_SIZE-1)/SORT_BLOCK_SIZE : 0;

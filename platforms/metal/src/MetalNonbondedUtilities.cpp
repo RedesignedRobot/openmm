@@ -411,8 +411,6 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
         copyInteractionCountsArgs.push_back(&interactionCount.getDevicePointer());
         copyInteractionCountsArgs.push_back(&pinnedCountDeviceMemory);
-        if (useIndirectRebuild)
-            copyInteractionCountsArgs.push_back(&blockSizeRange.getDevicePointer());
     }
 }
 
@@ -450,7 +448,8 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
     if (useIndirectRebuild) {
         void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
-                &interactionCount.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
+                &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
+                &rebuildDispatch.getDevicePointer()};
         context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, 32, 32);
         MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
         context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks(), 64, 0, dispatch, 0);
@@ -466,10 +465,14 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     }
     forceRebuildNeighborList = false;
-    context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
+    // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
+    // which is all a step without the wait needs.
+    bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+    if (wait || !useIndirectRebuild)
+        context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
-    if (waitForCount || context.getStepsSinceReorder() == 0)
+    if (wait)
         downloadCountEvent->signal();
 }
 
