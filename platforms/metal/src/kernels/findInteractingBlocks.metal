@@ -649,6 +649,8 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 // displacement test and the decision.  It runs as one threadgroup, so on rebuild
 // steps it also computes the sort keys and sorts them, with only threadgroup
 // barriers.  Keys are unique, so ranking them gives sortShortList2's order.
+// Above 1024 blocks (SORT_BLOCKS_BY_BINS) the keys don't fit one threadgroup, and
+// it sizes the bin sort's three dispatches instead.
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
 extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
@@ -656,7 +658,9 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
         const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
         unsigned int* __restrict__ dispatch) {
+#ifndef SORT_BLOCKS_BY_BINS
     __shared__ unsigned int keys[NUM_BLOCKS];
+#endif
     __shared__ bool anyMoved;
     if (threadIdx.x == 0)
         anyMoved = false;
@@ -683,11 +687,19 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         }
         dispatch[0] = rebuild ? (NUM_ATOMS+63)/64 : 0;
         dispatch[3] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
+#ifdef SORT_BLOCKS_BY_BINS
+        // countBlockBins and scatterBlocks, then sumBlockBins.
+        dispatch[6] = rebuild ? (NUM_BLOCKS+BIN_SORT_GROUP-1)/BIN_SORT_GROUP : 0;
+        dispatch[9] = rebuild ? 1 : 0;
+        for (int i = 0; i < 4; i++) {
+#else
         for (int i = 0; i < 2; i++) {
+#endif
             dispatch[3*i+1] = 1;
             dispatch[3*i+2] = 1;
         }
     }
+#ifndef SORT_BLOCKS_BY_BINS
     if (!rebuild)
         return;
 
@@ -711,5 +723,85 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
             rank += (keys[j] < key);
         sortedBlocks[rank] = key;
     }
+#endif
 }
+
+#ifdef SORT_BLOCKS_BY_BINS
+/**
+ * A stable counting sort over computeSortKeys' 20 size bins, for block counts too large for
+ * prepareRebuildDispatch.  Inside a bin, blocks stay in index order, which is the order of sorting
+ * computeSortKeys' keys, so the neighbor list and its tile orientation are unchanged.  countBlockBins
+ * ranks each block inside its threadgroup's share of its bin, sumBlockBins turns the per-threadgroup
+ * counts into offsets, and scatterBlocks writes the keys.  Adapted from the dual neighbor list's
+ * dualSortLocal, dualSortOffsets and dualSortScatter (r3/duallist 5ec392b34).
+ */
+extern "C" __global__ void countBlockBins(const real4* __restrict__ blockBoundingBox, const real2* __restrict__ blockSizeRange,
+        unsigned int* __restrict__ binRanks, unsigned int* __restrict__ binCounts) {
+    __shared__ unsigned int warpCounts[(BIN_SORT_GROUP/32)*NUM_SIZE_BINS];
+    const int lane = threadIdx.x%32;
+    const int warp = threadIdx.x/32;
+    const unsigned int index = blockIdx.x*BIN_SORT_GROUP+threadIdx.x;
+    int bin = -1;
+    if (index < NUM_BLOCKS) {
+        real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
+        real scale = NUM_SIZE_BINS/(sizeRange.y-sizeRange.x);
+        real4 box = blockBoundingBox[index];
+        real size = LOG(box.x+box.y+box.z);
+        bin = (size-sizeRange.x)*scale;
+        bin = max(0, min(bin, NUM_SIZE_BINS-1));
+    }
+    unsigned int rank = 0;
+    for (int b = 0; b < NUM_SIZE_BINS; b++) {
+        unsigned int bits = BALLOT(bin == b);
+        if (bin == b)
+            rank = __popc(bits & ((1u<<lane)-1));
+        if (lane == 0)
+            warpCounts[warp*NUM_SIZE_BINS+b] = __popc(bits);
+    }
+    SYNC_THREADS;
+    if (bin >= 0) {
+        for (int w = 0; w < warp; w++)
+            rank += warpCounts[w*NUM_SIZE_BINS+bin];
+        binRanks[index] = (bin<<8) | rank;
+    }
+    if (threadIdx.x < NUM_SIZE_BINS) {
+        unsigned int count = 0;
+        for (int w = 0; w < BIN_SORT_GROUP/32; w++)
+            count += warpCounts[w*NUM_SIZE_BINS+threadIdx.x];
+        binCounts[blockIdx.x*NUM_SIZE_BINS+threadIdx.x] = count;
+    }
+}
+
+extern "C" __global__ void sumBlockBins(const unsigned int* __restrict__ binCounts, unsigned int* __restrict__ binOffsets) {
+    __shared__ unsigned int totals[NUM_SIZE_BINS];
+    const int bin = threadIdx.x;
+    const int groups = (NUM_BLOCKS+BIN_SORT_GROUP-1)/BIN_SORT_GROUP;
+    if (bin < NUM_SIZE_BINS) {
+        unsigned int total = 0;
+        for (int g = 0; g < groups; g++)
+            total += binCounts[g*NUM_SIZE_BINS+bin];
+        totals[bin] = total;
+    }
+    SYNC_THREADS;
+    if (bin < NUM_SIZE_BINS) {
+        unsigned int offset = 0;
+        for (int b = 0; b < bin; b++)
+            offset += totals[b];
+        for (int g = 0; g < groups; g++) {
+            binOffsets[g*NUM_SIZE_BINS+bin] = offset;
+            offset += binCounts[g*NUM_SIZE_BINS+bin];
+        }
+    }
+}
+
+extern "C" __global__ void scatterBlocks(const unsigned int* __restrict__ binRanks, const unsigned int* __restrict__ binOffsets,
+        unsigned int* __restrict__ sortedBlocks) {
+    const unsigned int index = blockIdx.x*BIN_SORT_GROUP+threadIdx.x;
+    if (index < NUM_BLOCKS) {
+        unsigned int bin = binRanks[index]>>8;
+        unsigned int rank = binRanks[index]&255;
+        sortedBlocks[binOffsets[blockIdx.x*NUM_SIZE_BINS+bin]+rank] = (bin<<BIN_SHIFT) + index;
+    }
+}
+#endif
 #endif
