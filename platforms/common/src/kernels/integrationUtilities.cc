@@ -69,10 +69,24 @@ KERNEL void generateRandomNumbers(int numValues, GLOBAL float4* RESTRICT random,
 }
 
 /**
+ * Metal emulates mixed precision with pairs of floats, which makes every mixed operation several times the cost of
+ * a real one.  There the constraint kernels evaluate residuals in mixed precision but compute the corrections in
+ * real precision, and iterate until the residuals meet the tolerance.
+ */
+#if defined(USE_METAL) && defined(USE_MIXED_PRECISION)
+#define EMULATED_MIXED_PRECISION
+#endif
+
+/**
  * Load the position of a particle.
  */
 inline DEVICE mixed4 loadPos(GLOBAL const real4* RESTRICT posq, GLOBAL const real4* RESTRICT posqCorrection, int index) {
-#ifdef USE_MIXED_PRECISION
+#if defined(EMULATED_MIXED_PRECISION)
+    // A mixed coordinate is a pair of floats: posq holds the high word and posqCorrection the low word.
+    real4 pos1 = posq[index];
+    real4 pos2 = posqCorrection[index];
+    return make_mixed4(mixed(pos1.x, pos2.x), mixed(pos1.y, pos2.y), mixed(pos1.z, pos2.z), pos1.w);
+#elif defined(USE_MIXED_PRECISION)
     real4 pos1 = posq[index];
     real4 pos2 = posqCorrection[index];
     return make_mixed4(pos1.x+(mixed)pos2.x, pos1.y+(mixed)pos2.y, pos1.z+(mixed)pos2.z, pos1.w);
@@ -85,22 +99,16 @@ inline DEVICE mixed4 loadPos(GLOBAL const real4* RESTRICT posq, GLOBAL const rea
  * Store the position of a particle.
  */
 inline DEVICE void storePos(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, int index, mixed4 pos) {
-#ifdef USE_MIXED_PRECISION
+#if defined(EMULATED_MIXED_PRECISION)
+    posq[index] = make_real4(pos.x.hi, pos.y.hi, pos.z.hi, (real) pos.w);
+    posqCorrection[index] = make_real4(pos.x.lo, pos.y.lo, pos.z.lo, 0);
+#elif defined(USE_MIXED_PRECISION)
     posq[index] = make_real4((real) pos.x, (real) pos.y, (real) pos.z, (real) pos.w);
     posqCorrection[index] = make_real4(pos.x-(real) pos.x, pos.y-(real) pos.y, pos.z-(real) pos.z, 0);
 #else
     posq[index] = pos;
 #endif
 }
-
-/**
- * Metal emulates mixed precision with pairs of floats, which makes every mixed operation several times the cost of
- * a real one.  There the constraint kernels evaluate residuals in mixed precision but compute the corrections in
- * real precision, and iterate until the residuals meet the tolerance.
- */
-#if defined(USE_METAL) && defined(USE_MIXED_PRECISION)
-#define EMULATED_MIXED_PRECISION
-#endif
 
 /**
  * Load the positions of the atoms in a SHAKE cluster at the start of the step, and their displacements or velocities.
