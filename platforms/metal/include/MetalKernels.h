@@ -34,6 +34,7 @@
 #include "openmm/common/CommonKernels.h"
 #include "openmm/common/CommonCalcNonbondedForce.h"
 #include "openmm/common/CommonCalcConstantPotentialForce.h"
+#include "openmm/common/CommonIntegrateCustomStepKernel.h"
 #include "openmm/common/ComputeSort.h"
 #include "openmm/common/FFT3D.h"
 
@@ -131,6 +132,20 @@ public:
     }
 private:
     void integrate(double tol);
+    MetalContext& cu;
+};
+
+/**
+ * This kernel is invoked by CustomIntegrator to take one time step.  In mixed precision it refuses, when the
+ * Context is created, per-DOF expressions that use an operation with no double-single implementation.
+ */
+class MetalIntegrateCustomStepKernel : public CommonIntegrateCustomStepKernel {
+public:
+    MetalIntegrateCustomStepKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonIntegrateCustomStepKernel(name, platform, cu), cu(cu) {
+    }
+    void initialize(const System& system, const CustomIntegrator& integrator);
+private:
     MetalContext& cu;
 };
 
