@@ -4,7 +4,7 @@ enum {VelScale, NoiseScale, MaxParams};
  * Perform the first part of integration: velocity step.
  */
 
-KERNEL void integrateLangevinMiddlePart1(int numAtoms, int paddedNumAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
+KERNEL void integrateLangevinMiddlePart1(int numAtoms, int paddedNumAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
         GLOBAL const mixed2* RESTRICT dt) {
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     for (int index = GLOBAL_ID; index < numAtoms; index += GLOBAL_SIZE) {
@@ -23,7 +23,7 @@ KERNEL void integrateLangevinMiddlePart1(int numAtoms, int paddedNumAtoms, GLOBA
  * then another position half step.
  */
 
-KERNEL void integrateLangevinMiddlePart2(int numAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL mixed4* RESTRICT posDelta,
+KERNEL void integrateLangevinMiddlePart2(int numAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed4s* RESTRICT posDelta,
         GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt, GLOBAL const float4* RESTRICT random, unsigned int randomIndex
         ) {
     mixed vscale = paramBuffer[VelScale];
@@ -54,8 +54,8 @@ KERNEL void integrateLangevinMiddlePart2(int numAtoms, GLOBAL mixed4* RESTRICT v
  * the constrained positions.
  */
 
-KERNEL void integrateLangevinMiddlePart3(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4* RESTRICT velm,
-         GLOBAL mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
+KERNEL void integrateLangevinMiddlePart3(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4s* RESTRICT velm,
+         GLOBAL mixed4s* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif
@@ -94,7 +94,7 @@ KERNEL void integrateLangevinMiddlePart3(int numAtoms, GLOBAL real4* RESTRICT po
  */
 
 KERNEL void selectLangevinStepSize(int numAtoms, int paddedNumAtoms, mixed maxStepSize, mixed errorTol, mixed friction, mixed kT, GLOBAL mixed2* RESTRICT dt,
-        GLOBAL const mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed* RESTRICT paramBuffer) {
+        GLOBAL const mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed* RESTRICT paramBuffer) {
     // Calculate the error.
 
     LOCAL mixed error[256];

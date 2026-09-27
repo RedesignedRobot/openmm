@@ -5,7 +5,7 @@ KERNEL void copyState(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT innerP
 #ifdef USE_MIXED_PRECISION
         GLOBAL real4* RESTRICT posqCorrection, GLOBAL real4* RESTRICT innerPosqCorrection,
 #endif
-        GLOBAL mixed4* RESTRICT velm, GLOBAL mixed4* RESTRICT innerVelm, GLOBAL int* RESTRICT atomOrder, GLOBAL int* RESTRICT innerInvAtomOrder, int numAtoms) {
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed4s* RESTRICT innerVelm, GLOBAL int* RESTRICT atomOrder, GLOBAL int* RESTRICT innerInvAtomOrder, int numAtoms) {
     for (int i = GLOBAL_ID; i < numAtoms; i += GLOBAL_SIZE) {
         int index = innerInvAtomOrder[atomOrder[i]];
         real4 p = posq[i];

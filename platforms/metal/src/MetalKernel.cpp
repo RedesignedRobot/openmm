@@ -32,7 +32,8 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalKernel::MetalKernel(MetalContext& context, metalFunction_t kernel, const string& name) : context(context), kernel(kernel), name(name) {
+MetalKernel::MetalKernel(MetalContext& context, metalFunction_t kernel, const string& name) : context(context), kernel(kernel), name(name),
+        layouts(context.getArgumentLayouts(kernel)) {
 }
 
 string MetalKernel::getName() const {
@@ -47,8 +48,13 @@ void MetalKernel::execute(int threads, int blockSize) {
     int numArgs = arrayArgs.size();
     argPointers.resize(numArgs);
     for (int i = 0; i < numArgs; i++) {
-        if (arrayArgs[i] != NULL)
+        if (arrayArgs[i] != NULL) {
             argPointers[i] = &arrayArgs[i]->getDevicePointer();
+            MetalContext::BufferLayout layout = (i < layouts.size() ? layouts[i] : MetalContext::PlainLayout);
+            if (layout != MetalContext::AnyLayout && arrayArgs[i]->getPairStorage() != (layout == MetalContext::PairLayout))
+                throw OpenMMException("Kernel "+name+" argument "+to_string(i)+": array "+arrayArgs[i]->getName()+
+                        (arrayArgs[i]->getPairStorage() ? " stores float pairs, but the argument isn't mixed4s" : " doesn't store float pairs, but the argument is mixed4s"));
+        }
         else
             argPointers[i] = &primitiveArgs[i];
     }

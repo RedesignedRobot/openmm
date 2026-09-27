@@ -3,7 +3,7 @@
  * step.
  */
 inline void kickAtom(int atom, GLOBAL const real4* RESTRICT posq, GLOBAL const real4* RESTRICT posqCorrection,
-        GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms, mixed fscale,
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms, mixed fscale,
         int removeCM, float4 cm, PRIVATE mixed4& pos, PRIVATE mixed4& vel) {
     pos = loadPos(posq, posqCorrection, atom);
     vel = velm[atom];
@@ -40,7 +40,7 @@ inline void bathAtom(int atom, GLOBAL const float4* RESTRICT random, unsigned in
  * Correct an atom's velocity for the constraints and record its new position.
  */
 inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection,
-        GLOBAL mixed4* RESTRICT velm, mixed invDt, mixed4 pos, mixed4 vel, mixed4 delta, mixed4 oldDelta) {
+        GLOBAL mixed4s* RESTRICT velm, mixed invDt, mixed4 pos, mixed4 vel, mixed4 delta, mixed4 oldDelta) {
     vel.x += (delta.x-oldDelta.x)*invDt;
     vel.y += (delta.y-oldDelta.y)*invDt;
     vel.z += (delta.z-oldDelta.z)*invDt;
@@ -62,7 +62,7 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
  * saves removeCenterOfMassMomentum's dispatch and its pass over velm.
  */
 KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
-        GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT velm,
+        GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT velm,
         GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
@@ -132,7 +132,7 @@ inline mixed4 laneElement(PRIVATE const mixed4* values, int lane) {
  * its own atom's result.  Each atom sees the same operations as in integrateLangevinMiddleFused.
  */
 KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
-        GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT velm,
+        GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT velm,
         GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,

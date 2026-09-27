@@ -106,6 +106,7 @@ private:
     std::vector<double4> primitiveArgs;
     std::vector<MetalArray*> arrayArgs;
     std::vector<void*> argPointers;
+    const std::vector<MetalContext::BufferLayout>& layouts;
 };
 
 } // namespace OpenMM
