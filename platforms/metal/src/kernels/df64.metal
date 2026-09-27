@@ -250,19 +250,26 @@ inline uint2 df64_to_ieee(df64 v) {
 inline df64 operator-(df64 a) { return df64(-a.hi, -a.lo); }
 inline df64 operator+(df64 a) { return a; }
 
+// An overflowed sum or product returns inf with a zero low part; unguarded, the two-sum makes it NaN.  A program whose
+// mixed values stay finite defines DF64_FINITE to drop these guards: finite results are unchanged, and the guards cost
+// about a fifth of the fused Langevin kernel, whose SHAKE sweeps are a serial chain of these operators.
+#ifdef DF64_FINITE
+#define DF64_GUARD_OVERFLOW(v)
+#else
+#define DF64_GUARD_OVERFLOW(v) if (!isfinite(v)) return df64(v, 0.0f);
+#endif
+
 // One rounding joins the low parts instead of a second two-sum, so the error is about 2^-47 of |x|+|y|.
 inline df64 operator+(df64 x, df64 y) {
     float2 s = df64_two_sum(x.hi, y.hi);
-    if (!isfinite(s.x))
-        return df64(s.x, 0.0f);
+    DF64_GUARD_OVERFLOW(s.x)
     float2 z = df64_fast_two_sum(s.x, s.y + (x.lo + y.lo));
     return df64(z.x, z.y);
 }
 
 inline df64 operator+(df64 x, float y) {
     float2 s = df64_two_sum(x.hi, y);
-    if (!isfinite(s.x))
-        return df64(s.x, 0.0f);
+    DF64_GUARD_OVERFLOW(s.x)
     float2 z = df64_fast_two_sum(s.x, x.lo + s.y);
     return df64(z.x, z.y);
 }
@@ -272,16 +279,14 @@ inline df64 operator-(df64 x, float y) { return x + (-y); }
 
 inline df64 operator*(df64 x, df64 y) {
     float2 c = df64_two_prod(x.hi, y.hi);
-    if (!isfinite(c.x))
-        return df64(c.x, 0.0f);
+    DF64_GUARD_OVERFLOW(c.x)
     float2 z = df64_fast_two_sum(c.x, c.y + fma(x.lo, y.hi, x.hi * y.lo));
     return df64(z.x, z.y);
 }
 
 inline df64 operator*(df64 x, float y) {
     float2 c = df64_two_prod(x.hi, y);
-    if (!isfinite(c.x))
-        return df64(c.x, 0.0f);
+    DF64_GUARD_OVERFLOW(c.x)
     float2 z = df64_fast_two_sum(c.x, fma(x.lo, y, c.y));
     return df64(z.x, z.y);
 }

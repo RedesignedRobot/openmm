@@ -515,8 +515,12 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << endl;
     src << "#include <metal_stdlib>\n";
     src << "using namespace metal;\n";
-    if (useMixedPrecision)
+    if (useMixedPrecision) {
+        // The program's own defines come after this header, too late for df64 to see.
+        if (defines.find("DF64_FINITE") != defines.end())
+            src << "#define DF64_FINITE\n";
         src << MetalKernelSources::df64 << endl;
+    }
     if (useDoublePrecision) {
         src << "typedef double real;\n";
         src << "typedef double2 real2;\n";
