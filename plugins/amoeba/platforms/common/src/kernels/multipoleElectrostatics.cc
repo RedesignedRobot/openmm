@@ -469,6 +469,10 @@ KERNEL void computeElectrostatics(
                     computeOneInteraction(&data, &localData[tbx+tj], true, d, p, m, 1, &energy);
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef USE_METAL
+                // The next step reads the entry another lane just updated.  Metal promises no lockstep.
+                SYNC_WARPS;
+#endif
             }
             data.force *= -ENERGY_SCALE_FACTOR;
             data.torque *= ENERGY_SCALE_FACTOR;
