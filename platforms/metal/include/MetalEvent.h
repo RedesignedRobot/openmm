@@ -63,6 +63,7 @@ public:
      */
     void queueWait(ComputeQueue queue);
 private:
+    void checkBufferStatus();
     MetalContext& context;
     MTL::SharedEvent* event;
     MTL::CommandBuffer* buffer;

@@ -59,18 +59,28 @@ void MetalEvent::signal() {
 void MetalEvent::wait() {
     // Waiting on the command buffer instead of the event delays the start of the next command buffer
     // by about 40 us on the M3 Ultra.  The status check returns if the buffer fails before the signal.
-    if (buffer != NULL)
+    if (buffer != NULL) {
         while (!event->waitUntilSignaledValue(value, 100) && buffer->status() < MTL::CommandBufferStatusCompleted)
             ;
+        checkBufferStatus();
+    }
 }
 
 void MetalEvent::poll() {
     // On the M3 Ultra, waitUntilSignaledValue() wakes the host 90 to 110 us after the signal, and a 10 us
     // poll within about 22 us.  The fence orders the host's reads of GPU results after the signal.
-    if (buffer != NULL)
+    if (buffer != NULL) {
         while (event->signaledValue() < value && buffer->status() < MTL::CommandBufferStatusCompleted)
             usleep(10);
+        checkBufferStatus();
+    }
     std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+void MetalEvent::checkBufferStatus() {
+    // A failed buffer can stop before its signal, so the host must not go on to read the results it waited for.
+    if (buffer->status() == MTL::CommandBufferStatusError)
+        throw OpenMMException("Error executing METAL command buffer: "+std::string(buffer->error()->localizedDescription()->utf8String()));
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
