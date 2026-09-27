@@ -32,9 +32,12 @@
 namespace OpenMM {
 
 /**
- * This class evaluates each force's terms in chunks of one threadgroup, and sums the chunk's forces on
- * each atom in threadgroup memory before adding them to the force buffer.  That takes one atomic add per
- * atom and component for each chunk, instead of one for every term that touches the atom.
+ * This class gives each threadgroup a block of contiguous atoms to own.  The threadgroup evaluates every
+ * term of every force that touches one of its atoms, sums the forces on its own atoms in threadgroup
+ * memory as 64-bit fixed point, and adds each atom's total to the force buffer once.  A term that touches
+ * several blocks is evaluated once in each, and only its home block (the block of its first atom) counts
+ * its energy.  So each atom takes one atomic add per component, instead of one for every term that
+ * touches it.
  */
 
 class OPENMM_EXPORT_COMMON MetalBondedUtilities : public BondedUtilities {
@@ -48,10 +51,12 @@ public:
 protected:
     std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
 private:
+    std::string createBlockSource(int forceIndex, int numAtoms, int group, const std::string& computeForce);
     ComputeArray plan;
     std::string planArgument;
-    std::vector<int> entryStartOffset, entryOffset, slotOffset;
-    int firstChunkedForce, maxChunkedAtoms;
+    std::vector<int> blockStartOffset, termOffset;
+    std::vector<std::string> blockSource;
+    int blockSize, numBlocks, lastBlockForce;
 };
 
 } // namespace OpenMM
