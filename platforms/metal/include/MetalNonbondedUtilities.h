@@ -334,6 +334,13 @@ private:
     MetalArray rebuildNeighborList;
     MetalArray displacementFlags, rebuildDispatch;
     bool useIndirectRebuild;
+    // The outer list contains packed rows without sparse pairs.  Each builder warp
+    // owns one linked row; pruning repacks that row into the public active list.
+    MetalArray outerTiles, outerAtoms, outerCount, outerNext, outerHeads;
+    MetalArray innerPositions, listDisplacements, rebuildOuterList, outerBox;
+    MetalArray sortRanks, sortCounts, sortOffsets;
+    bool useDualList = false;
+    std::vector<void*> prepareDualListArgs, pruneListArgs, dualSortLocalArgs, dualSortOffsetsArgs, dualSortScatterArgs;
     ComputeSort blockSorter;
     std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
@@ -370,6 +377,7 @@ public:
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;
     metalFunction_t copyInteractionCountsKernel;
+    metalFunction_t prepareDualListKernel, pruneListKernel, dualSortLocalKernel, dualSortOffsetsKernel, dualSortScatterKernel;
 };
 
 } // namespace OpenMM

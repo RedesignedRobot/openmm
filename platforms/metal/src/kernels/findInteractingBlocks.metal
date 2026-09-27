@@ -45,6 +45,10 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
 #ifdef INDIRECT_REBUILD
         , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
 #endif
+#ifdef DUAL_LIST
+        , const real4* __restrict__ outerPositions, const real4* __restrict__ innerPositions,
+        unsigned int* __restrict__ displacements, bool forceRebuild
+#endif
         ) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
     const int tileInGroup = threadIdx.x/TILE_SIZE;
@@ -62,6 +66,21 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
     bool tileMoved = simd_any(moved);
     if (indexInTile == 0 && validBlock)
         displacementFlags[index] = tileMoved;
+#endif
+#ifdef DUAL_LIST
+    unsigned int moved = forceRebuild ? 3 : 0;
+    if (!forceRebuild && base+indexInTile < numAtoms) {
+        real4 delta = tPos-outerPositions[base+indexInTile];
+        if (dot(delta.xyz, delta.xyz) > 0.25f*PADDING*PADDING)
+            moved |= 1;
+        delta = tPos-innerPositions[base+indexInTile];
+        if (dot(delta.xyz, delta.xyz) > 0.25f*INNER_PADDING*INNER_PADDING)
+            moved |= 2;
+    }
+    unsigned int outerMoved = BALLOT((moved&1) != 0);
+    unsigned int innerMoved = BALLOT((moved&2) != 0);
+    if (indexInTile == 0 && validBlock)
+        displacements[index] = (outerMoved ? 1 : 0) | (innerMoved ? 2 : 0);
 #endif
     real4 pos = make_real4(tPos.x, tPos.y, tPos.z, 0);
 #ifdef USE_PERIODIC
@@ -83,17 +102,17 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
 #endif
     real tcenter = simd_max(delta.x*delta.x+delta.y*delta.y+delta.z*delta.z);
 
-    // Record the range of sizes.
-
+    if (indexInTile == 0 && validBlock) {
+        center.w = SQRT(tcenter);
+        blockBoundingBox[index] = blockSize;
+        blockCenter[index] = center;
+    }
+#ifndef DUAL_LIST
+    // The dual path computes the size range in prepareDualList only when its outer list rebuilds.
     __shared__ real groupMinSize[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
     __shared__ real groupMaxSize[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
     if (indexInTile == 0) {
         real totalSize = blockSize.x+blockSize.y+blockSize.z;
-        if (validBlock) {
-            center.w = SQRT(tcenter);
-            blockBoundingBox[index] = blockSize;
-            blockCenter[index] = center;
-        }
         groupMinSize[tileInGroup] = (validBlock && totalSize > 0 ? totalSize : 1e38f);
         groupMaxSize[tileInGroup] = (validBlock ? totalSize : 0.0f);
     }
@@ -111,6 +130,7 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
     }
     if (blockIdx.x == 0 && threadIdx.x == 0)
         rebuildNeighborList[0] = 0;
+#endif
 }
 
 extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks, const real2* __restrict__ blockSizeRange/*, int numSizes*/) {
@@ -142,6 +162,10 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
         unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild,
         real2* __restrict__ blockSizeRange) {
+#ifdef DUAL_LIST
+    if (rebuildNeighborList[0] == 0)
+        return;
+#endif
     int i = threadIdx.x+blockIdx.x*blockDim.x;
     if (i < NUM_BLOCKS) {
         unsigned int index = sortedBlocks[i] & BLOCK_INDEX_MASK;
@@ -170,6 +194,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
 #endif
     }
 
+#ifndef DUAL_LIST
     // Initialize min and max for the atomic reduction in findBlockBounds (for the next step)
     if (i == 0) {
         blockSizeRange->x = 1e38;
@@ -191,6 +216,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         interactionCount[0] = 0;
         interactionCount[1] = 0;
     }
+#endif
 #endif
 }
 
@@ -293,7 +319,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
 #endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
-        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList
+#ifdef DUAL_LIST
+        , int* __restrict__ outerHeads, int* __restrict__ outerNext
+#endif
+        ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
@@ -326,6 +356,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 
     // Loop over blocks.
 
+#ifdef DUAL_LIST
+    int previousTile = -1;
+    if (indexInWarp == 0 && warpIndex < numBlocks*NUM_TILES_IN_BATCH)
+        outerHeads[warpIndex] = -1;
+#endif
     int block1 = startBlockIndex+warpIndex/NUM_TILES_IN_BATCH;
     if (block1 < startBlockIndex+numBlocks) {
         // Load data for this block.  Note that all threads in a warp are processing the same block.
@@ -593,6 +628,17 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
                     unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
                     if (newTileStartIndex+tilesToStore <= maxTiles) {
+#ifdef DUAL_LIST
+                        if (indexInWarp == 0) {
+                            if (previousTile < 0)
+                                outerHeads[warpIndex] = newTileStartIndex;
+                            else
+                                outerNext[previousTile] = newTileStartIndex;
+                        }
+                        if (indexInWarp < tilesToStore)
+                            outerNext[newTileStartIndex+indexInWarp] = (indexInWarp+1 < tilesToStore ? newTileStartIndex+indexInWarp+1 : -1);
+                        previousTile = newTileStartIndex+tilesToStore-1;
+#endif
                         if (indexInWarp < tilesToStore)
                             interactingTiles[newTileStartIndex+indexInWarp] = x;
                         for (int j = 0; j < tilesToStore/tilesPerWarp; j++)
@@ -620,6 +666,16 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
             unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
             if (newTileStartIndex+tilesToStore <= maxTiles) {
+#ifdef DUAL_LIST
+                if (indexInWarp == 0) {
+                    if (previousTile < 0)
+                        outerHeads[warpIndex] = newTileStartIndex;
+                    else
+                        outerNext[previousTile] = newTileStartIndex;
+                }
+                if (indexInWarp < tilesToStore)
+                    outerNext[newTileStartIndex+indexInWarp] = (indexInWarp+1 < tilesToStore ? newTileStartIndex+indexInWarp+1 : -1);
+#endif
                 if (indexInWarp < tilesToStore)
                     interactingTiles[newTileStartIndex+indexInWarp] = x;
                 for (int j = 0; j <= tilesToStore/tilesPerWarp; j++) {
@@ -639,8 +695,16 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 }
 
 extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict__ interactionCount,
-        unsigned int* __restrict__ pinnedInteractionCount) {
+        unsigned int* __restrict__ pinnedInteractionCount
+#ifdef DUAL_LIST
+        , const unsigned int* __restrict__ outerCount
+#endif
+        ) {
+#ifdef DUAL_LIST
+    pinnedInteractionCount[0] = max(interactionCount[0], outerCount[0]);
+#else
     pinnedInteractionCount[0] = interactionCount[0];
+#endif
     pinnedInteractionCount[1] = interactionCount[1];
 }
 
@@ -710,6 +774,287 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         for (unsigned int j = 0; j < NUM_BLOCKS; j++)
             rank += (keys[j] < key);
         sortedBlocks[rank] = key;
+    }
+}
+#endif
+
+#ifdef DUAL_LIST
+/**
+ * Reduce displacement flags in one threadgroup.  The block count is unrestricted:
+ * each thread consumes a strided part of the array.  The following dispatches see
+ * both the flags and count resets without cross-threadgroup synchronization.
+ */
+extern "C" __global__ void prepareDualList(const unsigned int* __restrict__ displacements,
+        int* __restrict__ rebuildOuter, int* __restrict__ rebuildInner,
+        unsigned int* __restrict__ outerCount, unsigned int* __restrict__ innerCount,
+        real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        real4* __restrict__ oldBox, bool forceRebuild, const real4* __restrict__ blockBoundingBox,
+        real2* __restrict__ blockSizeRange) {
+    __shared__ unsigned int flags[256];
+    unsigned int moved = forceRebuild ? 3 : 0;
+    for (int i = threadIdx.x; i < NUM_BLOCKS; i += 256)
+        moved |= displacements[i];
+#ifdef USE_PERIODIC
+    if (!forceRebuild && (any(oldBox[0] != periodicBoxVecX) || any(oldBox[1] != periodicBoxVecY) || any(oldBox[2] != periodicBoxVecZ)))
+        moved |= 3;
+#endif
+    flags[threadIdx.x] = moved;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            flags[threadIdx.x] |= flags[threadIdx.x+stride];
+        __syncthreads();
+    }
+    // The original sort bins use the current global range of block sizes.
+    // Compute it only on outer rebuilds, without contended device atomics.
+    __shared__ real minimum[256], maximum[256];
+    if (flags[0]&1) {
+        real lo = 1e38, hi = 0;
+        for (int i = threadIdx.x; i < NUM_BLOCKS; i += 256) {
+            real4 box = blockBoundingBox[i];
+            real size = box.x+box.y+box.z;
+            if (size > 0)
+                lo = min(lo, size);
+            hi = max(hi, size);
+        }
+        minimum[threadIdx.x] = lo;
+        maximum[threadIdx.x] = hi;
+        __syncthreads();
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                minimum[threadIdx.x] = min(minimum[threadIdx.x], minimum[threadIdx.x+stride]);
+                maximum[threadIdx.x] = max(maximum[threadIdx.x], maximum[threadIdx.x+stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+            blockSizeRange[0] = make_real2(minimum[0], maximum[0]);
+    }
+    if (threadIdx.x == 0) {
+        moved = flags[0];
+        rebuildOuter[0] = (moved&1) != 0;
+        rebuildInner[0] = moved != 0;
+        if (moved&1) {
+            outerCount[0] = outerCount[1] = 0;
+            oldBox[0] = periodicBoxVecX;
+            oldBox[1] = periodicBoxVecY;
+            oldBox[2] = periodicBoxVecZ;
+        }
+        if (moved)
+            innerCount[0] = innerCount[1] = 0;
+    }
+}
+
+// Stable counting sort for the same (size bin, original block) key used by
+// computeSortKeys.  Three dispatches suffice for any number of blocks, and all
+// three return on the GPU when the outer list is still valid.
+extern "C" __global__ void dualSortLocal(const int* __restrict__ rebuildOuter,
+        const real4* __restrict__ boxes, const real2* __restrict__ range,
+        unsigned int* __restrict__ ranks, unsigned int* __restrict__ counts) {
+    if (!rebuildOuter[0])
+        return;
+    const int lane = threadIdx.x%32;
+    const int warp = threadIdx.x/32;
+    const int index = blockIdx.x*256+threadIdx.x;
+    __shared__ unsigned int warpCounts[8*20];
+    int bin = -1;
+    if (index < NUM_BLOCKS) {
+        real4 box = boxes[index];
+        real lo = LOG(range->x), hi = LOG(range->y);
+        real scale = 20/(hi-lo);
+        bin = (LOG(box.x+box.y+box.z)-lo)*scale;
+        bin = max(0, min(bin, 19));
+    }
+    unsigned int rank = 0;
+    for (int b = 0; b < 20; b++) {
+        unsigned int bits = BALLOT(bin == b);
+        if (bin == b)
+            rank = __popc(bits & ((1u << lane)-1));
+        if (lane == 0)
+            warpCounts[warp*20+b] = __popc(bits);
+    }
+    __syncthreads();
+    if (index < NUM_BLOCKS) {
+        for (int w = 0; w < warp; w++)
+            rank += warpCounts[w*20+bin];
+        ranks[index] = (bin << 8) | rank;
+    }
+    if (threadIdx.x < 20) {
+        unsigned int count = 0;
+        for (int w = 0; w < 8; w++)
+            count += warpCounts[w*20+threadIdx.x];
+        counts[blockIdx.x*20+threadIdx.x] = count;
+    }
+}
+
+extern "C" __global__ void dualSortOffsets(const int* __restrict__ rebuildOuter,
+        const unsigned int* __restrict__ counts, unsigned int* __restrict__ offsets) {
+    if (!rebuildOuter[0])
+        return;
+    __shared__ unsigned int totals[20];
+    const int bin = threadIdx.x;
+    const int groups = (NUM_BLOCKS+255)/256;
+    unsigned int total = 0;
+    if (bin < 20) {
+        for (int g = 0; g < groups; g++)
+            total += counts[g*20+bin];
+        totals[bin] = total;
+    }
+    SYNC_WARPS;
+    if (bin < 20) {
+        unsigned int offset = 0;
+        for (int b = 0; b < bin; b++)
+            offset += totals[b];
+        for (int g = 0; g < groups; g++) {
+            offsets[g*20+bin] = offset;
+            offset += counts[g*20+bin];
+        }
+    }
+}
+
+extern "C" __global__ void dualSortScatter(const int* __restrict__ rebuildOuter,
+        const unsigned int* __restrict__ ranks, const unsigned int* __restrict__ offsets,
+        unsigned int* __restrict__ sortedBlocks) {
+    if (!rebuildOuter[0])
+        return;
+    const int index = blockIdx.x*256+threadIdx.x;
+    if (index < NUM_BLOCKS) {
+        unsigned int bin = ranks[index] >> 8;
+        unsigned int rank = ranks[index] & 255;
+        sortedBlocks[offsets[blockIdx.x*20+bin]+rank] = (bin << BIN_SHIFT) | index;
+    }
+}
+
+/**
+ * Prune every row when the inner displacement bound expires, and after every
+ * outer rebuild.  Compact across the entire row, not just inside each old tile,
+ * so rejecting y atoms does not leave mostly empty force tiles.  Exclusion tiles
+ * never enter the outer list and continue through the original force path.
+ */
+extern "C" __global__ void pruneNeighborList(real4 periodicBoxSize, real4 invPeriodicBoxSize,
+        real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        const real4* __restrict__ posq, const real4* __restrict__ blockCenter,
+        const real4* __restrict__ blockBoundingBox, const int* __restrict__ outerTiles,
+        const unsigned int* __restrict__ outerAtoms, const unsigned int* __restrict__ outerCount,
+        const int* __restrict__ outerHeads, const int* __restrict__ outerNext,
+        int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
+        int2* __restrict__ singlePairs, unsigned int* __restrict__ interactionCount,
+        unsigned int maxTiles, unsigned int maxSinglePairs, const int* __restrict__ rebuildInner,
+        real4* __restrict__ innerPositions) {
+    if (rebuildInner[0] == 0)
+        return;
+    const int lane = threadIdx.x;
+    const int row = blockIdx.x;
+    int atom = row*TILE_SIZE+lane;
+    if (atom < NUM_ATOMS)
+        innerPositions[atom] = posq[atom];
+    if (outerCount[0] > maxTiles) {
+        // Preserve the existing overflow protocol: invalidate forces on the host,
+        // grow both list levels, then retry the force evaluation.
+        if (row == 0 && lane == 0)
+            interactionCount[0] = outerCount[0];
+        return;
+    }
+    int tile = outerHeads[row];
+    if (tile < 0)
+        return;
+    const int x = outerTiles[tile];
+    const real4 center = blockCenter[x];
+    const real4 size = blockBoundingBox[x];
+    __shared__ real4 xPositions[TILE_SIZE];
+    __shared__ unsigned int buffer[2*TILE_SIZE];
+    real4 pos1 = posq[x*TILE_SIZE+lane];
+#ifdef USE_PERIODIC
+    const real cutoff = SQRT(INNER_CUTOFF_SQUARED);
+    const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-size.x >= cutoff &&
+                                    0.5f*periodicBoxSize.y-size.y >= cutoff &&
+                                    0.5f*periodicBoxSize.z-size.z >= cutoff);
+    if (singlePeriodicCopy) {
+        APPLY_PERIODIC_TO_POS_WITH_CENTER(pos1, center)
+    }
+#endif
+    xPositions[lane] = pos1;
+    int buffered = 0;
+    SYNC_WARPS;
+    while (tile >= 0) {
+        unsigned int atom2 = outerAtoms[tile*TILE_SIZE+lane];
+        unsigned int mask = 0;
+        if (atom2 < NUM_ATOMS) {
+            real4 pos2 = posq[atom2];
+#ifdef USE_PERIODIC
+            if (singlePeriodicCopy) {
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(pos2, center)
+            }
+#endif
+            #pragma unroll
+            for (int j = 0; j < TILE_SIZE; j++) {
+                real4 delta = pos2-xPositions[j];
+#ifdef USE_PERIODIC
+                if (!singlePeriodicCopy) {
+                    APPLY_PERIODIC_TO_DELTA(delta)
+                }
+#endif
+                if (x*TILE_SIZE+j < NUM_ATOMS && dot(delta.xyz, delta.xyz) < INNER_CUTOFF_SQUARED)
+                    mask |= 1u << j;
+            }
+        }
+        unsigned int count = __popc(mask);
+#if INNER_MAX_BITS > 0
+        bool sparse = count > 0 && count <= INNER_MAX_BITS;
+        if (BALLOT(sparse)) {
+            unsigned int sum = 0, offset = 0;
+            for (int n = 1; n <= INNER_MAX_BITS; n++) {
+                unsigned int bits = BALLOT(count == n);
+                sum += __popc(bits)*n;
+                offset += __popc(bits & ((1u << lane)-1))*n;
+            }
+            unsigned int first = 0;
+            if (lane == 0)
+                first = atomicAdd(&interactionCount[1], sum);
+            first = SHFL(first, 0)+offset;
+            if (sparse && first+count <= maxSinglePairs) {
+                while (mask) {
+                    int j = __ffs(mask)-1;
+                    singlePairs[first++] = make_int2(atom2, x*TILE_SIZE+j);
+                    mask &= mask-1;
+                }
+            }
+        }
+#endif
+        unsigned int bits = BALLOT(count > INNER_MAX_BITS);
+        if (count > INNER_MAX_BITS)
+            buffer[buffered+__popc(bits & ((1u << lane)-1))] = atom2;
+        buffered += __popc(bits);
+        SYNC_WARPS;
+        if (buffered >= TILE_SIZE) {
+            unsigned int first = 0;
+            if (lane == 0)
+                first = atomicAdd(&interactionCount[0], 1);
+            first = SHFL(first, 0);
+            if (first < maxTiles) {
+                if (lane == 0)
+                    interactingTiles[first] = x;
+                interactingAtoms[first*TILE_SIZE+lane] = buffer[lane];
+            }
+            SYNC_WARPS;
+            if (lane < buffered-TILE_SIZE)
+                buffer[lane] = buffer[lane+TILE_SIZE];
+            buffered -= TILE_SIZE;
+            SYNC_WARPS;
+        }
+        tile = outerNext[tile];
+    }
+    if (buffered) {
+        unsigned int first = 0;
+        if (lane == 0)
+            first = atomicAdd(&interactionCount[0], 1);
+        first = SHFL(first, 0);
+        if (first < maxTiles) {
+            if (lane == 0)
+                interactingTiles[first] = x;
+            interactingAtoms[first*TILE_SIZE+lane] = lane < buffered ? buffer[lane] : PADDED_NUM_ATOMS;
+        }
+
     }
 }
 #endif

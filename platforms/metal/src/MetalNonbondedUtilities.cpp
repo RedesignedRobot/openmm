@@ -270,6 +270,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     // Create data structures for the neighbor list.
 
     maxCutoff = getMaxCutoffDistance();
+    useDualList = useNeighborList && usePadding && numContexts == 1 && numAtoms > 90000 &&
+            context.getDevice()->supportsFamily(MTL::GPUFamilyApple9);
+    useIndirectRebuild = useIndirectRebuild && !useDualList;
     if (useCutoff) {
         // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
         // the list could ever hold fit in 1/256 of the device's unused working set, it can't overflow, and
@@ -312,7 +315,23 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
             rebuildDispatch.initialize<unsigned int>(context, 6, "rebuildDispatch");
         }
-        blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
+        if (useDualList) {
+            outerTiles.initialize<int>(context, maxTiles, "outerTiles");
+            outerAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "outerAtoms");
+            outerNext.initialize<int>(context, maxTiles, "outerNext");
+            outerHeads.initialize<int>(context, numAtomBlocks*numTilesInBatch, "outerHeads");
+            outerCount.initialize<unsigned int>(context, 2, "outerCount");
+            outerCount.upload(vector<unsigned int>(2, 0));
+            innerPositions.initialize(context, numAtoms, 4*elementSize, "innerPositions");
+            listDisplacements.initialize<unsigned int>(context, numAtomBlocks, "listDisplacements");
+            rebuildOuterList.initialize<int>(context, 1, "rebuildOuterList");
+            outerBox.initialize(context, 3, 4*elementSize, "outerBox");
+            sortRanks.initialize<unsigned int>(context, numAtomBlocks, "sortRanks");
+            sortCounts.initialize<unsigned int>(context, 20*((numAtomBlocks+255)/256), "sortCounts");
+            sortOffsets.initialize<unsigned int>(context, 20*((numAtomBlocks+255)/256), "sortOffsets");
+        }
+        else
+            blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
         vector<unsigned int> count(2, 0);
         interactionCount.upload(count);
         rebuildNeighborList.upload(&count[0]);
@@ -418,8 +437,41 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&exclusionRowIndices.getDevicePointer());
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        if (useDualList) {
+            findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
+            findBlockBoundsArgs.push_back(&innerPositions.getDevicePointer());
+            findBlockBoundsArgs.push_back(&listDisplacements.getDevicePointer());
+            findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
+            prepareDualListArgs = {&listDisplacements.getDevicePointer(), &rebuildOuterList.getDevicePointer(),
+                &rebuildNeighborList.getDevicePointer(), &outerCount.getDevicePointer(), &interactionCount.getDevicePointer(),
+                context.getPeriodicBoxVecXPointer(), context.getPeriodicBoxVecYPointer(), context.getPeriodicBoxVecZPointer(),
+                &outerBox.getDevicePointer(), &forceRebuildNeighborList, &blockBoundingBox.getDevicePointer(), &blockSizeRange.getDevicePointer()};
+            dualSortLocalArgs = {&rebuildOuterList.getDevicePointer(), &blockBoundingBox.getDevicePointer(),
+                &blockSizeRange.getDevicePointer(), &sortRanks.getDevicePointer(), &sortCounts.getDevicePointer()};
+            dualSortOffsetsArgs = {&rebuildOuterList.getDevicePointer(), &sortCounts.getDevicePointer(), &sortOffsets.getDevicePointer()};
+            dualSortScatterArgs = {&rebuildOuterList.getDevicePointer(), &sortRanks.getDevicePointer(),
+                &sortOffsets.getDevicePointer(), &sortedBlocks.getDevicePointer()};
+            // The builder writes only the outer list.  Public getters and force arguments
+            // continue to name the compact active list, including its sparse pairs.
+            findInteractingBlocksArgs[5] = &outerCount.getDevicePointer();
+            findInteractingBlocksArgs[6] = &outerTiles.getDevicePointer();
+            findInteractingBlocksArgs[7] = &outerAtoms.getDevicePointer();
+            findInteractingBlocksArgs.back() = &rebuildOuterList.getDevicePointer();
+            findInteractingBlocksArgs.push_back(&outerHeads.getDevicePointer());
+            findInteractingBlocksArgs.push_back(&outerNext.getDevicePointer());
+            sortBoxDataArgs[sortBoxDataArgs.size()-3] = &rebuildOuterList.getDevicePointer();
+            pruneListArgs = {context.getPeriodicBoxSizePointer(), context.getInvPeriodicBoxSizePointer(),
+                context.getPeriodicBoxVecXPointer(), context.getPeriodicBoxVecYPointer(), context.getPeriodicBoxVecZPointer(),
+                &context.unwrap(context.getPosq()).getDevicePointer(), &blockCenter.getDevicePointer(), &blockBoundingBox.getDevicePointer(),
+                &outerTiles.getDevicePointer(), &outerAtoms.getDevicePointer(), &outerCount.getDevicePointer(),
+                &outerHeads.getDevicePointer(), &outerNext.getDevicePointer(), &interactingTiles.getDevicePointer(),
+                &interactingAtoms.getDevicePointer(), &singlePairs.getDevicePointer(), &interactionCount.getDevicePointer(),
+                &maxTiles, &maxSinglePairs, &rebuildNeighborList.getDevicePointer(), &innerPositions.getDevicePointer()};
+        }
         copyInteractionCountsArgs.push_back(&interactionCount.getDevicePointer());
         copyInteractionCountsArgs.push_back(&pinnedCountDeviceMemory);
+        if (useDualList)
+            copyInteractionCountsArgs.push_back(&outerCount.getDevicePointer());
     }
 }
 
@@ -455,7 +507,16 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // Compute the neighbor list.
 
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), FindBlockBoundsThreadBlockSize);
-    if (useIndirectRebuild) {
+    if (useDualList) {
+        context.executeKernelFlat(kernels.prepareDualListKernel, &prepareDualListArgs[0], 256, 256);
+        context.executeKernelFlat(kernels.dualSortLocalKernel, &dualSortLocalArgs[0], context.getNumAtomBlocks(), 256);
+        context.executeKernelFlat(kernels.dualSortOffsetsKernel, &dualSortOffsetsArgs[0], 32, 32);
+        context.executeKernelFlat(kernels.dualSortScatterKernel, &dualSortScatterArgs[0], context.getNumAtomBlocks(), 256);
+        context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
+        context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch, findInteractingBlocksThreadBlockSize);
+        context.executeKernelFlat(kernels.pruneListKernel, &pruneListArgs[0], context.getNumAtomBlocks()*numTilesInBatch*32, 32);
+    }
+    else if (useIndirectRebuild) {
         void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
                 &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
                 &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
@@ -470,7 +531,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         context.executeKernelFlat(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
         blockSorter->sort(sortedBlocks);
         context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64);
-        context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
+        context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch, findInteractingBlocksThreadBlockSize);
     }
     forceRebuildNeighborList = false;
     // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
@@ -547,10 +608,15 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
         interactingAtoms.resize(MetalContext::TileSize*(size_t) maxTiles);
         if (forceArgs.size() > 0)
             forceArgs[7] = &interactingTiles.getDevicePointer();
-        findInteractingBlocksArgs[6] = &interactingTiles.getDevicePointer();
+        if (useDualList) {
+            outerTiles.resize(maxTiles);
+            outerAtoms.resize(MetalContext::TileSize*(size_t) maxTiles);
+            outerNext.resize(maxTiles);
+        }
+        findInteractingBlocksArgs[6] = &(useDualList ? outerTiles : interactingTiles).getDevicePointer();
         if (forceArgs.size() > 0)
             forceArgs[17] = &interactingAtoms.getDevicePointer();
-        findInteractingBlocksArgs[7] = &interactingAtoms.getDevicePointer();
+        findInteractingBlocksArgs[7] = &(useDualList ? outerAtoms : interactingAtoms).getDevicePointer();
     }
     if (pinnedCountBuffer[1] > maxSinglePairs) {
         maxSinglePairs = (unsigned int) (1.2*pinnedCountBuffer[1]);
@@ -626,7 +692,7 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
     kernels.source = source;
     kernels.forceKernel = kernels.energyKernel = kernels.forceEnergyKernel = NULL;
     if (useCutoff) {
-        double paddedCutoff = padCutoff(maxCutoff);
+        double paddedCutoff = useDualList ? maxCutoff+0.2 : padCutoff(maxCutoff);
         map<string, string> defines;
         defines["TILE_SIZE"] = context.intToString(MetalContext::TileSize);
         defines["NUM_BLOCKS"] = context.intToString(context.getNumAtomBlocks());
@@ -643,7 +709,13 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
-        defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
+        defines["MAX_BITS_FOR_PAIRS"] = context.intToString(useDualList ? 0 : getMaxBitsForPairs());
+        if (useDualList) {
+            defines["DUAL_LIST"] = "1";
+            defines["INNER_PADDING"] = context.doubleToString(padCutoff(maxCutoff)-maxCutoff);
+            defines["INNER_CUTOFF_SQUARED"] = context.doubleToString(padCutoff(maxCutoff)*padCutoff(maxCutoff));
+            defines["INNER_MAX_BITS"] = context.intToString(getMaxBitsForPairs());
+        }
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         if (useIndirectRebuild)
@@ -662,6 +734,13 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
         kernels.copyInteractionCountsKernel = context.getKernel(interactingBlocksProgram, "copyInteractionCounts");
+        if (useDualList) {
+            kernels.prepareDualListKernel = context.getKernel(interactingBlocksProgram, "prepareDualList");
+            kernels.pruneListKernel = context.getKernel(interactingBlocksProgram, "pruneNeighborList");
+            kernels.dualSortLocalKernel = context.getKernel(interactingBlocksProgram, "dualSortLocal");
+            kernels.dualSortOffsetsKernel = context.getKernel(interactingBlocksProgram, "dualSortOffsets");
+            kernels.dualSortScatterKernel = context.getKernel(interactingBlocksProgram, "dualSortScatter");
+        }
     }
     groupKernels[groups] = kernels;
 }
