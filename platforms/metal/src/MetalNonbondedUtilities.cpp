@@ -59,7 +59,11 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     downloadCountEvent = std::make_shared<MetalEvent>(context);
     pinnedCountDeviceMemory = context.getDevice()->newBuffer(2*sizeof(unsigned int), MTL::ResourceStorageModeShared);
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
-    numForceThreadBlocks = 10*4*context.getMultiprocessors();
+    // Large systems have enough neighbor list tiles to split finely, and 160 force blocks per core instead of 40 make
+    // apoa1, cellulose and stmv 4-11% faster on an M3 Ultra and 1-2% faster on an M2.  Small systems lose at 160 (rf
+    // 5% on the M3 Ultra, gbsa 1.4% on the M2): their tiles are already spread thin, and every block adds 64 entries
+    // to the energy buffer that is cleared each step.
+    numForceThreadBlocks = (context.getNumAtoms() > 90000 ? 160 : 40)*context.getMultiprocessors();
     forceThreadBlockSize = 64;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
 
