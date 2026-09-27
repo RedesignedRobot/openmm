@@ -49,6 +49,14 @@ static const int StepsPerCommandBuffer = 8;
 // size range per threadgroup instead of per block.
 static const int FindBlockBoundsThreadBlockSize = 256;
 
+// prepareRebuildDispatch sorts up to this many blocks in its one threadgroup.  Larger systems sort in
+// three dispatches of BinSortThreadBlockSize threads (at most 256, since a block's rank inside its
+// threadgroup takes 8 bits).
+static const int MaxBlocksSortedInOneGroup = 1024;
+static const int BinSortThreadBlockSize = 256;
+// computeSortKeys' number of block size bins.
+static const int NumSizeBins = 20;
+
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
     BlockSortTrait() {}
@@ -67,8 +75,10 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
-    // this.  The block sort must fit the short-list kernel, which takes up to 1024 blocks.
-    useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && context.getNumAtomBlocks() <= 1024;
+    // this.  On apoa1 (2882 blocks) the list rebuilds on half the steps, and each skipped step still spent
+    // 49 us on an M3 Ultra in the sort, sortBoxData and an empty findBlocksWithInteractions.
+    useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9);
+    sortBlocksByBins = useIndirectRebuild && context.getNumAtomBlocks() > MaxBlocksSortedInOneGroup;
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
@@ -310,9 +320,16 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
         if (useIndirectRebuild) {
             displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
-            rebuildDispatch.initialize<unsigned int>(context, 6, "rebuildDispatch");
+            rebuildDispatch.initialize<unsigned int>(context, 12, "rebuildDispatch");
         }
-        blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
+        if (sortBlocksByBins) {
+            int binSortGroups = (numAtomBlocks+BinSortThreadBlockSize-1)/BinSortThreadBlockSize;
+            binRanks.initialize<unsigned int>(context, numAtomBlocks, "binRanks");
+            binCounts.initialize<unsigned int>(context, NumSizeBins*binSortGroups, "binCounts");
+            binOffsets.initialize<unsigned int>(context, NumSizeBins*binSortGroups, "binOffsets");
+        }
+        if (!useIndirectRebuild)
+            blockSorter = context.createSort(new BlockSortTrait(), numAtomBlocks, false);
         vector<unsigned int> count(2, 0);
         interactionCount.upload(count);
         rebuildNeighborList.upload(&count[0]);
@@ -462,6 +479,15 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
         context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
         MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
+        if (sortBlocksByBins) {
+            void* countArgs[] = {&blockBoundingBox.getDevicePointer(), &blockSizeRange.getDevicePointer(),
+                    &binRanks.getDevicePointer(), &binCounts.getDevicePointer()};
+            void* sumArgs[] = {&binCounts.getDevicePointer(), &binOffsets.getDevicePointer()};
+            void* scatterArgs[] = {&binRanks.getDevicePointer(), &binOffsets.getDevicePointer(), &sortedBlocks.getDevicePointer()};
+            context.executeKernelFlat(kernels.countBlockBinsKernel, countArgs, 0, BinSortThreadBlockSize, 0, dispatch, 6*sizeof(unsigned int));
+            context.executeKernelFlat(kernels.sumBlockBinsKernel, sumArgs, 0, 32, 0, dispatch, 9*sizeof(unsigned int));
+            context.executeKernelFlat(kernels.scatterBlocksKernel, scatterArgs, 0, BinSortThreadBlockSize, 0, dispatch, 6*sizeof(unsigned int));
+        }
         context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64, 0, dispatch, 0);
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch,
                 findInteractingBlocksThreadBlockSize, 0, dispatch, 3*sizeof(unsigned int));
@@ -648,6 +674,11 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
+        if (sortBlocksByBins) {
+            defines["SORT_BLOCKS_BY_BINS"] = "1";
+            defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);
+            defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
+        }
         defines["FIND_BLOCK_BOUNDS_GROUP"] = context.intToString(FindBlockBoundsThreadBlockSize);
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
@@ -658,6 +689,11 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
         if (useIndirectRebuild)
             kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
+        if (sortBlocksByBins) {
+            kernels.countBlockBinsKernel = context.getKernel(interactingBlocksProgram, "countBlockBins");
+            kernels.sumBlockBinsKernel = context.getKernel(interactingBlocksProgram, "sumBlockBins");
+            kernels.scatterBlocksKernel = context.getKernel(interactingBlocksProgram, "scatterBlocks");
+        }
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
