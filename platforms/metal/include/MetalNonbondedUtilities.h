@@ -31,6 +31,7 @@
 #include "MetalExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
 #include "openmm/common/NonbondedUtilities.h"
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -312,6 +313,7 @@ private:
      */
     void waitForCountCopy();
     class KernelSet;
+    struct CountAudit;
     class BlockSortTrait;
     void initParamArgs();
     MetalContext& context;
@@ -342,6 +344,8 @@ private:
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
     unsigned int countCopies;
+    std::shared_ptr<CountAudit> countAudit;
+    int missedCountReads;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;

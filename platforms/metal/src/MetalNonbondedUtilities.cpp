@@ -32,6 +32,8 @@
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <mutex>
 #include <unistd.h>
 #include <map>
 #include <set>
@@ -39,6 +41,14 @@
 
 using namespace OpenMM;
 using namespace std;
+
+// The counts the host acted on for the last 4 copies, and how many of them a re-read after the command buffer
+// completed, when Metal guarantees the GPU's writes are visible, found different from what the host read mid-flight.
+struct MetalNonbondedUtilities::CountAudit {
+    mutex lock;
+    unsigned int acted[4][3] = {};
+    atomic<int> missed{0};
+};
 
 // Steps without a host wait share a command buffer, up to this many.  Fewer buffers mean fewer boundaries
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
@@ -72,7 +82,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), countCopies(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        pinnedCountBuffer(NULL), countCopies(0), countAudit(make_shared<CountAudit>()), missedCountReads(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
@@ -82,10 +92,11 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     sortBlocksByBins = useIndirectRebuild && context.getNumAtomBlocks() > MaxBlocksSortedInOneGroup;
     // Decide how many thread blocks to use.
 
-    // The tile count, the single pair count, and how many times copyInteractionCounts has run.
-    pinnedCountDeviceMemory = context.getDevice()->newBuffer(4*sizeof(unsigned int), MTL::ResourceStorageModeShared);
+    // The tile count, the single pair count, and how many times copyInteractionCounts has run, then the same three
+    // for each of the last 4 copies.
+    pinnedCountDeviceMemory = context.getDevice()->newBuffer(20*sizeof(unsigned int), MTL::ResourceStorageModeShared);
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
-    memset(pinnedCountBuffer, 0, 4*sizeof(unsigned int));
+    memset(pinnedCountBuffer, 0, 20*sizeof(unsigned int));
     // Large systems have enough neighbor list tiles to split finely, and 160 force blocks per core instead of 40 make
     // apoa1, cellulose and stmv 4-11% faster on an M3 Ultra and 1-2% faster on an M2.  Small systems lose at 160 (rf
     // 5% on the M3 Ultra, gbsa 1.4% on the M2): their tiles are already spread thin, and every block adds 64 entries
@@ -470,6 +481,12 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         return;
     if (numTiles == 0)
         return;
+    if (countAudit->missed != missedCountReads) {
+        if (missedCountReads == 0)
+            fprintf(stderr, "OpenMM Metal: a neighbor list count read while the GPU ran differed from the count at completion; rebuilding the list\n");
+        missedCountReads = countAudit->missed;
+        forceRebuildNeighborList = true;
+    }
 
     // Compute the neighbor list.
 
@@ -541,6 +558,19 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
+        if (wait) {
+            shared_ptr<CountAudit> audit = countAudit;
+            MTL::Buffer* pinned = pinnedCountDeviceMemory->retain();
+            unsigned int copy = countCopies;
+            queue.getCommandBuffer()->addCompletedHandler([audit, pinned, copy](MTL::CommandBuffer*) {
+                const unsigned int* slot = (const unsigned int*) pinned->contents()+4+4*(copy%4);
+                lock_guard<mutex> guard(audit->lock);
+                const unsigned int* acted = audit->acted[copy%4];
+                if (slot[2] == copy && acted[2] == copy && (slot[0] != acted[0] || slot[1] != acted[1]))
+                    audit->missed++;
+                pinned->release();
+            });
+        }
         if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
             queue.commit();
             uncommittedSteps = 0;
@@ -567,6 +597,11 @@ void MetalNonbondedUtilities::waitForCountCopy() {
         }
     }
     std::atomic_thread_fence(std::memory_order_acquire);
+    lock_guard<mutex> guard(countAudit->lock);
+    unsigned int* acted = countAudit->acted[countCopies%4];
+    acted[0] = pinnedCountBuffer[0];
+    acted[1] = pinnedCountBuffer[1];
+    acted[2] = countCopies;
 }
 
 bool MetalNonbondedUtilities::updateNeighborListSize() {
