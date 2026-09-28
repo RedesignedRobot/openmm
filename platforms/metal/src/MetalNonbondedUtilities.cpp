@@ -579,6 +579,7 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
     if (pinnedCountBuffer[0] <= maxTiles && pinnedCountBuffer[1] <= maxSinglePairs)
         return false;
 
+    fprintf(stderr, "R2PROBE overflow: tiles %u of %u, pairs %u of %u\n", pinnedCountBuffer[0], maxTiles, pinnedCountBuffer[1], maxSinglePairs);
     // The most recent timestep had too many interactions to fit in the arrays.  Make the arrays bigger to prevent
     // this from happening in the future.
 
