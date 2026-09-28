@@ -334,6 +334,15 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                 real4 blockCenterX = blockCenter[x];
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
+                // Padding atoms and empty list slots move far outside the cutoff, x atoms to one side and y atoms to
+                // the other, so the cutoff test rejects every pair that has one.  The loop then needs no exclusion
+                // test and no rotated atom index: an interaction that reads atom2 reloads it from the list, and the
+                // load is dead code for the ones that don't.  A rotated index would stay, because the compiler
+                // never removes an unused simd_shuffle.
+                if (atom1 >= NUM_ATOMS)
+                    posq1.x = 1e15f;
+                if (atomIndex >= NUM_ATOMS)
+                    shflPosq.x = -1e15f;
                 #pragma unroll 2
                 for (j = 0; j < TILE_SIZE; j++) {
                     real4 posq2 = shflPosq;
@@ -345,7 +354,11 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                         real invR = RSQRT(r2);
                         real r = r2*invR;
                         LOAD_ATOM2_PARAMETERS
-                        int atom2 = atomIndex;
+#ifdef USE_NEIGHBOR_LIST
+                        int atom2 = interactingAtoms[pos*TILE_SIZE+((tgx+j)&(TILE_SIZE-1))];
+#else
+                        int atom2 = y*TILE_SIZE+((tgx+j)&(TILE_SIZE-1));
+#endif
 #ifdef USE_SYMMETRIC
                         real dEdR = -0.0f;
 #else
@@ -353,7 +366,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                         real3 dEdR2 = make_real3(0);
 #endif
 #ifdef USE_EXCLUSIONS
-                        bool isExcluded = !(atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+                        bool isExcluded = false;
 #endif
                         real tempEnergy = 0.0f;
                         const real interactionScale = 1.0f;
@@ -382,7 +395,6 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                     }
 #endif
                     SHUFFLE_WARP_DATA
-                    atomIndex = warpRotateLeft(atomIndex);
                 }
             }
             else
