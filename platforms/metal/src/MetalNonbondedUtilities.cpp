@@ -27,11 +27,12 @@
 #include "MetalNonbondedUtilities.h"
 #include "MetalArray.h"
 #include "MetalContext.h"
-#include "MetalEvent.h"
 #include "MetalSort.h"
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
+#include <atomic>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <utility>
@@ -71,7 +72,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        pinnedCountBuffer(NULL), countCopies(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
@@ -81,9 +82,10 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     sortBlocksByBins = useIndirectRebuild && context.getNumAtomBlocks() > MaxBlocksSortedInOneGroup;
     // Decide how many thread blocks to use.
 
-    downloadCountEvent = std::make_shared<MetalEvent>(context);
-    pinnedCountDeviceMemory = context.getDevice()->newBuffer(2*sizeof(unsigned int), MTL::ResourceStorageModeShared);
+    // The tile count, the single pair count, and how many times copyInteractionCounts has run.
+    pinnedCountDeviceMemory = context.getDevice()->newBuffer(4*sizeof(unsigned int), MTL::ResourceStorageModeShared);
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
+    memset(pinnedCountBuffer, 0, 4*sizeof(unsigned int));
     // Large systems have enough neighbor list tiles to split finely, and 160 force blocks per core instead of 40 make
     // apoa1, cellulose and stmv 4-11% faster on an M3 Ultra and 1-2% faster on an M2.  Small systems lose at 160 (rf
     // 5% on the M3 Ultra, gbsa 1.4% on the M2): their tiles are already spread thin, and every block adds 64 entries
@@ -502,12 +504,12 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
     // which is all a step without the wait needs.
     bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
-    if (wait || !useIndirectRebuild)
-        context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
-    if (wait)
-        downloadCountEvent->signal();
+    if (wait || !useIndirectRebuild) {
+        context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
+        countCopies++;
+    }
 }
 
 void MetalNonbondedUtilities::initParamArgs() {
@@ -545,9 +547,26 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         }
         commitCountAfterLastStep = queue.getCommitCount();
         if (wait)
-            downloadCountEvent->poll();
+            waitForCountCopy();
         updateNeighborListSize();
     }
+}
+
+void MetalNonbondedUtilities::waitForCountCopy() {
+    // The host watches the copy counter in pinned memory instead of waiting on a shared event.  A signal
+    // between the neighbor list and the force kernels stalled the force kernels on the M3 Ultra until the
+    // host's next commit, 47 us per step on apoa1.  The counter usually shows up while the force kernels
+    // run; the idle check covers a buffer that ends without it, which only an error does.
+    volatile unsigned int* copies = pinnedCountBuffer+2;
+    MetalQueue& queue = context.getCurrentStream();
+    for (int i = 1; *copies != countCopies; i++) {
+        usleep(10);
+        if (i%32 == 0 && queue.isIdle() && *copies != countCopies) {
+            queue.finish();
+            throw OpenMMException("The neighbor list count never arrived");
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
 }
 
 bool MetalNonbondedUtilities::updateNeighborListSize() {
