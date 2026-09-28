@@ -731,7 +731,7 @@ public:
      * @param force      the GBSAOBCForce to copy the parameters from
      */
     void copyParametersToContext(ContextImpl& context, const GBSAOBCForce& force);
-private:
+protected:
     class ForceInfo;
     double prefactor, surfaceAreaFactor, cutoff;
     bool hasCreatedKernels;

@@ -123,6 +123,33 @@ private:
 };
 
 /**
+ * This kernel is invoked by GBSAOBCForce to calculate the forces acting on the system.  With a cutoff, on a device
+ * whose launch has few block pairs per SIMD group, it uses the block-pair kernels in kernels/gbsaObcOwned.metal,
+ * which accumulate without atomics, in place of the common half-list kernels.
+ */
+class MetalCalcGBSAOBCForceKernel : public CommonCalcGBSAOBCForceKernel {
+public:
+    MetalCalcGBSAOBCForceKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonCalcGBSAOBCForceKernel(name, platform, cu), cu(cu) {
+    }
+    /**
+     * Execute the kernel to calculate the forces and/or energy.
+     *
+     * @param context        the context in which to execute this kernel
+     * @param includeForces  true if forces should be calculated
+     * @param includeEnergy  true if the energy should be calculated
+     * @return the potential energy due to the force
+     */
+    double execute(ContextImpl& context, bool includeForces, bool includeEnergy);
+private:
+    bool createOwnedKernels();
+    MetalContext& cu;
+    bool hasCheckedOwned = false, useOwned = false;
+    ComputeArray partialBornSum, partialForce, atomData;
+    ComputeKernel ownedBornSumKernel, ownedReduceBornSumKernel, ownedForce1Kernel, ownedReduceBornForceKernel;
+};
+
+/**
  * This kernel is invoked by LangevinMiddleIntegrator to take one time step.
  */
 class MetalIntegrateLangevinMiddleStepKernel : public CommonIntegrateLangevinMiddleStepKernel {
