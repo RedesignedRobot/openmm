@@ -27,12 +27,26 @@
 #include "MetalContext.h"
 #include "MetalKernel.h"
 #include <cstdlib>
+#include <fstream>
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
 
 using namespace OpenMM;
 using namespace std;
+
+// Probe (r2-mixed, not for merge): a switch is on when its environment variable is set, or when its name is a word in
+// /tmp/openmm-metal-bench/ultra-r2-mixed/fused-probe, which reaches runs xctrace launches without the caller's environment.
+static bool probeSwitch(const string& name) {
+    if (getenv(name.c_str()) != NULL)
+        return true;
+    ifstream file("/tmp/openmm-metal-bench/ultra-r2-mixed/fused-probe");
+    string word;
+    while (file >> word)
+        if (word == name)
+            return true;
+    return false;
+}
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
         ccmaConvergedMemory(NULL), pendingCMBlockSize(0), pendingCMVelocity(NULL) {
@@ -229,14 +243,18 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // that, each quad runs several units in sequence and pays the redundant constraint work in full.
         int numQuadUnits = numSettle+numShake+numFreeQuads;
         bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
-        // Probe (r2-mixed, not for merge): force the quads path, and launch every thread in one uncapped grid.
-        if (getenv("OPENMM_METAL_FUSED_QUADS") != NULL)
+        // Probe (r2-mixed, not for merge): force the quads path, launch every thread in one uncapped grid, skip the
+        // SHAKE or SETTLE solves (timing only), or take the SHAKE clusters before the SETTLE clusters.
+        if (probeSwitch("OPENMM_METAL_FUSED_QUADS"))
             useQuads = true;
-        flatLangevinMiddle = (getenv("OPENMM_METAL_FUSED_FLAT") != NULL);
+        flatLangevinMiddle = probeSwitch("OPENMM_METAL_FUSED_FLAT");
 
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        for (string name : {"SKIP_SHAKE", "SKIP_SETTLE", "SHAKE_FIRST"})
+            if (probeSwitch("OPENMM_METAL_FUSED_"+name))
+                fusedDefines["FUSED_"+name] = "";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);

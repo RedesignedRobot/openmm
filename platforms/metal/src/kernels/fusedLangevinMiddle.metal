@@ -1,3 +1,27 @@
+// Probe (r2-mixed, not for merge): FUSED_SKIP_SHAKE and FUSED_SKIP_SETTLE drop those solves (timing only), and
+// FUSED_SHAKE_FIRST numbers the units SHAKE clusters, then SETTLE clusters, then free atoms.
+#ifdef FUSED_SKIP_SHAKE
+#define SOLVE_SHAKE false
+#else
+#define SOLVE_SHAKE true
+#endif
+#ifdef FUSED_SKIP_SETTLE
+#define SOLVE_SETTLE false
+#else
+#define SOLVE_SETTLE true
+#endif
+#ifdef FUSED_SHAKE_FIRST
+#define CLASSIFY_UNIT(unit) \
+        bool isShake = (unit < numShake); \
+        bool isSettle = (!isShake && unit < numShake+numSettle); \
+        int shakeIndex = unit, settleIndex = unit-numShake;
+#else
+#define CLASSIFY_UNIT(unit) \
+        bool isSettle = (unit < numSettle); \
+        bool isShake = (!isSettle && unit < numSettle+numShake); \
+        int settleIndex = unit, shakeIndex = unit-numSettle;
+#endif
+
 /**
  * Load an atom's position and velocity, remove the center of mass velocity if removeCM is set, and apply the velocity
  * step.
@@ -75,15 +99,14 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
     mixed halfdt = 0.5f*dt[0].y;
     mixed invDt = 1/dt[0].y;
     for (int unit = GLOBAL_ID; unit < numUnits; unit += GLOBAL_SIZE) {
-        bool isSettle = (unit < numSettle);
-        bool isShake = (!isSettle && unit < numSettle+numShake);
+        CLASSIFY_UNIT(unit)
         int4 atoms;
         if (isSettle) {
-            atoms = settleAtoms[unit];
+            atoms = settleAtoms[settleIndex];
             atoms.w = -1; // The host leaves 0 in the unused fourth slot of a SETTLE cluster.
         }
         else if (isShake)
-            atoms = shakeAtoms[unit-numSettle];
+            atoms = shakeAtoms[shakeIndex];
         else
             atoms = make_int4(freeAtoms[unit-numSettle-numShake], -1, -1, -1);
         mixed4 pos[4], vel[4], delta[4], oldDelta[4];
@@ -95,17 +118,17 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             if (atoms[i] != -1)
                 kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos[i], vel[i]);
         }
-        if (isSettle)
+        if (isSettle && SOLVE_SETTLE)
             applySettleToClusterVelocities(pos, vel);
-        else if (isShake)
-            applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, pos, vel);
+        else if (isShake && SOLVE_SHAKE)
+            applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, pos, vel);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 bathAtom(atoms[i], random, randomIndex, halfdt, vscale, noisescale, vel[i], delta[i], oldDelta[i]);
-        if (isSettle)
-            applySettleToCluster(settleParams[unit], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
-        else if (isShake)
-            applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, pos, delta);
+        if (isSettle && SOLVE_SETTLE)
+            applySettleToCluster(settleParams[settleIndex], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
+        else if (isShake && SOLVE_SHAKE)
+            applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, pos, delta);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 finishAtom(atoms[i], posq, posqCorrection, velm, invDt, pos[i], vel[i], delta[i], oldDelta[i]);
@@ -146,17 +169,16 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
     mixed invDt = 1/dt[0].y;
     const int lane = GLOBAL_ID & 3;
     for (int unit = GLOBAL_ID/4; unit < numUnits; unit += GLOBAL_SIZE/4) {
-        bool isSettle = (unit < numSettle);
-        bool isShake = (!isSettle && unit < numSettle+numShake);
+        CLASSIFY_UNIT(unit)
         int4 atoms = make_int4(-1);
         int atom;
         if (isSettle) {
-            atoms = settleAtoms[unit];
+            atoms = settleAtoms[settleIndex];
             atoms.w = -1; // The host leaves 0 in the unused fourth slot of a SETTLE cluster.
             atom = atoms[lane];
         }
         else if (isShake) {
-            atoms = shakeAtoms[unit-numSettle];
+            atoms = shakeAtoms[shakeIndex];
             atom = atoms[lane];
         }
         else
@@ -173,10 +195,10 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
                 clusterPos[i] = shuffleMixed4(pos, i);
                 clusterVel[i] = shuffleMixed4(vel, i);
             }
-            if (isSettle)
+            if (isSettle && SOLVE_SETTLE)
                 applySettleToClusterVelocities(clusterPos, clusterVel);
-            else
-                applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterVel);
+            else if (isShake && SOLVE_SHAKE)
+                applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterVel);
             vel = laneElement(clusterVel, lane);
         }
         if (atom != -1 && vel.w != 0.0)
@@ -185,10 +207,10 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             mixed4 clusterDelta[4];
             for (int i = 0; i < 4; i++)
                 clusterDelta[i] = shuffleMixed4(delta, i);
-            if (isSettle)
-                applySettleToCluster(settleParams[unit], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
-            else
-                applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterDelta);
+            if (isSettle && SOLVE_SETTLE)
+                applySettleToCluster(settleParams[settleIndex], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
+            else if (isShake && SOLVE_SHAKE)
+                applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterDelta);
             delta = laneElement(clusterDelta, lane);
         }
         if (atom != -1 && vel.w != 0.0)
