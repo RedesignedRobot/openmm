@@ -562,7 +562,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             shared_ptr<CountAudit> audit = countAudit;
             MTL::Buffer* pinned = pinnedCountDeviceMemory->retain();
             unsigned int copy = countCopies;
-            queue.getCommandBuffer()->addCompletedHandler([audit, pinned, copy](MTL::CommandBuffer*) {
+            queue.addCompletedHandler([audit, pinned, copy](MTL::CommandBuffer*) {
                 const unsigned int* slot = (const unsigned int*) pinned->contents()+4+4*(copy%4);
                 lock_guard<mutex> guard(audit->lock);
                 const unsigned int* acted = audit->acted[copy%4];

@@ -91,6 +91,11 @@ void MetalQueue::endEncoding() {
     }
 }
 
+void MetalQueue::addCompletedHandler(const MTL::HandlerFunction& handler) {
+    lock_guard<recursive_mutex> guard(lock);
+    completedHandlers.push_back(handler);
+}
+
 void MetalQueue::commit() {
     lock_guard<recursive_mutex> guard(lock);
     submit();
@@ -108,6 +113,9 @@ void MetalQueue::commit() {
 void MetalQueue::submit() {
     if (openBuffer != NULL) {
         endEncoding();
+        for (const MTL::HandlerFunction& handler : completedHandlers)
+            openBuffer->addCompletedHandler(handler);
+        completedHandlers.clear();
         openBuffer->commit();
         pending.push_back(openBuffer);
         openBuffer = NULL;

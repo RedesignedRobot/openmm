@@ -32,6 +32,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 typedef MTL::CommandQueue* metalStream_t;
 
@@ -69,6 +70,11 @@ public:
      * it ends the current pass.
      */
     void setConcurrentDispatch(bool concurrent);
+    /**
+     * Run a function when the next command buffer to be committed completes.  It is attached at commit time,
+     * so callers never touch the open command buffer or its encoder.
+     */
+    void addCompletedHandler(const MTL::HandlerFunction& handler);
     void commit();
     void finish();
     /**
@@ -97,6 +103,7 @@ private:
     MTL::ComputeCommandEncoder* encoder;
     bool concurrentDispatch;
     std::deque<MTL::CommandBuffer*> pending;
+    std::vector<MTL::HandlerFunction> completedHandlers;
     std::atomic<long long> commitCount;
     std::recursive_mutex lock;
     std::condition_variable_any bufferOpened;
