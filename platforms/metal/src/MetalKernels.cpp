@@ -46,6 +46,7 @@
 #include "lepton/ParsedExpression.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -59,6 +60,15 @@ static void getMetalPmeParameters(MetalContext& cu, bool& usePmeQueue, bool& use
     usePmeQueue = (!cu.getPlatformData().disablePmeStream && !cu.getPlatformData().useCpuPme);
     useFixedPointChargeSpreading = cu.getUseFixedPointChargeSpreading();
 }
+
+// Probe knobs, never for merge. R3OV_NOBONDED=1 drops bonded work on force-only steps (ceiling).
+// R3OV_EARLYBONDED=1 runs it beside the Born sum, =2 beside Force1, =3 beside reduceBornForce.
+static int r3ovKnob(const char* name) {
+    const char* value = getenv(name);
+    return (value == NULL ? 0 : atoi(value));
+}
+static const int r3ovNoBonded = r3ovKnob("R3OV_NOBONDED");
+static const int r3ovEarlyBonded = r3ovKnob("R3OV_EARLYBONDED");
 
 // Sets the queue's dispatch type for a scope and restores serial dispatch on the way out, even when an
 // exception leaves the scope.
@@ -102,7 +112,8 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
-        cu.getBondedUtilities().computeInteractions(groups);
+        if (!(overlap && (r3ovNoBonded || r3ovEarlyBonded)))
+            cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
     double sum = 0.0;
@@ -309,8 +320,18 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
     setPeriodicBoxArgs(cu, ownedForce1Kernel, 9);
-    ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
+    int early = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty() ? r3ovEarlyBonded : 0);
+    auto stage = [&] (int index, ComputeKernel& kernel, int threads, int groupSize) {
+        if (early != index) {
+            kernel->execute(threads, groupSize);
+            return;
+        }
+        ConcurrentDispatchScope scope(cu.getCurrentStream(), true);
+        cu.getBondedUtilities().computeInteractions(-1);
+        kernel->execute(threads, groupSize);
+    };
+    stage(1, ownedBornSumKernel, pairThreads, PAIR_GROUP_SIZE);
+    stage(2, ownedForce1Kernel, pairThreads, PAIR_GROUP_SIZE);
+    stage(3, ownedReduceBornForceKernel, cu.getPaddedNumAtoms()*REDUCE_LANES, -1);
     return 0.0;
 }

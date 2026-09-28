@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 
@@ -626,6 +627,8 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
         cc.getNonbondedUtilities().addParameter(ComputeParameterInfo(sigmaEpsilon, prefix+"sigmaEpsilon", "float", 2));
     }
     source = cc.replaceStrings(source, replacements);
+    if (getenv("R3OV_NODIRECT") != NULL)
+        source = ""; // Probe only: ceiling for hiding the direct-space pair work.
     if (force.getIncludeDirectSpace() && doLJPME)
         cc.getNonbondedUtilities().setUseLJPME();
     if (force.getIncludeDirectSpace())
