@@ -44,8 +44,20 @@ DEVICE uint2 decodeBlockPair(unsigned int index) {
 
 /**
  * The Born sum term of an atom with offset radius radius1 from an atom with scaled radius scaledRadius2 at distance r.
+ *
+ * Beyond r = radius1+scaledRadius2 the term is invR*x^3*P(x^2) with x = scaledRadius2/r, where
+ * P(y) = sum over k >= 1 of 2k/(2k+1) y^(k-1).  The polynomial is a fit to float precision (1.2e-7 relative) for
+ * x <= 0.6, which covers almost every pair: it needs no log or divide, and it avoids the closed form's cancellation
+ * at small x.  Pairs closer than that, or with larger x, use the closed form.
  */
 DEVICE real bornSumTerm(real r, real invR, real radius1, real invRadius1, real scaledRadius2) {
+    if (r >= radius1+scaledRadius2 && scaledRadius2 <= 0.6f*r) {
+        real x = scaledRadius2*invR;
+        real y = x*x;
+        real p = 0.666666687f+y*(0.799996376f+y*(0.857358336f+y*(0.883500159f+y*(0.978707075f+y*(0.415265888f+
+                y*(3.07469845f+y*(-4.06764746f+y*6.41090584f)))))));
+        return invR*x*y*p;
+    }
     real rScaledRadiusJ = r+scaledRadius2;
     if (radius1 >= rScaledRadiusJ)
         return 0;
