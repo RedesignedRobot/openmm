@@ -245,6 +245,139 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
     }
 
+#if defined(USE_NEIGHBOR_LIST) && defined(GROUP_PER_TILE)
+    // Second loop: neighbor list tiles, one at a time for the whole threadgroup.  Thread t pairs x atom t/8 with y
+    // atoms t%8, t%8+8, t%8+16 and t%8+24, so each thread computes 4 pairs per tile and nothing rotates through the
+    // warp.  The partial forces are summed in a fixed order: across the 8 threads of an x atom by xor shuffles, and
+    // for a y atom first across the warp's 4 x atoms, then across the 8 warps in threadgroup memory.
+    const unsigned int numTiles = interactionCount[0];
+    if (numTiles > maxTiles)
+        return; // There wasn't enough memory for the neighbor list.
+    const unsigned int warpsPerGroup = GROUP_PER_TILE/TILE_SIZE;
+    const unsigned int warpInGroup = threadIdx.x/TILE_SIZE;
+    const unsigned int xInTile = warpInGroup*4 + tgx/8;
+    const unsigned int yLane = tgx%8;
+#ifdef INCLUDE_FORCES
+    __shared__ real yForceParts[2][3][GROUP_PER_TILE/TILE_SIZE][TILE_SIZE];
+    int parity = 0;
+#endif
+    mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
+    const unsigned int end = firstNeighborListTile(numTiles, (blockIdx.x+1)*warpsPerGroup, totalWarps);
+    for (unsigned int pos = firstNeighborListTile(numTiles, blockIdx.x*warpsPerGroup, totalWarps); pos < end; pos++) {
+        const int x = tiles[pos];
+        real4 blockSizeX = blockSize[x];
+        const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.z-blockSizeX.z >= MAX_CUTOFF);
+        unsigned int atom1 = x*TILE_SIZE + xInTile;
+        real4 posq1 = posq[atom1];
+        LOAD_ATOM1_PARAMETERS
+#ifdef USE_PERIODIC
+        real4 blockCenterX = blockCenter[x];
+        if (singlePeriodicCopy) {
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
+        }
+#endif
+        real3 force = make_real3(0);
+        real3 yForce[4];
+        #pragma unroll
+        for (int m = 0; m < 4; m++) {
+            yForce[m] = make_real3(0);
+            unsigned int j = interactingAtoms[pos*TILE_SIZE + yLane + 8*m];
+            DECLARE_LOCAL_PARAMETERS
+            real4 posq2;
+            if (j < PADDED_NUM_ATOMS) {
+                posq2 = posq[j];
+                LOAD_LOCAL_PARAMETERS_FROM_GLOBAL
+            }
+            else {
+                posq2 = make_real4(0, 0, 0, 0);
+                CLEAR_LOCAL_PARAMETERS
+            }
+#ifdef USE_PERIODIC
+            if (singlePeriodicCopy) {
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(posq2, blockCenterX)
+            }
+#endif
+            real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+#ifdef USE_PERIODIC
+            if (!singlePeriodicCopy) {
+                APPLY_PERIODIC_TO_DELTA(delta)
+            }
+#endif
+            real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+            if (r2 < MAX_CUTOFF_SQUARED) {
+                real invR = RSQRT(r2);
+                real r = r2*invR;
+                LOAD_ATOM2_PARAMETERS
+                int atom2 = j;
+#ifdef USE_SYMMETRIC
+                real dEdR = 0.0f;
+#else
+                real3 dEdR1 = make_real3(0);
+                real3 dEdR2 = make_real3(0);
+#endif
+#ifdef USE_EXCLUSIONS
+                bool isExcluded = !(atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+#endif
+                real tempEnergy = 0.0f;
+                const real interactionScale = 1.0f;
+                COMPUTE_INTERACTION
+#ifdef INCLUDE_ENERGY
+                energy += tempEnergy;
+#endif
+#ifdef INCLUDE_FORCES
+#ifdef USE_SYMMETRIC
+                delta *= dEdR;
+                force -= delta;
+                yForce[m] += delta;
+#else
+                force -= dEdR1;
+                yForce[m] += dEdR2;
+#endif
+#endif
+            }
+        }
+#ifdef INCLUDE_FORCES
+        for (ushort mask = 1; mask < 8; mask *= 2)
+            force += simd_shuffle_xor(force, mask);
+
+        // After two halving steps, thread tgx of each warp holds that warp's sum for y atom tgx.
+        const bool upper = (tgx & 16) != 0;
+        real3 keep0 = (upper ? yForce[2] : yForce[0]) + simd_shuffle_xor(upper ? yForce[0] : yForce[2], (ushort) 16);
+        real3 keep1 = (upper ? yForce[3] : yForce[1]) + simd_shuffle_xor(upper ? yForce[1] : yForce[3], (ushort) 16);
+        const bool odd = (tgx & 8) != 0;
+        real3 yPart = (odd ? keep1 : keep0) + simd_shuffle_xor(odd ? keep0 : keep1, (ushort) 8);
+        yForceParts[parity][0][warpInGroup][tgx] = yPart.x;
+        yForceParts[parity][1][warpInGroup][tgx] = yPart.y;
+        yForceParts[parity][2][warpInGroup][tgx] = yPart.z;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (threadIdx.x < 3*TILE_SIZE) {
+            const unsigned int component = threadIdx.x/TILE_SIZE;
+            const unsigned int y = threadIdx.x%TILE_SIZE;
+            real sum = yForceParts[parity][component][0][y];
+            for (unsigned int w = 1; w < warpsPerGroup; w++)
+                sum += yForceParts[parity][component][w][y];
+            unsigned int atom2 = interactingAtoms[pos*TILE_SIZE + y];
+            if (atom2 < PADDED_NUM_ATOMS)
+                atomicAdd(&forceBuffers[atom2+component*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(sum)));
+        }
+        // The next tile writes the other half, so one barrier per tile is enough.
+        parity ^= 1;
+        xForceX += realToFixedPoint(force.x);
+        xForceY += realToFixedPoint(force.y);
+        xForceZ += realToFixedPoint(force.z);
+        if (pos+1 == end || tiles[pos+1] != x) {
+            if (yLane == 0) {
+                atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
+                atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
+                atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+            }
+            xForceX = xForceY = xForceZ = 0;
+        }
+#endif
+    }
+#else
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
@@ -471,6 +604,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
         }
     }
+#endif
 
     // Third loop: single pairs that aren't part of a tile.
 

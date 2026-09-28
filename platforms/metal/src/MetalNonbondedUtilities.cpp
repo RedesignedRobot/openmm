@@ -43,6 +43,8 @@ using namespace std;
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
 // it doesn't wait for MetalQueue's idle commit.
 static const int StepsPerCommandBuffer = 8;
+// Threads that compute one neighbor list tile together on large systems.
+static const int GroupPerTileSize = 256;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -75,6 +77,7 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // to the energy buffer that is cleared each step.
     numForceThreadBlocks = (context.getNumAtoms() > 90000 ? 160 : 40)*context.getMultiprocessors();
     forceThreadBlockSize = 64;
+    groupPerTile = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && context.getNumAtoms() > 90000;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
 
     // When building the neighbor list, we can optionally use large blocks (32 * warpSize atoms) to
@@ -498,7 +501,8 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         if (!hasInitializedParams)
             initParamArgs();
-        context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        int blockSize = (groupPerTile ? GroupPerTileSize : forceThreadBlockSize);
+        context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, blockSize);
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
@@ -789,7 +793,9 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["INCLUDE_FORCES"] = "1";
     if (includeEnergy)
         defines["INCLUDE_ENERGY"] = "1";
-    defines["THREAD_BLOCK_SIZE"] = context.intToString(forceThreadBlockSize);
+    defines["THREAD_BLOCK_SIZE"] = context.intToString(groupPerTile ? GroupPerTileSize : forceThreadBlockSize);
+    if (groupPerTile)
+        defines["GROUP_PER_TILE"] = context.intToString(GroupPerTileSize);
     double maxCutoff = 0.0;
     for (int i = 0; i < 32; i++) {
         if ((groups&(1<<i)) != 0) {
@@ -814,6 +820,8 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
     metalModule_t program = context.createModule(MetalKernelSources::vectorOps+context.replaceStrings(kernelSource, replacements), defines);
     metalFunction_t kernel = context.getKernel(program, "computeNonbonded");
+    if (groupPerTile && kernel->maxTotalThreadsPerThreadgroup() < GroupPerTileSize)
+        throw OpenMMException("computeNonbonded allows only "+context.intToString(kernel->maxTotalThreadsPerThreadgroup())+" threads per group");
     return kernel;
 }
 
