@@ -26,6 +26,7 @@
 #include "MetalEvent.h"
 #include "openmm/OpenMMException.h"
 #include <atomic>
+#include <cstdlib>
 #include <unistd.h>
 
 using namespace OpenMM;
@@ -77,10 +78,31 @@ void MetalEvent::poll() {
     std::atomic_thread_fence(std::memory_order_acquire);
 }
 
+#ifdef OPENMM_METAL_TEST_HOOKS
+// Test builds only (CMake OPENMM_METAL_TEST_HOOKS): OPENMM_METAL_TEST_FAIL_CB=n makes the nth status check in
+// the process see a page fault, since no organic fault fails a command buffer on macOS 27 (GAPS.md gap 4).
+static NS::Error* testBufferFailure() {
+    static const char* setting = getenv("OPENMM_METAL_TEST_FAIL_CB");
+    static const long failAt = (setting == NULL ? 0 : atol(setting));
+    static std::atomic<long> checks(0);
+    if (failAt <= 0 || ++checks != failAt)
+        return NULL;
+    NS::String* domain = NS::String::string("MTLCommandBufferErrorDomain", NS::UTF8StringEncoding);
+    return NS::Error::error(domain, MTL::CommandBufferErrorPageFault, NULL);
+}
+#endif
+
 void MetalEvent::checkBufferStatus() {
     // A failed buffer can stop before its signal, so the host must not go on to read the results it waited for.
+    NS::Error* error = NULL;
     if (buffer->status() == MTL::CommandBufferStatusError)
-        throw OpenMMException("Error executing METAL command buffer: "+std::string(buffer->error()->localizedDescription()->utf8String()));
+        error = buffer->error();
+#ifdef OPENMM_METAL_TEST_HOOKS
+    else
+        error = testBufferFailure();
+#endif
+    if (error != NULL)
+        throw OpenMMException("Error executing METAL command buffer: "+std::string(error->localizedDescription()->utf8String()));
 }
 
 void MetalEvent::queueWait(ComputeQueue queue) {
