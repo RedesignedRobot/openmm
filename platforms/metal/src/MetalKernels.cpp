@@ -78,11 +78,23 @@ void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
-    cu.clearAutoclearBuffers();
+    MetalNonbondedUtilities& nb = cu.getNonbondedUtilities();
+
+    // The first neighbor list kernel reads positions and writes only list buffers, and the clear writes only
+    // the autoclear buffers, so they share a concurrent pass.  The list kernel goes first: on a small system it
+    // is one threadgroup, and the clear spreads over the other cores beside it.  A precomputation may read what
+    // the clear writes or change positions, so steps with one stay serial.
+
+    if (cu.getPreComputations().empty()) {
+        ConcurrentDispatchScope scope(cu.getCurrentStream(), true);
+        nb.startInteractions(groups);
+        cu.clearAutoclearBuffers();
+    }
+    else
+        cu.clearAutoclearBuffers();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
         computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
-    MetalNonbondedUtilities& nb = cu.getNonbondedUtilities();
     cu.setComputeForceCount(cu.getComputeForceCount()+1);
     nb.prepareInteractions(groups);
     map<string, double>& derivs = cu.getEnergyParamDerivWorkspace();

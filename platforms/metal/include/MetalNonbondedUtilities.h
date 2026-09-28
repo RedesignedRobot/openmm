@@ -168,6 +168,12 @@ public:
      */
     double padCutoff(double cutoff);
     /**
+     * Dispatch the first neighbor list kernel of the next prepareInteractions() call now, so the caller can
+     * put independent work beside it in a concurrent pass.  That kernel reads positions and writes only
+     * neighbor list buffers.
+     */
+    void startInteractions(int forceGroups);
+    /**
      * Prepare to compute interactions.  This updates the neighbor list.
      */
     void prepareInteractions(int forceGroups);
@@ -309,6 +315,8 @@ public:
     void setKernelSource(const std::string& source);
 private:
     class KernelSet;
+    KernelSet* getListKernels(int forceGroups);
+    void findBlockBounds(KernelSet& kernels);
     class BlockSortTrait;
     void initParamArgs();
     MetalContext& context;
@@ -333,12 +341,12 @@ private:
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
     MetalArray displacementFlags, rebuildDispatch;
-    bool useIndirectRebuild;
+    bool useIndirectRebuild, boundsStarted = false;
     ComputeSort blockSorter;
     std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
-    std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
+    std::vector<void*> forceArgs, findBlockBoundsArgs, boundsAndPrepareArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
     std::vector<ComputeParameterInfo> arguments;
@@ -366,6 +374,8 @@ public:
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
     metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
+    metalFunction_t boundsAndPrepareKernel;
+    int boundsAndPrepareThreads;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;

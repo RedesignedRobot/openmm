@@ -43,6 +43,9 @@ using namespace std;
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
 // it doesn't wait for MetalQueue's idle commit.
 static const int StepsPerCommandBuffer = 8;
+// findBoundsAndPrepareRebuild runs as one threadgroup, so each SIMD group finds the bounds of several blocks
+// in turn.  Past this many per SIMD group, the separate findBlockBounds dispatch is cheaper.
+static const int MaxFusedBlocksPerSimdGroup = 4;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -364,6 +367,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
             findBlockBoundsArgs.push_back(&displacementFlags.getDevicePointer());
             findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
+            boundsAndPrepareArgs = findBlockBoundsArgs;
+            boundsAndPrepareArgs.push_back(&interactionCount.getDevicePointer());
+            boundsAndPrepareArgs.push_back(&pinnedCountDeviceMemory);
+            boundsAndPrepareArgs.push_back(&sortedBlocks.getDevicePointer());
+            boundsAndPrepareArgs.push_back(&rebuildDispatch.getDevicePointer());
         }
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
         computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
@@ -430,32 +438,56 @@ double MetalNonbondedUtilities::padCutoff(double cutoff) {
     return cutoff+padding;
 }
 
-void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
+MetalNonbondedUtilities::KernelSet* MetalNonbondedUtilities::getListKernels(int forceGroups) {
     if ((forceGroups&groupFlags) == 0)
-        return;
+        return NULL;
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
-    KernelSet& kernels = groupKernels[forceGroups];
     if (useCutoff && usePeriodic) {
         double4 box = context.getPeriodicBoxSize();
         double minAllowedSize = 1.999999*maxCutoff;
         if (box.x < minAllowedSize || box.y < minAllowedSize || box.z < minAllowedSize)
             throw OpenMMException("The periodic box size has decreased to less than twice the nonbonded cutoff.");
     }
-    if (!useNeighborList)
+    if (!useNeighborList || numTiles == 0)
+        return NULL;
+    return &groupKernels[forceGroups];
+}
+
+void MetalNonbondedUtilities::findBlockBounds(KernelSet& kernels) {
+    if (kernels.boundsAndPrepareKernel != NULL)
+        context.executeKernelFlat(kernels.boundsAndPrepareKernel, &boundsAndPrepareArgs[0], kernels.boundsAndPrepareThreads, kernels.boundsAndPrepareThreads);
+    else
+        context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
+}
+
+void MetalNonbondedUtilities::startInteractions(int forceGroups) {
+    KernelSet* kernels = getListKernels(forceGroups);
+    if (kernels == NULL)
         return;
-    if (numTiles == 0)
+    findBlockBounds(*kernels);
+    boundsStarted = true;
+}
+
+void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
+    KernelSet* listKernels = getListKernels(forceGroups);
+    if (listKernels == NULL)
         return;
+    KernelSet& kernels = *listKernels;
 
     // Compute the neighbor list.
 
-    context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
+    if (!boundsStarted)
+        findBlockBounds(kernels);
+    boundsStarted = false;
     if (useIndirectRebuild) {
-        void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
-                &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
-                &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
-        int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
-        context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
+        if (kernels.boundsAndPrepareKernel == NULL) {
+            void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
+                    &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
+                    &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
+            int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
+            context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
+        }
         MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
         context.executeKernelFlat(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms(), 64, 0, dispatch, 0);
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks()*context.getSIMDWidth()*numTilesInBatch,
@@ -641,8 +673,10 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
-        if (useIndirectRebuild)
+        if (useIndirectRebuild) {
             defines["INDIRECT_REBUILD"] = "1";
+            defines["FUSED_BLOCKS_PER_SIMD"] = context.intToString(MaxFusedBlocksPerSimdGroup);
+        }
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
@@ -650,8 +684,21 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         metalModule_t interactingBlocksProgram = context.createModule(MetalKernelSources::vectorOps+MetalKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
-        if (useIndirectRebuild)
+        kernels.boundsAndPrepareKernel = NULL;
+        if (useIndirectRebuild) {
             kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
+            // When one threadgroup can find the bounds of every block with a few blocks per SIMD group, it
+            // also makes the rebuild decision, one dependent dispatch fewer per step.
+            int maxThreads = context.getDevice()->maxThreadsPerThreadgroup().width;
+            if (context.getNumAtomBlocks() <= MaxFusedBlocksPerSimdGroup*maxThreads/MetalContext::TileSize) {
+                metalFunction_t fused = context.getKernel(interactingBlocksProgram, "findBoundsAndPrepareRebuild");
+                int threads = fused->maxTotalThreadsPerThreadgroup()/MetalContext::TileSize*MetalContext::TileSize;
+                if (context.getNumAtomBlocks() <= MaxFusedBlocksPerSimdGroup*threads/MetalContext::TileSize) {
+                    kernels.boundsAndPrepareKernel = fused;
+                    kernels.boundsAndPrepareThreads = min(context.getNumAtomBlocks()*MetalContext::TileSize, threads);
+                }
+            }
+        }
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");

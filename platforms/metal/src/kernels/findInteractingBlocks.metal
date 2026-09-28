@@ -35,30 +35,26 @@ private:
     __half v[3];
 };
 
+__device__ bool movedPastPadding(real4 oldPos, real4 pos) {
+    real4 displacement = oldPos-pos;
+    return displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
+}
+
 /**
- * Find a bounding box for the atoms in each block.
+ * Find the bounding box for the atoms in one block.  The SIMD group handling the block calls this with its
+ * lane's position, and with the indirect rebuild also with whether that atom moved far enough to need a
+ * rebuild.  It returns whether any atom of the block did.
  */
-extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
-        real2* __restrict__ blockSizeRange
+__device__ bool computeBlockBounds(int index, int indexInTile, real4 tPos, real4 periodicBoxSize, real4 invPeriodicBoxSize,
+        real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, GLOBAL real4* __restrict__ blockCenter,
+        GLOBAL real4* __restrict__ blockBoundingBox, GLOBAL real2* __restrict__ blockSizeRange
 #ifdef INDIRECT_REBUILD
-        , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
+        , bool moved, GLOBAL unsigned int* __restrict__ displacementFlags
 #endif
         ) {
-    const int indexInTile = threadIdx.x%TILE_SIZE;
-    const int index = warpSize == TILE_SIZE ? blockIdx.x : (blockIdx.x*(warpSize/TILE_SIZE) + threadIdx.x/TILE_SIZE);
-    const int base = index * TILE_SIZE;
-    if (base >= numAtoms)
-        return;
-
-    real4 tPos = posq[base + indexInTile < numAtoms ? base + indexInTile : 0];
+    bool tileMoved = false;
 #ifdef INDIRECT_REBUILD
-    bool moved = forceRebuild;
-    if (!forceRebuild && base+indexInTile < numAtoms) {
-        real4 displacement = oldPositions[base+indexInTile]-tPos;
-        moved = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
-    }
-    bool tileMoved = simd_any(moved);
+    tileMoved = simd_any(moved);
     if (indexInTile == 0)
         displacementFlags[index] = tileMoved;
 #endif
@@ -136,6 +132,34 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
             atomicMin((device real*) blockSizeRange, totalSize);
         atomicMax((device real*) blockSizeRange+1, totalSize);
     }
+    return tileMoved;
+}
+
+/**
+ * Find a bounding box for the atoms in each block.
+ */
+extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
+        real2* __restrict__ blockSizeRange
+#ifdef INDIRECT_REBUILD
+        , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
+#endif
+        ) {
+    const int indexInTile = threadIdx.x%TILE_SIZE;
+    const int index = warpSize == TILE_SIZE ? blockIdx.x : (blockIdx.x*(warpSize/TILE_SIZE) + threadIdx.x/TILE_SIZE);
+    const int atom = index*TILE_SIZE+indexInTile;
+    if (index*TILE_SIZE >= numAtoms)
+        return;
+    real4 tPos = posq[atom < numAtoms ? atom : 0];
+#ifdef INDIRECT_REBUILD
+    bool moved = forceRebuild || (atom < numAtoms && movedPastPadding(oldPositions[atom], tPos));
+#endif
+    computeBlockBounds(index, indexInTile, tPos, periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ,
+            blockCenter, blockBoundingBox, blockSizeRange
+#ifdef INDIRECT_REBUILD
+            , moved, displacementFlags
+#endif
+            );
     if (blockIdx.x == 0 && threadIdx.x == 0)
         rebuildNeighborList[0] = 0;
 }
@@ -678,19 +702,14 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 // barriers.  Keys are unique, so ranking them gives sortShortList2's order.
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
-extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
-        int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
-        unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
-        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
-        unsigned int* __restrict__ dispatch) {
-    __shared__ unsigned int keys[NUM_BLOCKS];
-    __shared__ bool anyMoved;
+__device__ void prepareRebuild(bool moved, threadgroup unsigned int* keys, threadgroup bool& anyMoved,
+        GLOBAL int* __restrict__ rebuildNeighborList, GLOBAL unsigned int* __restrict__ interactionCount,
+        GLOBAL unsigned int* __restrict__ pinnedInteractionCount, GLOBAL real2* __restrict__ blockSizeRange,
+        GLOBAL const real4* __restrict__ blockBoundingBox, GLOBAL unsigned int* __restrict__ sortedBlocks,
+        GLOBAL unsigned int* __restrict__ dispatch) {
     if (threadIdx.x == 0)
         anyMoved = false;
     __syncthreads();
-    bool moved = false;
-    for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
-        moved = moved || displacementFlags[i] != 0;
     if (simd_any(moved))
         anyMoved = true;
     __syncthreads();
@@ -738,5 +757,52 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
             rank += (keys[j] < key);
         sortedBlocks[rank] = key;
     }
+}
+
+extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
+        int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
+        unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
+        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
+        unsigned int* __restrict__ dispatch) {
+    __shared__ unsigned int keys[NUM_BLOCKS];
+    __shared__ bool anyMoved;
+    bool moved = false;
+    for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
+        moved = moved || displacementFlags[i] != 0;
+    prepareRebuild(moved, keys, anyMoved, rebuildNeighborList, interactionCount, pinnedInteractionCount, blockSizeRange,
+            blockBoundingBox, sortedBlocks, dispatch);
+}
+
+// For a small system, one threadgroup does findBlockBounds' work and then prepareRebuildDispatch's,
+// which saves a dependent dispatch on every step.  Each SIMD group handles every numSimdGroups-th block, at
+// most FUSED_BLOCKS_PER_SIMD of them, and loads all its positions before the first bounds so the loads
+// overlap.  The threadgroup barrier in prepareRebuild orders the bounds, the size range atomics and the
+// displacement test before the decision.
+extern "C" __global__ void findBoundsAndPrepareRebuild(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
+        real2* __restrict__ blockSizeRange, const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild,
+        unsigned int* __restrict__ interactionCount, unsigned int* __restrict__ pinnedInteractionCount, unsigned int* __restrict__ sortedBlocks,
+        unsigned int* __restrict__ dispatch) {
+    __shared__ unsigned int keys[NUM_BLOCKS];
+    __shared__ bool anyMoved;
+    const int numSimdGroups = blockDim.x/TILE_SIZE;
+    const int indexInTile = threadIdx.x%TILE_SIZE;
+    real4 pos[FUSED_BLOCKS_PER_SIMD];
+    bool atomMoved[FUSED_BLOCKS_PER_SIMD];
+    for (int i = 0; i < FUSED_BLOCKS_PER_SIMD; i++) {
+        int atom = (threadIdx.x/TILE_SIZE + i*numSimdGroups)*TILE_SIZE + indexInTile;
+        int load = (atom < numAtoms ? atom : 0);
+        pos[i] = posq[load];
+        atomMoved[i] = forceRebuild || (atom < numAtoms && movedPastPadding(oldPositions[load], pos[i]));
+    }
+    bool moved = false;
+    for (int i = 0; i < FUSED_BLOCKS_PER_SIMD; i++) {
+        int index = threadIdx.x/TILE_SIZE + i*numSimdGroups;
+        if (index < NUM_BLOCKS)
+            moved = computeBlockBounds(index, indexInTile, pos[i], periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ,
+                    blockCenter, blockBoundingBox, blockSizeRange, atomMoved[i], displacementFlags) || moved;
+    }
+    prepareRebuild(moved, keys, anyMoved, rebuildNeighborList, interactionCount, pinnedInteractionCount, blockSizeRange,
+            blockBoundingBox, sortedBlocks, dispatch);
 }
 #endif
