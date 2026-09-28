@@ -354,6 +354,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
+    // The fold's buffers are bound in every variant, since a kernel signature can't hold preprocessor lines.
     ownedForce1Kernel->addArg(cu.getLongForceBuffer());
     ownedForce1Kernel->addArg(bornForce);
     if (foldBornForce)

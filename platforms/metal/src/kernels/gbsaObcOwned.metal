@@ -203,6 +203,8 @@ DEVICE void addFoldedForce(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mm_ulo
  * y atoms with their sums rotate one lane per step, so each lane ends holding one y atom's sum.  The x sums go to
  * slot y and the y sums to slot x of partialForce, so every (atom, slot) is written by exactly one SIMD group and
  * nothing is accumulated in device memory.  A diagonal pair is evaluated from both sides, like the Born sum.
+ * forceBuffers and bornForce are used only under FOLD_BORN_FORCE, but they are always bound: the kernel argument
+ * rewriter reads the signature before preprocessing, so a KERNEL signature must not contain preprocessor lines.
  */
 KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL mixed* RESTRICT energyBuffer,
         GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
