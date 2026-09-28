@@ -60,13 +60,12 @@
  *
  */
 
-// X_ATOMS is the number of X atoms in a neighbor list tile.  At 16 (USE_HALF_BLOCKS), a tile holds one half of an
-// atom block against 32 Y atoms: lanes l and l+16 share X atom l%16, and 16 rotation steps pair every X atom with
-// every Y atom once.  Tiles with exclusions and tiles without a neighbor list always hold whole blocks.
+// With USE_HALF_BLOCKS, a neighbor list entry is 4*x+k for atom block x.  k = 2 is a whole tile: 32 X atoms against
+// 32 Y atoms.  k = 0 or 1 is a half tile: X atoms 16k to 16k+15 of the block, where lanes l and l+16 share X atom
+// l%16, so 16 rotation steps pair every X atom with every Y atom once.  Tiles with exclusions and tiles without a
+// neighbor list always hold whole blocks.
 #if defined(USE_HALF_BLOCKS) && defined(USE_NEIGHBOR_LIST)
-#define X_ATOMS (TILE_SIZE/2)
-#else
-#define X_ATOMS TILE_SIZE
+#define HALF_TILES
 #endif
 
 /**
@@ -284,17 +283,27 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         bool singlePeriodicCopy = false;
 #ifdef USE_NEIGHBOR_LIST
         x = tiles[pos];
-        real4 blockSizeX = blockSize[x/(TILE_SIZE/X_ATOMS)];
+#ifdef HALF_TILES
+        const int blockX = x>>2;
+        const bool wholeTile = ((x&3) == 2);
+        const int xAtoms = (wholeTile ? TILE_SIZE : TILE_SIZE/2);
+#else
+        const int blockX = x;
+        const int xAtoms = TILE_SIZE;
+#endif
+        real4 blockSizeX = blockSize[blockX];
         singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
                               0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
                               0.5f*periodicBoxSize.z-blockSizeX.z >= MAX_CUTOFF);
 #else
+        const int xAtoms = TILE_SIZE;
         y = (int) floor(NUM_BLOCKS+0.5f-SQRT((NUM_BLOCKS+0.5f)*(NUM_BLOCKS+0.5f)-2*pos));
         x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
         if (x < y || x >= NUM_BLOCKS) { // Occasionally happens due to roundoff error.
             y += (x < y ? -1 : 1);
             x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
         }
+        const int blockX = x;
 
         // Skip over tiles that have exclusions, since they were already processed.
 
@@ -310,7 +319,11 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         includeTile = BALLOT(skipTiles == pos) == 0;
 #endif
         if (includeTile) {
-            unsigned int atom1 = x*X_ATOMS + (tgx & (X_ATOMS-1));
+#if defined(HALF_TILES)
+            unsigned int atom1 = blockX*TILE_SIZE + (wholeTile ? tgx : (x&3)*(TILE_SIZE/2) + (tgx & (TILE_SIZE/2-1)));
+#else
+            unsigned int atom1 = blockX*TILE_SIZE + tgx;
+#endif
             // Load atom data for this tile.
             real4 posq1 = posq[atom1];
             LOAD_ATOM1_PARAMETERS
@@ -339,11 +352,11 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             if (singlePeriodicCopy) {
                 // The box is small enough that we can just translate all the atoms into a single periodic
                 // box, then skip having to apply periodic boundary conditions later.
-                real4 blockCenterX = blockCenter[x/(TILE_SIZE/X_ATOMS)];
+                real4 blockCenterX = blockCenter[blockX];
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
                 #pragma unroll 2
-                for (j = 0; j < X_ATOMS; j++) {
+                for (j = 0; j < xAtoms; j++) {
                     real4 posq2 = shflPosq;
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
                     real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
@@ -399,7 +412,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             {
                 // We need to apply periodic boundary conditions separately for each interaction.
                 #pragma unroll 2
-                for (j = 0; j < X_ATOMS; j++) {
+                for (j = 0; j < xAtoms; j++) {
                     real4 posq2 = shflPosq;
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
 #ifdef USE_PERIODIC

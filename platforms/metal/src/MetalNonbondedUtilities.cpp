@@ -310,11 +310,12 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {
-        // Apple9 GPUs build the list per 16-atom half of each atom block when nothing else reads it.  On apoa1rf only
-        // 27% of the 32x32 list slots are inside the cutoff, and half blocks drop about a fifth of the slots.
+        // Apple9 GPUs build the list in half-block tiles when nothing else reads it: a Y atom near only one 16-atom
+        // half of block X is paired with that half alone.  On apoa1rf only 27% of the 32x32 list slots are inside
+        // the cutoff, and half tiles drop about a fifth of the slots.  Each X block can end with three partial tiles.
         useHalfBlocks = (context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && getMaxBitsForPairs() == 0 &&
                 numContexts == 1 && !listReadElsewhere && onlyComputeNonbondedReadsList(system));
-        const long long listTiles = (useHalfBlocks ? 2 : 1)*numTiles;
+        const long long listTiles = (useHalfBlocks ? 2*numTiles+3*numAtomBlocks : numTiles);
         // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
         // the list could ever hold fit in 1/256 of the device's unused working set, it can't overflow, and
         // the host only waits for the interaction count on steps that set the reordering baseline.  With
@@ -600,7 +601,9 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
     if (pinnedCountBuffer[0] > maxTiles) {
         maxTiles = (unsigned int) (1.2*pinnedCountBuffer[0]);
         unsigned int numBlocks = context.getNumAtomBlocks();
-        int totalTiles = (useHalfBlocks ? 2 : 1)*numBlocks*(numBlocks+1)/2;
+        long long totalTiles = (long long) numBlocks*(numBlocks+1)/2;
+        if (useHalfBlocks)
+            totalTiles = 2*totalTiles+3*numBlocks;
         if (maxTiles > totalTiles)
             maxTiles = totalTiles;
         interactingTiles.resize(maxTiles);

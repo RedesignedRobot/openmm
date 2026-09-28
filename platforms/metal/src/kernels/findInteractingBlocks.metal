@@ -318,16 +318,16 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     const warpflags warpMask = (static_cast<warpflags>(1)<<indexInWarp)-1;
 
 #ifdef USE_HALF_BLOCKS
-    constexpr int numHalves = 2;
+    constexpr int numLists = 3;
 #else
-    constexpr int numHalves = 1;
+    constexpr int numLists = 1;
 #endif
-    __shared__ int workgroupBuffer[BUFFER_SIZE*warpsPerBlock*numHalves];
+    __shared__ int workgroupBuffer[BUFFER_SIZE*warpsPerBlock*numLists];
     __shared__ real4 workgroupPosBuffer[TILE_SIZE*warpsPerBlock];
     __shared__ int workgroupExclusions[MAX_EXCLUSIONS*warpsPerBlock];
     __shared__ int workgroupBlock2Buffer[(warpSize+1)*warpsPerBlock];
 
-    threadgroup int* halfBuffers = workgroupBuffer+BUFFER_SIZE*numHalves*warpInBlock;
+    threadgroup int* listBuffers = workgroupBuffer+BUFFER_SIZE*numLists*warpInBlock;
     threadgroup real4* posBuffer = workgroupPosBuffer+TILE_SIZE*warpInBlock;
     threadgroup int* exclusionsForX = workgroupExclusions+MAX_EXCLUSIONS*warpInBlock;
     threadgroup int* block2Buffer = workgroupBlock2Buffer+(warpSize+1)*warpInBlock;
@@ -341,7 +341,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         int x = sortedBlocks[block1] & BLOCK_INDEX_MASK;
         real4 blockCenterX = sortedBlockCenter[block1];
         real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
-        int halfNeighbors[numHalves] = {};
+        int listNeighbors[numLists] = {};
         real4 pos1 = posq[x*TILE_SIZE+indexInTile];
 #ifdef USE_PERIODIC
         const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= PADDED_CUTOFF &&
@@ -583,15 +583,21 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const unsigned int interactCount = interacts;
 #endif
 
-                // Add any interacting atoms to the buffer.  With half blocks, each 16-atom half of block X keeps its own
-                // list: a Y atom joins a half's list when it is within the padded cutoff of an atom in that half.
+                // Add any interacting atoms to the buffer.  With half blocks, block X keeps three lists: a Y atom within
+                // the padded cutoff of atoms in both 16-atom halves goes to the whole-tile list (h = 2), and one near a
+                // single half goes to that half's list (h = 0 or 1).
 
-                #pragma unroll
-                for (int h = 0; h < numHalves; h++) {
-                    threadgroup int* buffer = halfBuffers+BUFFER_SIZE*h;
-                    int neighborsInBuffer = halfNeighbors[h];
 #ifdef USE_HALF_BLOCKS
-                    const bool includeAtom = ((interacts >> (16*h)) & 0xFFFF) != 0;
+                const bool nearLow = (interacts & 0xFFFF) != 0;
+                const bool nearHigh = (interacts >> 16) != 0;
+                const int list = (nearLow && nearHigh ? 2 : (nearHigh ? 1 : 0));
+#endif
+                #pragma unroll
+                for (int h = 0; h < numLists; h++) {
+                    threadgroup int* buffer = listBuffers+BUFFER_SIZE*h;
+                    int neighborsInBuffer = listNeighbors[h];
+#ifdef USE_HALF_BLOCKS
+                    const bool includeAtom = (list == h && (nearLow || nearHigh));
 #else
                     const bool includeAtom = interactCount > MAX_BITS_FOR_PAIRS;
 #endif
@@ -612,7 +618,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
                         if (newTileStartIndex+tilesToStore <= maxTiles) {
                             if (indexInWarp < tilesToStore)
-                                interactingTiles[newTileStartIndex+indexInWarp] = x*numHalves+h;
+                                interactingTiles[newTileStartIndex+indexInWarp] = (numLists == 1 ? x : 4*x+h);
                             for (int j = 0; j < tilesToStore/tilesPerWarp; j++)
                                 interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = buffer[j*warpSize+indexInWarp];
                         }
@@ -621,7 +627,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         neighborsInBuffer -= TILE_SIZE*tilesToStore;
                         SYNC_WARPS;
                     }
-                    halfNeighbors[h] = neighborsInBuffer;
+                    listNeighbors[h] = neighborsInBuffer;
                 }
             }
 
@@ -634,9 +640,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         // If we have a partially filled buffer,  store it to memory.
 
         #pragma unroll
-        for (int h = 0; h < numHalves; h++) {
-            threadgroup int* buffer = halfBuffers+BUFFER_SIZE*h;
-            const int neighborsInBuffer = halfNeighbors[h];
+        for (int h = 0; h < numLists; h++) {
+            threadgroup int* buffer = listBuffers+BUFFER_SIZE*h;
+            const int neighborsInBuffer = listNeighbors[h];
             if (neighborsInBuffer > 0) {
                 unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
                 unsigned int tileStartIndex = 0;
@@ -645,7 +651,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
                 if (newTileStartIndex+tilesToStore <= maxTiles) {
                     if (indexInWarp < tilesToStore)
-                        interactingTiles[newTileStartIndex+indexInWarp] = x*numHalves+h;
+                        interactingTiles[newTileStartIndex+indexInWarp] = (numLists == 1 ? x : 4*x+h);
                     for (int j = 0; j <= tilesToStore/tilesPerWarp; j++) {
                         if (j*warpSize+indexInWarp < tilesToStore*TILE_SIZE)
                             interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = (j*warpSize+indexInWarp < neighborsInBuffer ? buffer[j*warpSize+indexInWarp] : PADDED_NUM_ATOMS);
