@@ -32,6 +32,7 @@
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <utility>
@@ -303,6 +304,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             maxSinglePairs = maxPossiblePairs;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
         numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
+        // Probe only, never for merge: M29_TILES_IN_BATCH overrides the warps per x block.
+        if (const char* probe = getenv("M29_TILES_IN_BATCH"))
+            numTilesInBatch = atoi(probe);
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
