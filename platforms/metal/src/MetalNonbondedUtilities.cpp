@@ -43,6 +43,8 @@ using namespace std;
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
 // it doesn't wait for MetalQueue's idle commit.
 static const int StepsPerCommandBuffer = 8;
+// Replay experiment: 0 rotates tile data through the warp, 1 is TG_FORCE, 2 is BOTH_SIDES.
+static const int TileExchange = 1;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -773,6 +775,25 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     }
     replacements["SHUFFLE_WARP_DATA"] = shuffleWarpData.str();
 
+    stringstream declareTg, storeTg, load2Tg, load1Y, load2X;
+    for (const ComputeParameterInfo& param : params) {
+        const string& name = param.getName();
+        declareTg<<"__shared__ "<<param.getType()<<" local_"<<name<<"[THREAD_BLOCK_SIZE];\n";
+        storeTg<<"local_"<<name<<"[threadIdx.x] = shfl"<<name<<";\n";
+        load2Tg<<param.getType()<<" "<<name<<"2 = local_"<<name<<"[tbx+tj];\n";
+        if (TileExchange == 2) {
+            declareTg<<"__shared__ "<<param.getType()<<" localX_"<<name<<"[THREAD_BLOCK_SIZE];\n";
+            storeTg<<"localX_"<<name<<"[threadIdx.x] = "<<name<<"1;\n";
+        }
+        load1Y<<param.getType()<<" "<<name<<"1 = shfl"<<name<<";\n";
+        load2X<<param.getType()<<" "<<name<<"2 = localX_"<<name<<"[tbx+tj];\n";
+    }
+    replacements["DECLARE_TG_PARAMETERS"] = declareTg.str();
+    replacements["STORE_TG_PARAMETERS"] = storeTg.str();
+    replacements["LOAD_ATOM2_PARAMETERS_TG"] = load2Tg.str();
+    replacements["LOAD_ATOM1_PARAMETERS_FROM_Y"] = load1Y.str();
+    replacements["LOAD_ATOM2_PARAMETERS_FROM_X"] = load2X.str();
+
     map<string, string> defines;
     if (useCutoff)
         defines["USE_CUTOFF"] = "1";
@@ -790,6 +811,10 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     if (includeEnergy)
         defines["INCLUDE_ENERGY"] = "1";
     defines["THREAD_BLOCK_SIZE"] = context.intToString(forceThreadBlockSize);
+    if (TileExchange == 1 && isSymmetric)
+        defines["TG_FORCE"] = "1";
+    if (TileExchange == 2 && isSymmetric)
+        defines["BOTH_SIDES"] = "1";
     double maxCutoff = 0.0;
     for (int i = 0; i < 32; i++) {
         if ((groups&(1<<i)) != 0) {

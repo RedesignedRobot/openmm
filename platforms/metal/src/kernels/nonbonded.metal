@@ -245,6 +245,161 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
     }
 
+#if defined(USE_NEIGHBOR_LIST) && (defined(TG_FORCE) || defined(BOTH_SIDES))
+    // Second loop, variants that pass tile data through threadgroup memory instead of rotating it through the warp.
+    // TG_FORCE: y positions and parameters are read from threadgroup memory at (tgx+k)%32, and y forces accumulate
+    // there, as in the OpenCL platform's kernel.  BOTH_SIDES: each tile is evaluated from the x side and then from
+    // the y side, so every lane sums only its own atom's force in registers.
+    const unsigned int numTiles = interactionCount[0];
+    if (numTiles > maxTiles)
+        return; // There wasn't enough memory for the neighbor list.
+    const unsigned int tbx = threadIdx.x - tgx;
+    __shared__ real4 localPosq[THREAD_BLOCK_SIZE];
+    __shared__ unsigned int localIndex[THREAD_BLOCK_SIZE];
+    DECLARE_TG_PARAMETERS
+#ifdef TG_FORCE
+    __shared__ real localFx[THREAD_BLOCK_SIZE], localFy[THREAD_BLOCK_SIZE], localFz[THREAD_BLOCK_SIZE];
+#else
+    __shared__ real4 localPosqX[THREAD_BLOCK_SIZE];
+#endif
+    mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
+    const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
+    for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
+        const int x = tiles[pos];
+        real4 blockSizeX = blockSize[x];
+        const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
+                                         0.5f*periodicBoxSize.z-blockSizeX.z >= MAX_CUTOFF);
+        unsigned int atom1 = x*TILE_SIZE + tgx;
+        real4 posq1 = posq[atom1];
+        LOAD_ATOM1_PARAMETERS
+        unsigned int j = interactingAtoms[pos*TILE_SIZE+tgx];
+        DECLARE_LOCAL_PARAMETERS
+        real4 posqJ;
+        if (j < PADDED_NUM_ATOMS) {
+            posqJ = posq[j];
+            LOAD_LOCAL_PARAMETERS_FROM_GLOBAL
+        }
+        else {
+            posqJ = make_real4(0, 0, 0, 0);
+            CLEAR_LOCAL_PARAMETERS
+        }
+#ifdef USE_PERIODIC
+        real4 blockCenterX = blockCenter[x];
+        if (singlePeriodicCopy) {
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(posqJ, blockCenterX)
+        }
+#endif
+        // The previous tile's reads must finish before this tile's writes.
+        SYNC_WARPS;
+        localPosq[threadIdx.x] = posqJ;
+        localIndex[threadIdx.x] = j;
+        STORE_TG_PARAMETERS
+#ifdef TG_FORCE
+        localFx[threadIdx.x] = 0;
+        localFy[threadIdx.x] = 0;
+        localFz[threadIdx.x] = 0;
+#else
+        localPosqX[threadIdx.x] = posq1;
+#endif
+        SYNC_WARPS;
+        real3 force = make_real3(0);
+        unsigned int tj = tgx;
+        for (unsigned int k = 0; k < TILE_SIZE; k++) {
+            real4 posq2 = localPosq[tbx+tj];
+            real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+#ifdef USE_PERIODIC
+            if (!singlePeriodicCopy) {
+                APPLY_PERIODIC_TO_DELTA(delta)
+            }
+#endif
+            real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+            if (r2 < MAX_CUTOFF_SQUARED) {
+                real invR = RSQRT(r2);
+                real r = r2*invR;
+                LOAD_ATOM2_PARAMETERS_TG
+                int atom2 = localIndex[tbx+tj];
+                real dEdR = 0.0f;
+#ifdef USE_EXCLUSIONS
+                bool isExcluded = !(atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+#endif
+                real tempEnergy = 0.0f;
+                const real interactionScale = 1.0f;
+                COMPUTE_INTERACTION
+#ifdef INCLUDE_ENERGY
+                energy += tempEnergy;
+#endif
+                delta *= dEdR;
+                force -= delta;
+#ifdef TG_FORCE
+                localFx[tbx+tj] += delta.x;
+                localFy[tbx+tj] += delta.y;
+                localFz[tbx+tj] += delta.z;
+#endif
+            }
+            tj = (tj+1) & (TILE_SIZE-1);
+#ifdef TG_FORCE
+            SYNC_WARPS;
+#endif
+        }
+#if defined(BOTH_SIDES) && defined(INCLUDE_FORCES)
+        // The same pairs from the y side: this lane's y atom against every x atom.
+        real3 forceJ = make_real3(0);
+        tj = tgx;
+        for (unsigned int k = 0; k < TILE_SIZE; k++) {
+            real4 posqX = localPosqX[tbx+tj];
+            real3 delta = make_real3(posqX.x-posqJ.x, posqX.y-posqJ.y, posqX.z-posqJ.z);
+#ifdef USE_PERIODIC
+            if (!singlePeriodicCopy) {
+                APPLY_PERIODIC_TO_DELTA(delta)
+            }
+#endif
+            real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+            if (r2 < MAX_CUTOFF_SQUARED) {
+                real invR = RSQRT(r2);
+                real r = r2*invR;
+                real4 posq1 = posqJ;
+                real4 posq2 = posqX;
+                LOAD_ATOM1_PARAMETERS_FROM_Y
+                LOAD_ATOM2_PARAMETERS_FROM_X
+                int atom1 = j;
+                int atom2 = x*TILE_SIZE+tj;
+                real dEdR = 0.0f;
+#ifdef USE_EXCLUSIONS
+                bool isExcluded = !(atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+#endif
+                real tempEnergy = 0.0f;
+                const real interactionScale = 1.0f;
+                COMPUTE_INTERACTION
+                forceJ -= delta*dEdR;
+            }
+            tj = (tj+1) & (TILE_SIZE-1);
+        }
+#endif
+#ifdef INCLUDE_FORCES
+        xForceX += realToFixedPoint(force.x);
+        xForceY += realToFixedPoint(force.y);
+        xForceZ += realToFixedPoint(force.z);
+        if (pos+1 == end || tiles[pos+1] != x) {
+            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
+            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
+            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+            xForceX = xForceY = xForceZ = 0;
+        }
+#ifdef TG_FORCE
+        const real3 yForce = make_real3(localFx[threadIdx.x], localFy[threadIdx.x], localFz[threadIdx.x]);
+#else
+        const real3 yForce = forceJ;
+#endif
+        if (j < PADDED_NUM_ATOMS) {
+            atomicAdd(&forceBuffers[j], static_cast<unsigned long long>(realToFixedPoint(yForce.x)));
+            atomicAdd(&forceBuffers[j+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(yForce.y)));
+            atomicAdd(&forceBuffers[j+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(yForce.z)));
+        }
+#endif
+    }
+#else
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
@@ -471,6 +626,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
         }
     }
+#endif
 
     // Third loop: single pairs that aren't part of a tile.
 
