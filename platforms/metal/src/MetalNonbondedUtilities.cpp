@@ -57,13 +57,17 @@ public:
     const char* getSortKey() const {return "value";}
 };
 
+// The largest system whose rebuild decision and block sort run in one threadgroup.  apoa1 (2882 blocks) fits.
+static const int MaxIndirectRebuildBlocks = 4096;
+
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
         pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
-    // this.  The block sort must fit the short-list kernel, which takes up to 1024 blocks.
-    useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && context.getNumAtomBlocks() <= 1024;
+    // this.  prepareRebuildDispatch sorts the blocks in one threadgroup, which keeps a byte per block in
+    // threadgroup memory.
+    useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && context.getNumAtomBlocks() <= MaxIndirectRebuildBlocks;
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
