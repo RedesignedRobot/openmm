@@ -57,13 +57,16 @@ static string getDeviceName(MTL::Device* device) {
     return name;
 }
 
+// On macOS 14 or an older GPU the platform stays unregistered, so OpenCL or CPU gets picked.
 #ifdef OPENMM_COMMON_BUILDING_STATIC_LIBRARY
 extern "C" void registerMetalPlatform() {
-    Platform::registerPlatform(new MetalPlatform());
+    if (isPlatformSupported())
+        Platform::registerPlatform(new MetalPlatform());
 }
 #else
 extern "C" OPENMM_EXPORT_COMMON void registerPlatforms() {
-    Platform::registerPlatform(new MetalPlatform());
+    if (isPlatformSupported())
+        Platform::registerPlatform(new MetalPlatform());
 }
 #endif
 
@@ -200,6 +203,11 @@ vector<map<string, string> > MetalPlatform::getDevices(const map<string, string>
 }
 
 void MetalPlatform::contextCreated(ContextImpl& context, const map<string, string>& properties) const {
+    // The kernels compile as MSL 3.2 with MTLCompileOptions mathMode, both new in macOS 15.  On
+    // macOS 14 setMathMode: is an unrecognized selector, which aborts the process instead of throwing.
+    // registerPlatforms() already skips such Macs; this covers a MetalPlatform created by hand.
+    if (!isPlatformSupported())
+        throw OpenMMException("The Metal platform needs macOS 15 or later and an Apple7-family GPU (M1 or later)");
     const string& devicePropValue = (properties.find(MetalDeviceIndex()) == properties.end() ?
             getPropertyDefaultValue(MetalDeviceIndex()) : properties.find(MetalDeviceIndex())->second);
     string blockingPropValue = (properties.find(MetalUseBlockingSync()) == properties.end() ?
