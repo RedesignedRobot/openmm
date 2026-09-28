@@ -49,6 +49,9 @@ DEVICE real bornSumTerm(real r, real invR, real radius1, real invRadius1, real s
     real rScaledRadiusJ = r+scaledRadius2;
     if (radius1 >= rScaledRadiusJ)
         return 0;
+#ifdef R3OV_CHEAPOBC
+    return invR*invR*scaledRadius2; // Probe only: ceiling for a tabulated descreening term.
+#endif
     real lowerLimit = max(radius1, fabs(r-scaledRadius2));
     real invProduct = RECIP(lowerLimit*rScaledRadiusJ);
     real l_ij = rScaledRadiusJ*invProduct;

@@ -49,6 +49,7 @@
 #include "jama_eig.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 
@@ -1982,6 +1983,12 @@ void CommonCalcGBSAOBCForceKernel::initialize(const System& system, const GBSAOB
     bool usePeriodic = (force.getNonbondedMethod() != GBSAOBCForce::NoCutoff && force.getNonbondedMethod() != GBSAOBCForce::CutoffNonPeriodic);
     cutoff = force.getCutoffDistance();
     string source = CommonKernelSources::gbsaObc2;
+    if (getenv("R3OV_CHEAPOBC") != NULL) // Probe only: ceiling for a tabulated chain rule.
+        source = "{\n"
+                "    real tempdEdR = (BORN_FORCE1+BORN_FORCE2)*(invR*invR*OBC_PARAMS1.y*OBC_PARAMS2.y)/0x100000000;\n"
+                "    unsigned int includeInteraction = (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS && atom1 != atom2 && r2 < CUTOFF_SQUARED);\n"
+                "    dEdR += (includeInteraction ? tempdEdR : (real) 0);\n"
+                "}\n";
     map<string, string> replacements;
     replacements["CHARGE1"] = prefix+"charge1";
     replacements["CHARGE2"] = prefix+"charge2";

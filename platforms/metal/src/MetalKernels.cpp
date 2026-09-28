@@ -63,6 +63,7 @@ static void getMetalPmeParameters(MetalContext& cu, bool& usePmeQueue, bool& use
 
 // Probe knobs, never for merge. R3OV_NOBONDED=1 drops bonded work on force-only steps (ceiling).
 // R3OV_EARLYBONDED=1 runs it beside the Born sum, =2 beside Force1, =3 beside reduceBornForce.
+// R3OV_NODIRECT (CommonCalcNonbondedForce.cpp) and R3OV_CHEAPOBC (here and CommonKernels.cpp) are ceilings too.
 static int r3ovKnob(const char* name) {
     const char* value = getenv(name);
     return (value == NULL ? 0 : atoi(value));
@@ -253,6 +254,8 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     map<string, string> defines;
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
+    if (getenv("R3OV_CHEAPOBC") != NULL)
+        defines["R3OV_CHEAPOBC"] = "1";
     defines["CUTOFF_SQUARED"] = cu.doubleToString(cutoff*cutoff);
     defines["CUTOFF"] = cu.doubleToString(cutoff);
     defines["PREFACTOR"] = cu.doubleToString(prefactor);
