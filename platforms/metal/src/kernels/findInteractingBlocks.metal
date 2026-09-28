@@ -669,6 +669,7 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
         unsigned int* __restrict__ pinnedInteractionCount) {
     pinnedInteractionCount[0] = interactionCount[0];
     pinnedInteractionCount[1] = interactionCount[1];
+    pinnedInteractionCount[2] = pinnedInteractionCount[2]+1;
 }
 
 #ifdef INDIRECT_REBUILD

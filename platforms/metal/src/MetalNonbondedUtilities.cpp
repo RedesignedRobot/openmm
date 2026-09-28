@@ -32,6 +32,10 @@
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <utility>
@@ -60,6 +64,18 @@ public:
 // The largest system whose rebuild decision and block sort run in one threadgroup.  apoa1 (2882 blocks) fits.
 static const int MaxIndirectRebuildBlocks = 4096;
 
+// Probe only: OPENMM_R2_COUNT=nowait never waits for the count (an upper bound), mem waits on a counter that
+// copyInteractionCounts bumps in the pinned buffer instead of a shared event, so no signal splits the buffer.
+static int probeCountMode() {
+    static int mode = -1;
+    if (mode == -1) {
+        const char* v = getenv("OPENMM_R2_COUNT");
+        mode = (v == NULL ? 0 : string(v) == "nowait" ? 1 : string(v) == "mem" ? 2 : 0);
+    }
+    return mode;
+}
+static unsigned int probeCountCopies = 0;
+
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
         pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
@@ -71,7 +87,8 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
-    pinnedCountDeviceMemory = context.getDevice()->newBuffer(2*sizeof(unsigned int), MTL::ResourceStorageModeShared);
+    pinnedCountDeviceMemory = context.getDevice()->newBuffer(4*sizeof(unsigned int), MTL::ResourceStorageModeShared);
+    memset(pinnedCountDeviceMemory->contents(), 0, 4*sizeof(unsigned int));
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
     // Large systems have enough neighbor list tiles to split finely, and 160 force blocks per core instead of 40 make
     // apoa1, cellulose and stmv 4-11% faster on an M3 Ultra and 1-2% faster on an M2.  Small systems lose at 160 (rf
@@ -474,12 +491,14 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     forceRebuildNeighborList = false;
     // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
     // which is all a step without the wait needs.
-    bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
-    if (wait || !useIndirectRebuild)
+    bool wait = ((waitForCount && probeCountMode() != 1) || context.getStepsSinceReorder() == 0);
+    if (wait || !useIndirectRebuild) {
         context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
+        probeCountCopies++;
+    }
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
-    if (wait)
+    if (wait && probeCountMode() != 2)
         downloadCountEvent->signal();
 }
 
@@ -509,7 +528,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
         // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
-        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        bool wait = ((waitForCount && probeCountMode() != 1) || context.getStepsSinceReorder() == 0);
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
         if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
@@ -517,7 +536,18 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             uncommittedSteps = 0;
         }
         commitCountAfterLastStep = queue.getCommitCount();
-        if (wait)
+        if (wait && probeCountMode() == 2) {
+            volatile unsigned int* copies = pinnedCountBuffer+2;
+            for (int i = 0; *copies != probeCountCopies; i++) {
+                usleep(10);
+                if (i > 2000) {
+                    queue.finish();
+                    break;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+        }
+        else if (wait)
             downloadCountEvent->poll();
         updateNeighborListSize();
     }
