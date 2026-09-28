@@ -239,6 +239,7 @@ void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionR
         totalMass += system.getParticleMass(i);
     map<string, string> defines;
     defines["INVERSE_TOTAL_MASS"] = cu.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
+    defines["CM_INVERSE_TOTAL_MASS"] = cu.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass, true);
     defines["CM_BLOCK_SIZE"] = cu.intToString(MaxCMBlockSize);
     ComputeProgram program = cu.compileProgram(CommonKernelSources::removeCM+MetalKernelSources::centerOfMass, defines);
     kernel1 = program->createKernel("calcCenterOfMassMomentum");
