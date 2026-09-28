@@ -32,6 +32,7 @@
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <utility>
@@ -826,6 +827,15 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    // Probe only, never merges: P_ABL bits remove per-tile work on list tiles. 1 = y-force atomics become stores,
+    // 2 = y data loads from block x^1 instead of the list atoms, 4 = x flush atomics become stores.
+    int ablation = getenv("P_ABL") ? atoi(getenv("P_ABL")) : 0;
+    if (ablation & 1)
+        defines["P_ABL_YSTORE"] = "1";
+    if (ablation & 2)
+        defines["P_ABL_YLOCAL"] = "1";
+    if (ablation & 4)
+        defines["P_ABL_XSTORE"] = "1";
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";

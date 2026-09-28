@@ -312,6 +312,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             unsigned int j = y*TILE_SIZE + tgx;
 #endif
             int atomIndex = j;
+#if defined(USE_NEIGHBOR_LIST) && defined(P_ABL_YLOCAL)
+            j = (x^1)*TILE_SIZE+tgx;
+#endif
             DECLARE_LOCAL_PARAMETERS
             real4 shflPosq;
             real3 shflForce;
@@ -463,9 +466,15 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             xForceY += realToFixedPoint(force.y);
             xForceZ += realToFixedPoint(force.z);
             if (pos+1 == end || tiles[pos+1] != x) {
+#ifdef P_ABL_XSTORE
+                forceBuffers[atom1] = static_cast<unsigned long long>(xForceX);
+                forceBuffers[atom1+PADDED_NUM_ATOMS] = static_cast<unsigned long long>(xForceY);
+                forceBuffers[atom1+2*PADDED_NUM_ATOMS] = static_cast<unsigned long long>(xForceZ);
+#else
                 atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
                 atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
                 atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+#endif
                 xForceX = xForceY = xForceZ = 0;
             }
 #else
@@ -475,9 +484,15 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
             unsigned int atom2 = atomIndex;
             if (atom2 < PADDED_NUM_ATOMS) {
+#if defined(USE_NEIGHBOR_LIST) && defined(P_ABL_YSTORE)
+                forceBuffers[atom2] = static_cast<unsigned long long>(realToFixedPoint(shflForce.x));
+                forceBuffers[atom2+PADDED_NUM_ATOMS] = static_cast<unsigned long long>(realToFixedPoint(shflForce.y));
+                forceBuffers[atom2+2*PADDED_NUM_ATOMS] = static_cast<unsigned long long>(realToFixedPoint(shflForce.z));
+#else
                 atomicAdd(&forceBuffers[atom2], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
                 atomicAdd(&forceBuffers[atom2+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.y)));
                 atomicAdd(&forceBuffers[atom2+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.z)));
+#endif
             }
 #endif
         }
