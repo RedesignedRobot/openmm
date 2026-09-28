@@ -310,8 +310,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     const char* variant = getenv("OPENMM_METAL_GB_VARIANT");
     foldBornForce = (variant != NULL && string(variant) == "fold");
     reduceLanes = (variant != NULL && string(variant) == "lanes32" ? 32 : 8);
-    if (!foldBornForce)
-        partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
+    partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
     map<string, string> defines;
     if (foldBornForce)
         defines["FOLD_BORN_FORCE"] = "1";
@@ -342,10 +341,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
-    if (foldBornForce)
-        ownedForce1Kernel->addArg(cu.getLongForceBuffer());
-    else
-        ownedForce1Kernel->addArg(partialForce);
+    ownedForce1Kernel->addArg(partialForce);
     ownedForce1Kernel->addArg(cu.getEnergyBuffer());
     ownedForce1Kernel->addArg(cu.getPosq());
     ownedForce1Kernel->addArg(bornSum);
@@ -358,10 +354,10 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
-    if (foldBornForce) {
-        ownedForce1Kernel->addArg(bornForce);
+    ownedForce1Kernel->addArg(cu.getLongForceBuffer());
+    ownedForce1Kernel->addArg(bornForce);
+    if (foldBornForce)
         return true;
-    }
     ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
     ownedReduceBornForceKernel->addArg(partialForce);
     ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
