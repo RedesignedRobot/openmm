@@ -337,7 +337,7 @@ private:
     MetalArray largeBlockBoundingBox;
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
-    MetalArray displacementFlags, rebuildDispatch;
+    MetalArray blockDisplacement, rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
     ComputeSort blockSorter;
