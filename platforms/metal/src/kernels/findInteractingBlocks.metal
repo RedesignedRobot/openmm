@@ -323,6 +323,12 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     threadgroup real4* posBuffer = workgroupPosBuffer+TILE_SIZE*warpInBlock;
     threadgroup int* exclusionsForX = workgroupExclusions+MAX_EXCLUSIONS*warpInBlock;
     threadgroup int* block2Buffer = workgroupBlock2Buffer+(warpSize+1)*warpInBlock;
+#ifdef CACHE_BLOCK2_Y
+    // The block search already loaded each candidate's center, and it loads its sorted index in parallel, so the
+    // serial loop over candidates starts at posq.
+    __shared__ real4 workgroupBlock2Center[(warpSize+1)*warpsPerBlock];
+    threadgroup real4* block2Center = workgroupBlock2Center+(warpSize+1)*warpInBlock;
+#endif
 
     // Loop over blocks.
 
@@ -447,7 +453,12 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             warpflags includeBlockFlags = __ballot(includeBlock2);
             if (includeBlock2) {
                 int index = block2Count + warpPopc(includeBlockFlags&warpMask);
+#ifdef CACHE_BLOCK2_Y
+                block2Buffer[index] = ((sortedBlocks[block2] & BLOCK_INDEX_MASK) << 1) | (forceInclude ? 1 : 0);
+                block2Center[index] = blockCenterY;
+#else
                 block2Buffer[index] = (block2 << 1) | (forceInclude ? 1 : 0);
+#endif
             }
             block2Count += warpPopc(includeBlockFlags);
             SYNC_WARPS;
@@ -459,10 +470,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             const int block2ToProcess = lastIteration ? block2Count : block2Count/tilesPerWarp*tilesPerWarp;
             for (int block2Index = 0; block2Index < block2ToProcess; block2Index += tilesPerWarp) {
                 bool includeBlock2 = block2Index + tileInWarp < block2Count;
-                const int b = block2Buffer[min(block2Index + tileInWarp, block2Count - 1)];
+                const int candidate = min(block2Index + tileInWarp, block2Count - 1);
+                const int b = block2Buffer[candidate];
                 const bool forceInclude = b & 1;
+#ifdef CACHE_BLOCK2_Y
+                const int y = b >> 1;
+#else
                 const int block2 = b >> 1;
                 int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#endif
 
                 #pragma unroll 1
                 for (int k = indexInTile; k < numExclusions; k += TILE_SIZE)
@@ -479,7 +495,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 }
 #endif
                 pos2.w = 0.5f * (pos2.x * pos2.x + pos2.y * pos2.y + pos2.z * pos2.z);
+#ifdef CACHE_BLOCK2_Y
+                real4 blockCenterY = block2Center[candidate];
+#else
                 real4 blockCenterY = sortedBlockCenter[block2];
+#endif
                 real3 atomDelta = trimTo3(pos1)-trimTo3(blockCenterY);
 #ifdef USE_PERIODIC
                 APPLY_PERIODIC_TO_DELTA(atomDelta)
@@ -606,8 +626,12 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             }
 
             // Move not processed blocks to the head of block2Buffer.
-            if (indexInWarp < block2Count - block2ToProcess)
+            if (indexInWarp < block2Count - block2ToProcess) {
                 block2Buffer[indexInWarp] = block2Buffer[block2ToProcess + indexInWarp];
+#ifdef CACHE_BLOCK2_Y
+                block2Center[indexInWarp] = block2Center[block2ToProcess + indexInWarp];
+#endif
+            }
             block2Count = block2Count - block2ToProcess;
         }
 

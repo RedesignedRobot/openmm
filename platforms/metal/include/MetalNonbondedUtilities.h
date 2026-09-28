@@ -357,7 +357,7 @@ private:
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams, waitForCount;
     bool useLJPME = false;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
-    int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
+    int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, findBlocksVariant, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     int uncommittedSteps;
     long long numTiles, commitCountAfterLastStep;

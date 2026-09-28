@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unistd.h>
 #include <map>
@@ -103,7 +104,11 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // to the energy buffer that is cleared each step.
     numForceThreadBlocks = (context.getNumAtoms() > 90000 ? 160 : 40)*context.getMultiprocessors();
     forceThreadBlockSize = 64;
-    findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
+    // Screen only, never a default: OPENMM_METAL_FB bit 0 runs 4 SIMD groups per findBlocksWithInteractions
+    // threadgroup, bit 1 caches each candidate block's index and center during the block search.
+    const char* findBlocksVariantEnv = getenv("OPENMM_METAL_FB");
+    findBlocksVariant = (findBlocksVariantEnv == NULL ? 0 : atoi(findBlocksVariantEnv));
+    findInteractingBlocksThreadBlockSize = context.getSIMDWidth()*((findBlocksVariant&1) != 0 ? 4 : 1);
 
     // When building the neighbor list, we can optionally use large blocks (32 * warpSize atoms) to
     // accelerate the process.  This makes building the neighbor list faster, but it prevents
@@ -726,6 +731,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
+        if ((findBlocksVariant&2) != 0)
+            defines["CACHE_BLOCK2_Y"] = "1";
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
         if (sortBlocksByBins) {
