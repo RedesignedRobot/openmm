@@ -65,7 +65,7 @@ KERNEL void computeHeatBathEnergy(GLOBAL mixed* RESTRICT heatBathEnergy, int cha
 }
 
 KERNEL void computeAtomsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int numAtoms,
-                                      GLOBAL const mixed4* RESTRICT velm, GLOBAL const int *RESTRICT atoms){
+                                      GLOBAL const mixed4s* RESTRICT velm, GLOBAL const int *RESTRICT atoms){
     mixed2 energy = make_mixed2(0,0);
     int index = GLOBAL_ID;
     while (index < numAtoms){
@@ -79,7 +79,7 @@ KERNEL void computeAtomsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int
 }
 
 KERNEL void computePairsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int numPairs,
-                                      GLOBAL const mixed4* RESTRICT velm, GLOBAL const int2 *RESTRICT pairs){
+                                      GLOBAL const mixed4s* RESTRICT velm, GLOBAL const int2 *RESTRICT pairs){
     mixed2 energy = make_mixed2(0,0);
     int index = GLOBAL_ID;
     while (index < numPairs){
@@ -108,7 +108,7 @@ KERNEL void computePairsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int
 }
 
 KERNEL void scaleAtomsVelocities(GLOBAL mixed2* RESTRICT scaleFactor, int numAtoms,
-                                   GLOBAL mixed4* RESTRICT velm, GLOBAL const int *RESTRICT atoms){
+                                   GLOBAL mixed4s* RESTRICT velm, GLOBAL const int *RESTRICT atoms){
     const mixed scale = scaleFactor[0].x;
     int index = GLOBAL_ID;
     while (index < numAtoms){
@@ -121,7 +121,7 @@ KERNEL void scaleAtomsVelocities(GLOBAL mixed2* RESTRICT scaleFactor, int numAto
 }
 
 KERNEL void scalePairsVelocities(GLOBAL mixed2 * RESTRICT scaleFactor, int numPairs,
-                                 GLOBAL mixed4* RESTRICT velm, GLOBAL const int2 *RESTRICT pairs){
+                                 GLOBAL mixed4s* RESTRICT velm, GLOBAL const int2 *RESTRICT pairs){
     int index = GLOBAL_ID;
     mixed comScale = scaleFactor[0].x;
     mixed relScale = scaleFactor[0].y;

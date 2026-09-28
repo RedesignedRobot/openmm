@@ -288,6 +288,11 @@ public:
      */
     metalFunction_t getKernel(metalModule_t& module, const std::string& name);
     /**
+     * How a kernel's buffer argument reads memory: as ordinary values, as float pairs (a mixed4s buffer in mixed
+     * precision), or as raw 32 bit words that work with either, as the clear kernels do.
+     */
+    enum BufferLayout : char {PlainLayout, PairLayout, AnyLayout};
+    /**
      * Execute a kernel.
      *
      * @param kernel       the kernel to execute
@@ -308,6 +313,12 @@ public:
      */
     void executeKernelFlat(metalFunction_t kernel, void** arguments, int threads, int blockSize = -1, unsigned int sharedSize = 0,
             MTL::Buffer* indirect = NULL, size_t indirectOffset = 0);
+    /**
+     * Get the layout each buffer argument of a kernel reads (see MetalArray::setPairStorage).
+     */
+    const std::vector<BufferLayout>& getArgumentLayouts(metalFunction_t kernel) {
+        return kernelArguments[kernel].layouts;
+    }
     /**
      * Compute the largest thread block size that can be used for a kernel that requires a particular amount of
      * shared memory per thread.
@@ -489,10 +500,12 @@ private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
      * each buffer.  When the kernel has too many arguments for separate bindings, offsets holds where
-     * each value goes in one struct bound at index 0, and packedSize is that struct's size.
+     * each value goes in one struct bound at index 0, and packedSize is that struct's size.  layouts
+     * holds the layout each buffer argument reads.
      */
     struct KernelArguments {
         std::vector<int> sizes, offsets;
+        std::vector<BufferLayout> layouts;
         int packedSize = 0;
     };
     /**
@@ -504,6 +517,10 @@ private:
      * struct.  Returns false if the struct has more buffer markers than the kernel has buffer bindings.
      */
     bool getPackedArguments(MTL::BufferBinding* binding, int numBuffers, KernelArguments& args);
+    /**
+     * Get the layout a buffer argument reads, from its element type.
+     */
+    static BufferLayout getBufferLayout(MTL::BufferBinding* binding);
     MetalPlatform::PlatformData& platformData;
     int deviceIndex;
     int contextIndex;

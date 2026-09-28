@@ -1,7 +1,7 @@
 /**
  * Perform the first part of integration: velocity step.
  */
-KERNEL void integrateQTBPart1(int numAtoms, int paddedNumAtoms, mixed dt, GLOBAL mixed4* RESTRICT velm,
+KERNEL void integrateQTBPart1(int numAtoms, int paddedNumAtoms, mixed dt, GLOBAL mixed4s* RESTRICT velm,
         GLOBAL const mm_long* RESTRICT force, GLOBAL const int* RESTRICT atomOrder) {
     mixed fscale = dt/(mixed) 0x100000000;
     for (int atom = GLOBAL_ID; atom < numAtoms; atom += GLOBAL_SIZE) {
@@ -20,8 +20,8 @@ KERNEL void integrateQTBPart1(int numAtoms, int paddedNumAtoms, mixed dt, GLOBAL
  * Perform the second part of integration: position half step, then interact with heat bath,
  * then another position half step.
  */
-KERNEL void integrateQTBPart2(int numAtoms, mixed dt, mixed friction, int stepIndex, GLOBAL mixed4* RESTRICT velm,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed* RESTRICT randomForce,
+KERNEL void integrateQTBPart2(int numAtoms, mixed dt, mixed friction, int stepIndex, GLOBAL mixed4s* RESTRICT velm,
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed* RESTRICT randomForce,
         GLOBAL mixed* RESTRICT segmentVelocity, GLOBAL const int* RESTRICT atomOrder) {
     mixed halfdt = 0.5f*dt;
     mixed vscale = EXP(-dt*friction);
@@ -53,8 +53,8 @@ KERNEL void integrateQTBPart2(int numAtoms, mixed dt, mixed friction, int stepIn
  * Perform the third part of integration: apply constraint forces to velocities, then record
  * the constrained positions.
  */
-KERNEL void integrateQTBPart3(int numAtoms, mixed dt, GLOBAL real4* RESTRICT posq, GLOBAL mixed4* RESTRICT velm,
-         GLOBAL const mixed4* RESTRICT posDelta, GLOBAL const mixed4* RESTRICT oldDelta
+KERNEL void integrateQTBPart3(int numAtoms, mixed dt, GLOBAL real4* RESTRICT posq, GLOBAL mixed4s* RESTRICT velm,
+         GLOBAL const mixed4s* RESTRICT posDelta, GLOBAL const mixed4* RESTRICT oldDelta
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif
@@ -127,7 +127,7 @@ DEVICE mixed2 multiplyComplexConj(mixed2 c1, mixed2 c2) {
  * Generate the random force for the next segment.
  */
 KERNEL void generateRandomForce(int numAtoms, int segmentLength, mixed dt, mixed friction, GLOBAL float* RESTRICT noise,
-        GLOBAL mixed* RESTRICT randomForce, GLOBAL mixed4* RESTRICT velm, GLOBAL const int* RESTRICT atomOrder, GLOBAL mixed* RESTRICT thetad,
+        GLOBAL mixed* RESTRICT randomForce, GLOBAL mixed4s* RESTRICT velm, GLOBAL const int* RESTRICT atomOrder, GLOBAL mixed* RESTRICT thetad,
         GLOBAL mixed* RESTRICT cutoffFunction, GLOBAL int* RESTRICT particleType, GLOBAL mixed* RESTRICT adaptedFriction,
         GLOBAL mixed2* RESTRICT workspace) {
     const int fftLength = 3*segmentLength;
@@ -171,7 +171,7 @@ KERNEL void generateRandomForce(int numAtoms, int segmentLength, mixed dt, mixed
  * Update the friction rates used for generating noise, part 1: compute the error in the
  * fluctuation dissipation theorem.
  */
-KERNEL void adaptFrictionPart1(int numAtoms, int segmentLength, GLOBAL const mixed4* RESTRICT velm, GLOBAL const int* RESTRICT atomOrder, GLOBAL const int* RESTRICT particleType,
+KERNEL void adaptFrictionPart1(int numAtoms, int segmentLength, GLOBAL const mixed4s* RESTRICT velm, GLOBAL const int* RESTRICT atomOrder, GLOBAL const int* RESTRICT particleType,
         GLOBAL const mixed* RESTRICT randomForce, GLOBAL const mixed* RESTRICT segmentVelocity, GLOBAL const mixed* RESTRICT adaptedFriction,
         GLOBAL mm_ulong* RESTRICT dfdt, GLOBAL mixed2* RESTRICT workspace) {
     const int fftLength = 3*segmentLength;

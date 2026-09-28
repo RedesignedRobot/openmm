@@ -8,7 +8,7 @@
  * Ultra for 92k atoms, and slowed the steps it was meant to hide in.
  */
 #define CM_LOADS 4
-KERNEL void calcCenterOfMassVelocity(int numAtoms, GLOBAL const mixed4* RESTRICT velm, GLOBAL float4* RESTRICT cmVelocity) {
+KERNEL void calcCenterOfMassVelocity(int numAtoms, GLOBAL const mixed4s* RESTRICT velm, GLOBAL float4* RESTRICT cmVelocity) {
     LOCAL float4 temp[CM_BLOCK_SIZE];
     float4 cm = make_float4(0);
     for (int first = LOCAL_ID; first < numAtoms; first += CM_LOADS*LOCAL_SIZE) {
