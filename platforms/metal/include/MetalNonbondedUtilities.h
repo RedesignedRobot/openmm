@@ -228,6 +228,26 @@ public:
         return interactingAtoms;
     }
     /**
+     * Get the number of X atoms in each neighbor list tile: 16 with half-block tiles, otherwise 32.  Tile i of
+     * getListTiles() pairs atoms getTileXAtoms()*x to getTileXAtoms()*(x+1)-1, with x its entry, against the 32
+     * atoms of getListAtoms() from 32*i.
+     */
+    int getTileXAtoms() const {
+        return (useHalfBlocks ? 16 : 32);
+    }
+    /**
+     * Get the neighbor list tiles in either format, for readers that check getTileXAtoms().
+     */
+    MetalArray& getListTiles() {
+        return interactingTiles;
+    }
+    /**
+     * Get the neighbor list atoms in either format, for readers that check getTileXAtoms().
+     */
+    MetalArray& getListAtoms() {
+        return interactingAtoms;
+    }
+    /**
      * Get the array containing single pairs in the neighbor list.
      */
     MetalArray& getSinglePairs() {
