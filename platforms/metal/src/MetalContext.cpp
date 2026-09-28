@@ -451,6 +451,7 @@ void MetalContext::initialize() {
         else
             ((float4*) pinnedBuffer)[i] = make_float4(0.0f, 0.0f, 0.0f, mass == 0.0 ? 0.0f : (float) (1.0/mass));
     }
+    unwrap(velm).setPairStorage(useMixedPrecision);
     velm.upload(pinnedBuffer);
     bonded->initialize(system);
     addAutoclearBuffer(longForceBuffer);
@@ -546,12 +547,15 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << "typedef double2 mixed2;\n";
         src << "typedef double3 mixed3;\n";
         src << "typedef double4 mixed4;\n";
+        // mixed4s is the integration state (velm, posDelta) as stored: float pairs in mixed, with no IEEE decode.
+        src << (useMixedPrecision ? "typedef df64s_4 mixed4s;\n" : "typedef double4 mixed4s;\n");
     }
     else {
         src << "typedef float mixed;\n";
         src << "typedef float2 mixed2;\n";
         src << "typedef float3 mixed3;\n";
         src << "typedef float4 mixed4;\n";
+        src << "typedef float4 mixed4s;\n";
     }
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
@@ -565,6 +569,8 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << endl;
     src << MetalKernelSources::intrinsics << endl;
     string header = src.str();
+    // Common kernels use "thread" as a variable name, a reserved word in MSL, so the program source and its defines
+    // rename it.  That also renames the address space qualifier: program sources must write PRIVATE, never thread.
     string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
     string log;
     metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);
@@ -621,22 +627,40 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     MTL::Function* function = module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
     MTL::ComputePipelineReflection* reflection = NULL;
     bool packed = (packedModules.find(module) != packedModules.end());
-    MTL::PipelineOption reflectionOptions = (packed ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
+    bool typeInfo = (packed || useMixedPrecision);
+    MTL::PipelineOption reflectionOptions = (typeInfo ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
     metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, reflectionOptions, &reflection, NULL));
     KernelArguments args;
     MTL::BufferBinding* argsBinding = NULL;
+    vector<BufferLayout> bindingLayouts;
     for (int i = 0; kernel != NULL && i < reflection->bindings()->count(); i++) {
         MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
         if (binding->type() != MTL::BindingTypeBuffer)
             continue;
         string bindingName = binding->name()->utf8String();
         args.sizes.resize(max((int) args.sizes.size(), (int) binding->index()+1), 0);
+        bindingLayouts.resize(args.sizes.size(), PlainLayout);
         if (bindingName == "_in__mmArgs")
             argsBinding = (MTL::BufferBinding*) binding;
         else if (bindingName.rfind("_in_", 0) == 0)
             args.sizes[binding->index()] = ((MTL::BufferBinding*) binding)->bufferDataSize();
+        else if (useMixedPrecision)
+            bindingLayouts[binding->index()] = getBufferLayout((MTL::BufferBinding*) binding);
     }
     bool validArguments = (!packed || (argsBinding != NULL && getPackedArguments(argsBinding, args.sizes.size()-1, args)));
+    if (validArguments) {
+        // Unpacked arguments bind at their own index, packed buffers in order from index 1.
+        args.layouts.resize(args.sizes.size(), PlainLayout);
+        int bufferIndex = 1;
+        for (int i = 0; i < args.sizes.size(); i++) {
+            int bindingIndex = (packed ? bufferIndex : i);
+            if (args.sizes[i] != 0)
+                continue;
+            if (bindingIndex < bindingLayouts.size())
+                args.layouts[i] = bindingLayouts[bindingIndex];
+            bufferIndex++;
+        }
+    }
     if (function != NULL)
         function->release();
     pool->release();
@@ -646,6 +670,19 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
         throw OpenMMException("Error creating kernel "+name+": its packed arguments don't match its buffer bindings");
     kernelArguments[kernel] = args;
     return kernel;
+}
+
+MetalContext::BufferLayout MetalContext::getBufferLayout(MTL::BufferBinding* binding) {
+    MTL::DataType type = binding->bufferDataType();
+    if (type == MTL::DataTypeInt || type == MTL::DataTypeUInt)
+        return AnyLayout;
+    if (type != MTL::DataTypeStruct)
+        return PlainLayout;
+    // A df64s_4 element is the only struct whose member x is a struct with a member shi.
+    MTL::StructMember* x = binding->bufferStructType()->memberByName(NS::String::string("x", NS::UTF8StringEncoding));
+    if (x == NULL || x->dataType() != MTL::DataTypeStruct)
+        return PlainLayout;
+    return (x->structType()->memberByName(NS::String::string("shi", NS::UTF8StringEncoding)) != NULL ? PairLayout : PlainLayout);
 }
 
 bool MetalContext::getPackedArguments(MTL::BufferBinding* binding, int numBuffers, KernelArguments& args) {

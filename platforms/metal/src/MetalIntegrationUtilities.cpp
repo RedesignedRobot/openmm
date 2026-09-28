@@ -33,10 +33,13 @@ using namespace OpenMM;
 using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
-        ccmaConvergedMemory(NULL) {
+        ccmaConvergedMemory(NULL), pendingCMBlockSize(0), pendingCMVelocity(NULL) {
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
+        // posDelta shares kernels and raw copies with velm, so it stores float pairs too.  The zeros the
+        // base class uploaded read the same either way.
+        getPosDelta().setPairStorage(context.getUseMixedPrecision());
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {
@@ -163,12 +166,29 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
+    return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision();
+}
+
+void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity) {
+    pendingCMCalc = calcKernel;
+    pendingCMBlockSize = blockSize;
+    pendingCMVelocity = &cmVelocity;
+}
+
+void MetalIntegrationUtilities::calcPendingCenterOfMassMomentum() {
+    if (!pendingCMCalc)
+        return;
+    pendingCMCalc->execute(pendingCMBlockSize, pendingCMBlockSize);
+    pendingCMCalc.reset();
+}
+
 bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
     if (ccmaConstraintAtoms.isInitialized() || context.getUseDoublePrecision())
         return false;
     ContextSelector selector(context);
     if (!langevinMiddleKernel) {
-        // Each thread handles one unit: a SETTLE cluster, a SHAKE cluster, or an atom in neither.
+        // Each unit is a SETTLE cluster, a SHAKE cluster, or free atoms: one per thread, or four per quad of threads.
 
         int numAtoms = context.getNumAtoms();
         vector<bool> isConstrained(numAtoms, false);
@@ -193,19 +213,31 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         for (int i = 0; i < numAtoms; i++)
             if (!isConstrained[i])
                 unconstrained.push_back(i);
-        if (unconstrained.size() > 0) {
+        int numFree = unconstrained.size();
+        int numFreeQuads = (numFree+3)/4;
+        if (numFree > 0) {
+            unconstrained.resize(4*numFreeQuads, -1);
             freeAtoms.initialize<int>(context, unconstrained.size(), "freeAtoms");
             freeAtoms.upload(unconstrained);
         }
+
+        // The kernel is latency bound: a thread's chain of dependent operations sets its time, not the thread count.
+        // A quad of threads per unit runs the per-atom work four wide, at the cost of running the constraint code in
+        // all four lanes.  That pays only while all the quads fit in one pass of the grid executeKernel launches.  Past
+        // that, each quad runs several units in sequence and pays the redundant constraint work in full.
+        int numQuadUnits = numSettle+numShake+numFreeQuads;
+        bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
+
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
-        numLangevinMiddleUnits = numSettle+numShake+unconstrained.size();
-        langevinMiddleKernel = program->createKernel("integrateLangevinMiddleFused");
+        int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
+        numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
+        langevinMiddleKernel = program->createKernel(useQuads ? "integrateLangevinMiddleFusedQuads" : "integrateLangevinMiddleFused");
         langevinMiddleKernel->addArg(numSettle);
         langevinMiddleKernel->addArg(numShake);
-        langevinMiddleKernel->addArg(numLangevinMiddleUnits);
+        langevinMiddleKernel->addArg(numUnits);
         langevinMiddleKernel->addArg(context.getPaddedNumAtoms());
         langevinMiddleKernel->addArg(); // The tolerance will be set just before it is executed.
         langevinMiddleKernel->addArg(context.getPosq());
@@ -225,6 +257,8 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
             else
                 langevinMiddleKernel->addArg(nullptr);
         }
+        langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
+        langevinMiddleKernel->addArg(nullptr);
     }
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
@@ -232,6 +266,11 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         langevinMiddleKernel->setArg(4, (float) tol);
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
-    langevinMiddleKernel->execute(numLangevinMiddleUnits);
+    calcPendingCenterOfMassMomentum();
+    langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
+    if (pendingCMVelocity != NULL)
+        langevinMiddleKernel->setArg(19, *pendingCMVelocity);
+    langevinMiddleKernel->execute(numLangevinMiddleThreads);
+    pendingCMVelocity = NULL;
     return true;
 }

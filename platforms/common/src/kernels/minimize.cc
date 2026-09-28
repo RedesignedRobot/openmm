@@ -232,7 +232,7 @@ KERNEL void restorePos(
 }
 
 KERNEL void convertForces(
-    GLOBAL const mixed4* RESTRICT velm,
+    GLOBAL const mixed4s* RESTRICT velm,
     GLOBAL const mm_long* RESTRICT forceBuffer,
     GLOBAL const int* RESTRICT order,
     GLOBAL mixed* RESTRICT grad,

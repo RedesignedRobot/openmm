@@ -26,16 +26,17 @@
 #include "MetalArray.h"
 #include "MetalContext.h"
 #include "openmm/common/ContextSelector.h"
+#include <cmath>
 #include <iostream>
 #include <sstream>
 #include <vector>
 
 using namespace OpenMM;
 
-MetalArray::MetalArray() : pointer(0), ownsMemory(false) {
+MetalArray::MetalArray() : pointer(0), ownsMemory(false), pairStorage(false) {
 }
 
-MetalArray::MetalArray(MetalContext& context, size_t size, int elementSize, const std::string& name) : pointer(0) {
+MetalArray::MetalArray(MetalContext& context, size_t size, int elementSize, const std::string& name) : pointer(0), pairStorage(false) {
     initialize(context, size, elementSize, name);
 }
 
@@ -71,20 +72,47 @@ ComputeContext& MetalArray::getContext() {
     return *context;
 }
 
+void MetalArray::setPairStorage(bool pairs) {
+    if (pairs && elementSize != 4*sizeof(double))
+        throw OpenMMException("Array "+name+" can't store float pairs: its elements aren't mixed4");
+    pairStorage = pairs;
+}
+
+// hi is the double rounded to float, as df64 decodes it, and lo the exact remainder rounded to float.
+static void doublesToPairs(const double* source, float* dest, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        float hi = (float) source[i];
+        dest[2*i] = hi;
+        dest[2*i+1] = (std::isfinite(hi) ? (float) (source[i]-hi) : 0.0f);
+    }
+}
+
+static void pairsToDoubles(const float* source, double* dest, size_t count) {
+    for (size_t i = 0; i < count; i++)
+        dest[i] = (double) source[2*i]+(double) source[2*i+1];
+}
+
 void MetalArray::uploadSubArray(const void* data, int offset, int elements, bool blocking) {
     if (pointer == 0)
         throw OpenMMException("MetalArray has not been initialized");
     if (offset < 0 || offset+elements > getSize())
         throw OpenMMException("uploadSubArray: data exceeds range of array");
     context->getCurrentStream().finish();
-    memcpy(reinterpret_cast<char*>(pointer->contents())+offset*elementSize, data, elements*elementSize);
+    char* dest = reinterpret_cast<char*>(pointer->contents())+offset*elementSize;
+    if (pairStorage)
+        doublesToPairs((const double*) data, (float*) dest, elements*4);
+    else
+        memcpy(dest, data, elements*elementSize);
 }
 
 void MetalArray::download(void* data, bool blocking) const {
     if (pointer == 0)
         throw OpenMMException("MetalArray has not been initialized");
     context->getCurrentStream().finish();
-    memcpy(data, pointer->contents(), size*elementSize);
+    if (pairStorage)
+        pairsToDoubles((const float*) pointer->contents(), (double*) data, size*4);
+    else
+        memcpy(data, pointer->contents(), size*elementSize);
 }
 
 void MetalArray::copyTo(ArrayInterface& dest) const {
@@ -93,6 +121,9 @@ void MetalArray::copyTo(ArrayInterface& dest) const {
     if (dest.getSize() != size || dest.getElementSize() != elementSize)
         throw OpenMMException("Error copying array "+name+" to "+dest.getName()+": The destination array does not match the size of the array");
     MetalArray& cuDest = context->unwrap(dest);
+    if (cuDest.pairStorage && !pairStorage)
+        throw OpenMMException("Error copying array "+name+" to "+dest.getName()+": the destination stores float pairs and the source doesn't");
+    cuDest.pairStorage = pairStorage;
     MetalQueue& queue = context->getCurrentStream();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();

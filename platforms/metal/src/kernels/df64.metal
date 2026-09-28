@@ -54,6 +54,7 @@ inline float df64_below_tie(float hi, float lo) {
 }
 
 struct df64;
+struct df64s;
 inline df64 df64_from_ieee(uint2 bits);
 inline uint2 df64_to_ieee(df64 v);
 
@@ -95,6 +96,8 @@ struct alignas(8) df64 {
     volatile threadgroup df64& operator=(df64 v) volatile threadgroup { hi = v.hi; lo = v.lo; return *this; }
 
     df64(const device df64& o) : df64(df64_load_ieee(reinterpret_cast<const device uint*>(&o))) {}
+    df64(const device df64s& o);
+    thread df64& operator=(const device df64s& o) thread { return *this = df64(o); }
     df64(const constant df64& o) : df64(df64_load_ieee(reinterpret_cast<const constant uint*>(&o))) {}
     device df64& operator=(df64 v) device {
         uint2 b = df64_to_ieee(v);
@@ -512,6 +515,25 @@ inline df64 simd_shuffle_xor(df64 v, ushort mask) { return df64(simd_shuffle_xor
 
 void atomicAdd(device df64* target, df64 value) = delete;
 
+// A df64 stored in device memory as the float pair it is in registers, with no IEEE decode or encode.  Metal mixed
+// stores the integration state this way (mixed4s: velm and posDelta), and MetalArray converts it on host transfers.
+// It reads as a df64 through df64's constructor.  Its float conversion is explicit: an implicit one would tie with that
+// constructor in mixed expressions like 1.0f/v.
+struct alignas(8) df64s {
+    float shi, slo;
+
+    device df64s& operator=(df64 v) device { shi = v.hi; slo = v.lo; return *this; }
+    explicit operator float() const device { return shi; }
+    device df64s& operator+=(df64 v) device { return *this = df64(*this) + v; }
+    device df64s& operator-=(df64 v) device { return *this = df64(*this) - v; }
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> device df64s& operator+=(T v) device { return *this = df64(*this) + v; }
+    template <typename T, typename = enable_if_t<is_same<T, float>::value>> device df64s& operator-=(T v) device { return *this = df64(*this) - v; }
+    device df64s& operator*=(df64 v) device { return *this = df64(*this) * v; }
+    device df64s& operator/=(df64 v) device { return *this = df64(*this) / v; }
+};
+
+inline df64::df64(const device df64s& o) : hi(o.shi), lo(o.slo) {}
+
 #define DF64_VECTOR_COMPOUND(V, AS, ASSIGN, SCALE) \
     AS V& operator+=(V o) AS { ASSIGN(+=) return *this; } \
     AS V& operator-=(V o) AS { ASSIGN(-=) return *this; } \
@@ -562,14 +584,33 @@ struct df64_3 {
     explicit operator float3() const { return float3(x.hi, y.hi, z.hi); }
 };
 
+struct df64s_4;
+
 struct df64_4 {
     df64 x, y, z, w;
     DF64_VECTOR_ACCESS(df64_4, x(o.x) DF64_COMMA y(o.y) DF64_COMMA z(o.z) DF64_COMMA w(o.w), DF64_ASSIGN4, DF64_SCALE4)
+    df64_4(const device df64s_4& o);
+    thread df64_4& operator=(const device df64s_4& o) thread { return *this = df64_4(o); }
     df64_4(df64 x, df64 y, df64 z, df64 w) : x(x), y(y), z(z), w(w) {}
     explicit df64_4(df64 s) : x(s), y(s), z(s), w(s) {}
     explicit df64_4(float4 v) : x(v.x), y(v.y), z(v.z), w(v.w) {}
     explicit operator float4() const { return float4(x.hi, y.hi, z.hi, w.hi); }
 };
+// The pair-stored form of df64_4 (see df64s).
+struct df64s_4 {
+    df64s x, y, z, w;
+
+    device df64s_4& operator=(df64_4 o) device { DF64_ASSIGN4(=) return *this; }
+    device df64s_4& operator+=(df64_4 o) device { DF64_ASSIGN4(+=) return *this; }
+    device df64s_4& operator-=(df64_4 o) device { DF64_ASSIGN4(-=) return *this; }
+    device df64s_4& operator*=(df64_4 o) device { DF64_ASSIGN4(*=) return *this; }
+    device df64s_4& operator/=(df64_4 o) device { DF64_ASSIGN4(/=) return *this; }
+    device df64s_4& operator*=(df64 s) device { DF64_SCALE4(*=) return *this; }
+    device df64s_4& operator/=(df64 s) device { DF64_SCALE4(/=) return *this; }
+};
+
+inline df64_4::df64_4(const device df64s_4& o) : x(o.x), y(o.y), z(o.z), w(o.w) {}
+
 #undef DF64_VECTOR_ACCESS
 #undef DF64_VECTOR_COMPOUND
 #undef DF64_ASSIGN2

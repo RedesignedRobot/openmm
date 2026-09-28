@@ -86,7 +86,7 @@ KERNEL void scalePositions(float scaleX, float scaleY, float scaleZ, float scale
  * 2) three components of kinetic energy corresponding to the three axes, or
  * 3) six components corresponding to all elements of the box tensor.
  */
-KERNEL void computeMolecularKineticEnergy(int numMolecules, GLOBAL mixed4* RESTRICT velm, GLOBAL const int* RESTRICT moleculeAtoms,
+KERNEL void computeMolecularKineticEnergy(int numMolecules, GLOBAL mixed4s* RESTRICT velm, GLOBAL const int* RESTRICT moleculeAtoms,
         GLOBAL const int* RESTRICT moleculeStartIndex,
 #if COMPONENTS == 1
         GLOBAL mixed* RESTRICT energyBuffer
