@@ -188,10 +188,34 @@ DEVICE real4 gbsaPair(real r2, real4 atomData1, real quarterInvRadius1, real cha
  * slot y and the y sums to slot x of partialForce, so every (atom, slot) is written by exactly one SIMD group and
  * nothing is accumulated in device memory.  A diagonal pair is evaluated from both sides, like the Born sum.
  */
+#ifdef FOLD_BORN_FORCE
+/**
+ * Add one atom's force over a block pair to the force buffer, and its Born force, finished for the chain rule term in
+ * the nonbonded kernel, to bornForce.  The finished Born force is (sum + saTerm/B)*B^2*chain, linear in the partial
+ * sums, so each partial takes the factor B^2*chain here and no reduction kernel is needed.  Fixed point addition is
+ * exact, so the totals don't depend on scheduling.
+ */
+DEVICE void addFoldedForce(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mm_ulong* RESTRICT bornForce, unsigned int atom,
+        real4 force, real4 atomData) {
+    if (atom >= NUM_ATOMS)
+        return;
+    ATOMIC_ADD(&forceBuffers[atom], (mm_ulong) realToFixedPoint(force.x));
+    ATOMIC_ADD(&forceBuffers[atom+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force.y));
+    ATOMIC_ADD(&forceBuffers[atom+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force.z));
+    ATOMIC_ADD(&bornForce[atom], (mm_ulong) realToFixedPoint(force.w*atomData.y*atomData.y*atomData.w));
+}
+
+KERNEL void computeGBSAForce1Owned(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mixed* RESTRICT energyBuffer,
+#else
 KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL mixed* RESTRICT energyBuffer,
+#endif
         GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
         GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii, GLOBAL real* RESTRICT obcChain, int needEnergy, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
-        real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize) {
+        real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize
+#ifdef FOLD_BORN_FORCE
+        , GLOBAL mm_ulong* RESTRICT bornForce
+#endif
+        ) {
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
     mixed energy = 0;
@@ -265,10 +289,27 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
                     forceY = simd_shuffle_rotate_down(forceY, (ushort) 1);
                 }
             }
+#ifdef FOLD_BORN_FORCE
+            // The diagonal pair adds each atom's surface area term once.
+            if (x == y && atom1 < NUM_ATOMS) {
+                float offsetRadius = params[atom1].x;
+                real r = offsetRadius+DIELECTRIC_OFFSET+PROBE_RADIUS;
+                real ratio6 = POW((offsetRadius+DIELECTRIC_OFFSET)/atomData1.y, (real) 6);
+                real saTerm = SURFACE_AREA_FACTOR*r*r*ratio6;
+                force.w += saTerm/atomData1.y;
+                if (needEnergy)
+                    energy -= saTerm/6;
+            }
+            addFoldedForce(forceBuffers, bornForce, atom1, force, atomData1);
+            if (x != y)
+                addFoldedForce(forceBuffers, bornForce, atomY, forceY, atomDataAtomY);
+#endif
         }
+#ifndef FOLD_BORN_FORCE
         partialForce[y*PADDED_NUM_ATOMS + atom1] = force;
         if (x != y)
             partialForce[x*PADDED_NUM_ATOMS + atomY] = forceY;
+#endif
     }
     if (needEnergy)
         energyBuffer[GLOBAL_ID] += energy;

@@ -24,6 +24,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "MetalKernels.h"
+#include <cstdlib>
 #include "MetalForceInfo.h"
 #include "openmm/Context.h"
 #include "openmm/internal/ContextImpl.h"
@@ -279,9 +280,6 @@ void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
         CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
 }
 
-// Lanes that share one atom in reduceBornForceOwned.
-static const int REDUCE_LANES = 8;
-
 // Threads per threadgroup in the pair kernels, which launch one SIMD group per block pair.
 static const int PAIR_GROUP_SIZE = 256;
 
@@ -308,8 +306,15 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     long long partialBytes = (long long) numBlocks*paddedAtoms*sizeof(mm_float4);
     if (partialBytes > cu.getDevice()->recommendedMaxWorkingSetSize()/100)
         return false;
-    partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
+    // Screen only, removed before merge: picks the gbsa unit variant, lanes32 or fold, against trunk in one build.
+    const char* variant = getenv("OPENMM_METAL_GB_VARIANT");
+    foldBornForce = (variant != NULL && string(variant) == "fold");
+    reduceLanes = (variant != NULL && string(variant) == "lanes32" ? 32 : 8);
+    if (!foldBornForce)
+        partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
     map<string, string> defines;
+    if (foldBornForce)
+        defines["FOLD_BORN_FORCE"] = "1";
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
     defines["CUTOFF_SQUARED"] = cu.doubleToString(cutoff*cutoff);
@@ -321,7 +326,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     defines["NUM_BLOCKS"] = cu.intToString(numBlocks);
     defines["NUM_BLOCK_PAIRS"] = cu.intToString(numBlocks*(numBlocks+1)/2);
     defines["TILE_SIZE"] = "32";
-    defines["REDUCE_LANES"] = cu.intToString(REDUCE_LANES);
+    defines["REDUCE_LANES"] = cu.intToString(reduceLanes);
     defines["DIELECTRIC_OFFSET"] = "0.009f";
     defines["OBC_ALPHA"] = "1.0f";
     defines["OBC_BETA"] = "0.8f";
@@ -337,7 +342,10 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
-    ownedForce1Kernel->addArg(partialForce);
+    if (foldBornForce)
+        ownedForce1Kernel->addArg(cu.getLongForceBuffer());
+    else
+        ownedForce1Kernel->addArg(partialForce);
     ownedForce1Kernel->addArg(cu.getEnergyBuffer());
     ownedForce1Kernel->addArg(cu.getPosq());
     ownedForce1Kernel->addArg(bornSum);
@@ -350,6 +358,10 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
+    if (foldBornForce) {
+        ownedForce1Kernel->addArg(bornForce);
+        return true;
+    }
     ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
     ownedReduceBornForceKernel->addArg(partialForce);
     ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
@@ -376,11 +388,13 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     int numBlocks = cu.getNumAtomBlocks();
     int pairThreads = min(threads, (numBlocks*(numBlocks+1)/2*32+PAIR_GROUP_SIZE-1)/PAIR_GROUP_SIZE*PAIR_GROUP_SIZE);
     ownedForce1Kernel->setArg(8, (int) includeEnergy);
-    ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
     setPeriodicBoxArgs(cu, ownedForce1Kernel, 9);
     ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
+    if (foldBornForce)
+        return 0.0;
+    ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
+    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*reduceLanes);
     return 0.0;
 }

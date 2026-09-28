@@ -145,6 +145,10 @@ private:
     bool createOwnedKernels();
     MetalContext& cu;
     bool hasCheckedOwned = false, useOwned = false;
+    // Whether Force1Owned adds straight to the force buffers instead of reduceBornForceOwned, and the lanes that share one
+    // atom in reduceBornForceOwned.
+    bool foldBornForce = false;
+    int reduceLanes = 8;
     ComputeArray partialForce;
     ComputeKernel ownedBornSumKernel, ownedForce1Kernel, ownedReduceBornForceKernel;
 };
