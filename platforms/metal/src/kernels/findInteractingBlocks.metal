@@ -1,6 +1,9 @@
 #define BUFFER_SIZE 256
 // Fewest atoms of block X passing the sphere test for which findBlocksWithInteractions tests all 32 unrolled.
 #define MIN_ATOMS_TO_UNROLL 8
+#if defined(USE_HALF_BLOCKS) && MAX_BITS_FOR_PAIRS > 0
+#error "half blocks need MAX_BITS_FOR_PAIRS 0"
+#endif
 
 #if defined(AMD_RDNA)
 
@@ -194,7 +197,7 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
 #endif
 }
 
-#if MAX_BITS_FOR_PAIRS > 0
+#if MAX_BITS_FOR_PAIRS > 0 || defined(USE_HALF_BLOCKS)
 
 __device__ inline
 void collectInteractions(PRIVATE unsigned int& interacts, float d, int bit) {
@@ -314,12 +317,17 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     const int warpIndex = blockIdx.x*warpsPerBlock + (warpsPerBlock == 1 ? 0 : warpInBlock);
     const warpflags warpMask = (static_cast<warpflags>(1)<<indexInWarp)-1;
 
-    __shared__ int workgroupBuffer[BUFFER_SIZE*warpsPerBlock];
+#ifdef USE_HALF_BLOCKS
+    constexpr int numHalves = 2;
+#else
+    constexpr int numHalves = 1;
+#endif
+    __shared__ int workgroupBuffer[BUFFER_SIZE*warpsPerBlock*numHalves];
     __shared__ real4 workgroupPosBuffer[TILE_SIZE*warpsPerBlock];
     __shared__ int workgroupExclusions[MAX_EXCLUSIONS*warpsPerBlock];
     __shared__ int workgroupBlock2Buffer[(warpSize+1)*warpsPerBlock];
 
-    threadgroup int* buffer = workgroupBuffer+BUFFER_SIZE*warpInBlock;
+    threadgroup int* halfBuffers = workgroupBuffer+BUFFER_SIZE*numHalves*warpInBlock;
     threadgroup real4* posBuffer = workgroupPosBuffer+TILE_SIZE*warpInBlock;
     threadgroup int* exclusionsForX = workgroupExclusions+MAX_EXCLUSIONS*warpInBlock;
     threadgroup int* block2Buffer = workgroupBlock2Buffer+(warpSize+1)*warpInBlock;
@@ -333,7 +341,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         int x = sortedBlocks[block1] & BLOCK_INDEX_MASK;
         real4 blockCenterX = sortedBlockCenter[block1];
         real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
-        int neighborsInBuffer = 0;
+        int halfNeighbors[numHalves] = {};
         real4 pos1 = posq[x*TILE_SIZE+indexInTile];
 #ifdef USE_PERIODIC
         const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= PADDED_CUTOFF &&
@@ -575,33 +583,45 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const unsigned int interactCount = interacts;
 #endif
 
-                // Add any interacting atoms to the buffer.
+                // Add any interacting atoms to the buffer.  With half blocks, each 16-atom half of block X keeps its own
+                // list: a Y atom joins a half's list when it is within the padded cutoff of an atom in that half.
 
-                warpflags includeAtomFlags = __ballot(interactCount > MAX_BITS_FOR_PAIRS);
-                if (interactCount > MAX_BITS_FOR_PAIRS) {
-                    int index = neighborsInBuffer+warpPopc(includeAtomFlags&warpMask);
-                    buffer[index] = atom2;
-                }
-                neighborsInBuffer += warpPopc(includeAtomFlags);
-                SYNC_WARPS;
-                if (neighborsInBuffer > BUFFER_SIZE-warpSize) {
-                    // Store the new tiles to memory.
-
-                    unsigned int tilesToStore = neighborsInBuffer/warpSize*tilesPerWarp;
-                    unsigned int tileStartIndex = 0;
-                    if (indexInWarp == 0)
-                        tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
-                    unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
-                    if (newTileStartIndex+tilesToStore <= maxTiles) {
-                        if (indexInWarp < tilesToStore)
-                            interactingTiles[newTileStartIndex+indexInWarp] = x;
-                        for (int j = 0; j < tilesToStore/tilesPerWarp; j++)
-                            interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = buffer[j*warpSize+indexInWarp];
+                #pragma unroll
+                for (int h = 0; h < numHalves; h++) {
+                    threadgroup int* buffer = halfBuffers+BUFFER_SIZE*h;
+                    int neighborsInBuffer = halfNeighbors[h];
+#ifdef USE_HALF_BLOCKS
+                    const bool includeAtom = ((interacts >> (16*h)) & 0xFFFF) != 0;
+#else
+                    const bool includeAtom = interactCount > MAX_BITS_FOR_PAIRS;
+#endif
+                    warpflags includeAtomFlags = __ballot(includeAtom);
+                    if (includeAtom) {
+                        int index = neighborsInBuffer+warpPopc(includeAtomFlags&warpMask);
+                        buffer[index] = atom2;
                     }
-                    if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE)
-                        buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
-                    neighborsInBuffer -= TILE_SIZE*tilesToStore;
+                    neighborsInBuffer += warpPopc(includeAtomFlags);
                     SYNC_WARPS;
+                    if (neighborsInBuffer > BUFFER_SIZE-warpSize) {
+                        // Store the new tiles to memory.
+
+                        unsigned int tilesToStore = neighborsInBuffer/warpSize*tilesPerWarp;
+                        unsigned int tileStartIndex = 0;
+                        if (indexInWarp == 0)
+                            tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
+                        unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
+                        if (newTileStartIndex+tilesToStore <= maxTiles) {
+                            if (indexInWarp < tilesToStore)
+                                interactingTiles[newTileStartIndex+indexInWarp] = x*numHalves+h;
+                            for (int j = 0; j < tilesToStore/tilesPerWarp; j++)
+                                interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = buffer[j*warpSize+indexInWarp];
+                        }
+                        if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE)
+                            buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
+                        neighborsInBuffer -= TILE_SIZE*tilesToStore;
+                        SYNC_WARPS;
+                    }
+                    halfNeighbors[h] = neighborsInBuffer;
                 }
             }
 
@@ -613,18 +633,23 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 
         // If we have a partially filled buffer,  store it to memory.
 
-        if (neighborsInBuffer > 0) {
-            unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
-            unsigned int tileStartIndex = 0;
-            if (indexInWarp == 0)
-                tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
-            unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
-            if (newTileStartIndex+tilesToStore <= maxTiles) {
-                if (indexInWarp < tilesToStore)
-                    interactingTiles[newTileStartIndex+indexInWarp] = x;
-                for (int j = 0; j <= tilesToStore/tilesPerWarp; j++) {
-                    if (j*warpSize+indexInWarp < tilesToStore*TILE_SIZE)
-                        interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = (j*warpSize+indexInWarp < neighborsInBuffer ? buffer[j*warpSize+indexInWarp] : PADDED_NUM_ATOMS);
+        #pragma unroll
+        for (int h = 0; h < numHalves; h++) {
+            threadgroup int* buffer = halfBuffers+BUFFER_SIZE*h;
+            const int neighborsInBuffer = halfNeighbors[h];
+            if (neighborsInBuffer > 0) {
+                unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
+                unsigned int tileStartIndex = 0;
+                if (indexInWarp == 0)
+                    tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
+                unsigned int newTileStartIndex = __shfl(tileStartIndex, 0);
+                if (newTileStartIndex+tilesToStore <= maxTiles) {
+                    if (indexInWarp < tilesToStore)
+                        interactingTiles[newTileStartIndex+indexInWarp] = x*numHalves+h;
+                    for (int j = 0; j <= tilesToStore/tilesPerWarp; j++) {
+                        if (j*warpSize+indexInWarp < tilesToStore*TILE_SIZE)
+                            interactingAtoms[newTileStartIndex*TILE_SIZE+j*warpSize+indexInWarp] = (j*warpSize+indexInWarp < neighborsInBuffer ? buffer[j*warpSize+indexInWarp] : PADDED_NUM_ATOMS);
+                    }
                 }
             }
         }

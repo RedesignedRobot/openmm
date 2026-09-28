@@ -31,6 +31,16 @@
 #include "MetalSort.h"
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
+#include "openmm/CMAPTorsionForce.h"
+#include "openmm/CMMotionRemover.h"
+#include "openmm/CustomAngleForce.h"
+#include "openmm/CustomBondForce.h"
+#include "openmm/CustomTorsionForce.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include "openmm/RBTorsionForce.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -79,6 +89,7 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // 49 us on an M3 Ultra in the sort, sortBoxData and an empty findBlocksWithInteractions.
     useIndirectRebuild = context.getDevice()->supportsFamily(MTL::GPUFamilyApple9);
     sortBlocksByBins = useIndirectRebuild && context.getNumAtomBlocks() > MaxBlocksSortedInOneGroup;
+    useHalfBlocks = listReadElsewhere = false;
     // Decide how many thread blocks to use.
 
     downloadCountEvent = std::make_shared<MetalEvent>(context);
@@ -193,6 +204,24 @@ static bool compareInt2LargeSIMD(int2 a, int2 b) {
     return ((a.y < b.y) || (a.y == b.y && a.x < b.x));
 }
 
+/**
+ * Whether computeNonbonded is the only kernel that reads the neighbor list.  GBSA, CustomGB, ConstantPotential and
+ * plugin forces read interactingTiles as whole-block tiles, so half-block tiles are only used when every force in
+ * the system is one of these.
+ */
+static bool onlyComputeNonbondedReadsList(const System& system) {
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const Force& force = system.getForce(i);
+        if (dynamic_cast<const NonbondedForce*>(&force) == NULL && dynamic_cast<const HarmonicBondForce*>(&force) == NULL &&
+                dynamic_cast<const HarmonicAngleForce*>(&force) == NULL && dynamic_cast<const PeriodicTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const RBTorsionForce*>(&force) == NULL && dynamic_cast<const CMAPTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const CustomBondForce*>(&force) == NULL && dynamic_cast<const CustomAngleForce*>(&force) == NULL &&
+                dynamic_cast<const CustomTorsionForce*>(&force) == NULL && dynamic_cast<const CMMotionRemover*>(&force) == NULL)
+            return false;
+    }
+    return true;
+}
+
 void MetalNonbondedUtilities::initialize(const System& system) {
     string errorMessage = "Error initializing nonbonded utilities";
     if (atomExclusions.size() == 0) {
@@ -281,6 +310,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {
+        // Apple9 GPUs build the list per 16-atom half of each atom block when nothing else reads it.  On apoa1rf only
+        // 27% of the 32x32 list slots are inside the cutoff, and half blocks drop about a fifth of the slots.
+        useHalfBlocks = (context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) && getMaxBitsForPairs() == 0 &&
+                numContexts == 1 && !listReadElsewhere && onlyComputeNonbondedReadsList(system));
+        const long long listTiles = (useHalfBlocks ? 2 : 1)*numTiles;
         // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
         // the list could ever hold fit in 1/256 of the device's unused working set, it can't overflow, and
         // the host only waits for the interaction count on steps that set the reordering baseline.  With
@@ -288,14 +322,14 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         // make a fairly arbitrary guess, but if this turns out to be too small we'll increase it later.
 
         long long maxPossiblePairs = getMaxBitsForPairs()*(long long) MetalContext::TileSize*numTiles;
-        long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
+        long long maxListBytes = listTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
         long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
         if (!waitForCount)
             context.getCurrentStream().commitWhenIdle();
-        maxTiles = 20*numAtomBlocks;
-        if (maxTiles > numTiles || !waitForCount)
-            maxTiles = numTiles;
+        maxTiles = (useHalfBlocks ? 40 : 20)*numAtomBlocks;
+        if (maxTiles > listTiles || !waitForCount)
+            maxTiles = listTiles;
         if (maxTiles < 1)
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
@@ -566,7 +600,7 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
     if (pinnedCountBuffer[0] > maxTiles) {
         maxTiles = (unsigned int) (1.2*pinnedCountBuffer[0]);
         unsigned int numBlocks = context.getNumAtomBlocks();
-        int totalTiles = numBlocks*(numBlocks+1)/2;
+        int totalTiles = (useHalfBlocks ? 2 : 1)*numBlocks*(numBlocks+1)/2;
         if (maxTiles > totalTiles)
             maxTiles = totalTiles;
         interactingTiles.resize(maxTiles);
@@ -674,6 +708,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
+        if (useHalfBlocks)
+            defines["USE_HALF_BLOCKS"] = "1";
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);
@@ -826,6 +862,8 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    if (useHalfBlocks)
+        defines["USE_HALF_BLOCKS"] = "1";
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";

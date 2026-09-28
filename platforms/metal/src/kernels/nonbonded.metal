@@ -60,6 +60,15 @@
  *
  */
 
+// X_ATOMS is the number of X atoms in a neighbor list tile.  At 16 (USE_HALF_BLOCKS), a tile holds one half of an
+// atom block against 32 Y atoms: lanes l and l+16 share X atom l%16, and 16 rotation steps pair every X atom with
+// every Y atom once.  Tiles with exclusions and tiles without a neighbor list always hold whole blocks.
+#if defined(USE_HALF_BLOCKS) && defined(USE_NEIGHBOR_LIST)
+#define X_ATOMS (TILE_SIZE/2)
+#else
+#define X_ATOMS TILE_SIZE
+#endif
+
 /**
  * The first neighbor list tile of a warp. Each warp takes as many tiles as a loop striding over the exclusion tiles,
  * then the neighbor list, would give it, so the work stays balanced with the first loop.
@@ -275,7 +284,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         bool singlePeriodicCopy = false;
 #ifdef USE_NEIGHBOR_LIST
         x = tiles[pos];
-        real4 blockSizeX = blockSize[x];
+        real4 blockSizeX = blockSize[x/(TILE_SIZE/X_ATOMS)];
         singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
                               0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
                               0.5f*periodicBoxSize.z-blockSizeX.z >= MAX_CUTOFF);
@@ -301,7 +310,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         includeTile = BALLOT(skipTiles == pos) == 0;
 #endif
         if (includeTile) {
-            unsigned int atom1 = x*TILE_SIZE + tgx;
+            unsigned int atom1 = x*X_ATOMS + (tgx & (X_ATOMS-1));
             // Load atom data for this tile.
             real4 posq1 = posq[atom1];
             LOAD_ATOM1_PARAMETERS
@@ -330,11 +339,11 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             if (singlePeriodicCopy) {
                 // The box is small enough that we can just translate all the atoms into a single periodic
                 // box, then skip having to apply periodic boundary conditions later.
-                real4 blockCenterX = blockCenter[x];
+                real4 blockCenterX = blockCenter[x/(TILE_SIZE/X_ATOMS)];
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
                 #pragma unroll 2
-                for (j = 0; j < TILE_SIZE; j++) {
+                for (j = 0; j < X_ATOMS; j++) {
                     real4 posq2 = shflPosq;
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
                     real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
@@ -390,7 +399,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             {
                 // We need to apply periodic boundary conditions separately for each interaction.
                 #pragma unroll 2
-                for (j = 0; j < TILE_SIZE; j++) {
+                for (j = 0; j < X_ATOMS; j++) {
                     real4 posq2 = shflPosq;
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
 #ifdef USE_PERIODIC

@@ -26,6 +26,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
+#include "openmm/OpenMMException.h"
 #include "openmm/System.h"
 #include "MetalArray.h"
 #include "MetalExpressionUtilities.h"
@@ -198,6 +199,15 @@ public:
         return blockBoundingBox;
     }
     /**
+     * Another kernel (GBSA, CustomGB, DPD, a plugin) is about to read the neighbor list, which it expects in
+     * whole-block tiles.  Half-block tiles are off from then on, and asking after they were chosen is an error.
+     */
+    void requireWholeBlockTiles() {
+        if (useHalfBlocks)
+            throw OpenMMException("The neighbor list uses half-block tiles, which only computeNonbonded can read");
+        listReadElsewhere = true;
+    }
+    /**
      * Get the array whose first element contains the number of tiles with interactions.
      */
     MetalArray& getInteractionCount() {
@@ -207,12 +217,14 @@ public:
      * Get the array containing tiles with interactions.
      */
     MetalArray& getInteractingTiles() {
+        requireWholeBlockTiles();
         return interactingTiles;
     }
     /**
      * Get the array containing the atoms in each tile with interactions.
      */
     MetalArray& getInteractingAtoms() {
+        requireWholeBlockTiles();
         return interactingAtoms;
     }
     /**
@@ -335,6 +347,7 @@ private:
     MetalArray displacementFlags, rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
+    bool useHalfBlocks, listReadElsewhere;
     ComputeSort blockSorter;
     std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
