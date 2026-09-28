@@ -92,6 +92,9 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     numForceThreadBlocks = (context.getNumAtoms() > 90000 ? 160 : 40)*context.getMultiprocessors();
     forceThreadBlockSize = 64;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
+    // Probe only, never for merge: M29_FIB_GROUP overrides the list search's threadgroup size.
+    if (getenv("M29_FIB_GROUP"))
+        findInteractingBlocksThreadBlockSize = atoi(getenv("M29_FIB_GROUP"));
 
     // When building the neighbor list, we can optionally use large blocks (32 * warpSize atoms) to
     // accelerate the process.  This makes building the neighbor list faster, but it prevents
