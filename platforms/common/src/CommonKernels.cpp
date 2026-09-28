@@ -1981,7 +1981,7 @@ void CommonCalcGBSAOBCForceKernel::initialize(const System& system, const GBSAOB
     bool useCutoff = (force.getNonbondedMethod() != GBSAOBCForce::NoCutoff);
     bool usePeriodic = (force.getNonbondedMethod() != GBSAOBCForce::NoCutoff && force.getNonbondedMethod() != GBSAOBCForce::CutoffNonPeriodic);
     cutoff = force.getCutoffDistance();
-    string source = CommonKernelSources::gbsaObc2;
+    string source = ""; // GB ownership timing-only ceiling: omit OBC2 arithmetic.
     map<string, string> replacements;
     replacements["CHARGE1"] = prefix+"charge1";
     replacements["CHARGE2"] = prefix+"charge2";

@@ -24,6 +24,13 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/OpenMMException.h"
+#include "openmm/GBSAOBCForce.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include "openmm/RBTorsionForce.h"
+#include "openmm/CMMotionRemover.h"
 #include "MetalNonbondedUtilities.h"
 #include "MetalArray.h"
 #include "MetalContext.h"
@@ -178,6 +185,39 @@ static bool compareInt2LargeSIMD(int2 a, int2 b) {
     return ((a.y < b.y) || (a.y == b.y && a.x < b.x));
 }
 
+// Only this force set has no other consumer of the neighbor list. Keep the
+// periodic and general custom-force paths until they have independent coverage.
+static bool isSmallOwnedGBSystem(const System& system, MetalContext& context, int forceThreads) {
+    if (!context.getDevice()->supportsFamily(MTL::GPUFamilyApple9) || context.getUseDoublePrecision() ||
+            context.getPlatformData().contexts.size() != 1)
+        return false;
+    const long long blocks = context.getNumAtomBlocks();
+    const long long bytes = blocks*context.getPaddedNumAtoms()*(2*sizeof(mm_float4)+sizeof(float));
+    if (blocks*blocks > 2*(forceThreads/32) || bytes > context.getDevice()->recommendedMaxWorkingSetSize()/100)
+        return false;
+    int gb = 0, nb = 0;
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const Force& force = system.getForce(i);
+        if (const auto* obc = dynamic_cast<const GBSAOBCForce*>(&force)) {
+            if (obc->getNonbondedMethod() != GBSAOBCForce::CutoffNonPeriodic)
+                return false;
+            gb++;
+        }
+        else if (const auto* direct = dynamic_cast<const NonbondedForce*>(&force)) {
+            if (direct->getNonbondedMethod() != NonbondedForce::CutoffNonPeriodic)
+                return false;
+            nb++;
+        }
+        else if (dynamic_cast<const HarmonicBondForce*>(&force) == NULL &&
+                dynamic_cast<const HarmonicAngleForce*>(&force) == NULL &&
+                dynamic_cast<const PeriodicTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const RBTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const CMMotionRemover*>(&force) == NULL)
+            return false;
+    }
+    return gb == 1 && nb == 1;
+}
+
 void MetalNonbondedUtilities::initialize(const System& system) {
     string errorMessage = "Error initializing nonbonded utilities";
     if (atomExclusions.size() == 0) {
@@ -261,6 +301,21 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     }
     atomExclusions.clear(); // We won't use this again, so free the memory it used
     exclusions.upload(exclusionVec);
+
+    useOwnedDirect = useCutoff && !usePeriodic &&
+            isSmallOwnedGBSystem(system, context, numForceThreadBlocks*forceThreadBlockSize);
+    if (useOwnedDirect) {
+        ownedPartialForce.initialize<mm_float4>(context, numAtomBlocks*context.getPaddedNumAtoms(), "ownedDirectPartialForce");
+        vector<int> pairExclusions(numAtomBlocks*(numAtomBlocks+1)/2, -1);
+        for (int i = 0; i < exclusionTilesVec.size(); i++) {
+            int2 pair = exclusionTilesVec[i];
+            pairExclusions[pair.x*(pair.x+1)/2+pair.y] = i;
+        }
+        ownedPairExclusions.initialize<int>(context, pairExclusions.size(), "ownedDirectPairExclusions");
+        ownedPairExclusions.upload(pairExclusions);
+        ownedReduceArgs.push_back(&ownedPartialForce.getDevicePointer());
+        ownedReduceArgs.push_back(&context.unwrap(context.getLongForceBuffer()).getDevicePointer());
+    }
 
     // Create data structures for the neighbor list.
 
@@ -348,6 +403,10 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         forceArgs.push_back(NULL);
     if (energyParameterDerivatives.size() > 0)
         forceArgs.push_back(&context.unwrap(context.getEnergyParamDerivBuffer()).getDevicePointer());
+    if (useOwnedDirect) {
+        forceArgs.push_back(&ownedPartialForce.getDevicePointer());
+        forceArgs.push_back(&ownedPairExclusions.getDevicePointer());
+    }
     if (useCutoff) {
         findBlockBoundsArgs.push_back(&numAtoms);
         findBlockBoundsArgs.push_back(context.getPeriodicBoxSizePointer());
@@ -450,6 +509,8 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // Compute the neighbor list.
 
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), context.getSIMDWidth());
+    if (useOwnedDirect)
+        return;
     if (useIndirectRebuild) {
         void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
                 &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
@@ -495,17 +556,23 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
     if (kernels.hasForces && (includeForces || includeEnergy)) {
         metalFunction_t& kernel = (includeForces ? (includeEnergy ? kernels.forceEnergyKernel : kernels.forceKernel) : kernels.energyKernel);
         if (kernel == NULL)
-            kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
+            kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy, useOwnedDirect);
         if (!hasInitializedParams)
             initParamArgs();
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        if (useOwnedDirect && includeForces) {
+            // The pair pass may overlap bonded work, but its partials must be
+            // complete before the reduction reads them.
+            context.getCurrentStream().setConcurrentDispatch(false);
+            context.executeKernelFlat(ownedReduceKernel, &ownedReduceArgs[0], context.getPaddedNumAtoms()*8, 64);
+        }
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
         // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
         // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
-        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        bool wait = !useOwnedDirect && (waitForCount || context.getStepsSinceReorder() == 0);
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
         if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
@@ -515,7 +582,8 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         commitCountAfterLastStep = queue.getCommitCount();
         if (wait)
             downloadCountEvent->poll();
-        updateNeighborListSize();
+        if (!useOwnedDirect)
+            updateNeighborListSize();
     }
 }
 
@@ -671,7 +739,7 @@ static string loadParameter(const ComputeParameterInfo& param, const string& ind
     return "make_"+param.getType()+"("+array+"[3*"+index+"], "+array+"[3*"+index+"+1], "+array+"[3*"+index+"+2])";
 }
 
-metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
+metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy, bool owned) {
     map<string, string> replacements;
     replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
@@ -812,7 +880,9 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     int endExclusionIndex = (context.getContextIndex()+1)*numExclusionTiles/numContexts;
     defines["FIRST_EXCLUSION_TILE"] = context.intToString(startExclusionIndex);
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
-    metalModule_t program = context.createModule(MetalKernelSources::vectorOps+context.replaceStrings(kernelSource, replacements), defines);
+    metalModule_t program = context.createModule(MetalKernelSources::vectorOps+context.replaceStrings(owned ? MetalKernelSources::nonbondedOwned : kernelSource, replacements), defines);
+    if (owned)
+        ownedReduceKernel = context.getKernel(program, "reduceNonbondedOwned");
     metalFunction_t kernel = context.getKernel(program, "computeNonbonded");
     return kernel;
 }
