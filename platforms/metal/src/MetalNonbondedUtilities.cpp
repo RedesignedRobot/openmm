@@ -57,8 +57,9 @@ static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
 // prepareRebuildDispatch tests whether the old list still covers every pair when at most this many
-// blocks moved more than half the padding, and rebuilds without the test above it.
-static const int MaxVerifiedBlocks = 128;
+// blocks moved more than half the padding, and rebuilds without the test above it.  At the second
+// step after a build, apoa1 has 55-97 such blocks with RF and 178-280 with PME; at the third, over 1200.
+static const int MaxVerifiedBlocks = 384;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
