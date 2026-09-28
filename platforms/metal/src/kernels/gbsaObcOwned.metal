@@ -1,14 +1,16 @@
 /**
- * GBSA-OBC with block-pair ownership and no device-memory accumulation.
+ * GBSA-OBC with block-pair ownership.
  *
  * GB has no exclusions, so the pair kernels loop over all block pairs and cull them with the current block bounds.
- * Each SIMD group owns one block pair (x, y) at a time.  For every atom and every block there is one slot in the
- * partial buffers, holding that atom's sum over that block, and exactly one SIMD group writes it.  The reduction
- * kernels add the slots of each atom in a fixed order, so the result doesn't depend on scheduling, and the pair
- * kernels need no atomics, threadgroup memory or barriers.
+ * Each SIMD group owns one block pair (x, y) at a time.  Both pair kernels evaluate each unordered pair once: each
+ * lane owns one atom of block x, and the atoms of block y with their sums rotate round the SIMD group.  The Born sum
+ * takes both directed terms from one distance.
  *
- * Both pair kernels evaluate each unordered pair once: each lane owns one atom of block x, and the atoms of block y
- * with their sums rotate round the SIMD group.  The Born sum takes both directed terms from one distance.
+ * The Born sum adds each atom's sum over a block pair to the fixed point bornSum buffer, one atomic per atom per block
+ * pair.  Integer addition is exact, so the total doesn't depend on scheduling, and Force1 turns the totals of its
+ * two blocks into Born radii itself instead of waiting for a separate kernel.  Force1 has four times as many values
+ * per atom, so it keeps one slot per atom and block in partialForce, written by exactly one SIMD group, and
+ * reduceBornForceOwned adds the slots in a fixed order.
  */
 
 #define CULL_SQUARED (CUTOFF_SQUARED*1.0001f)
@@ -92,7 +94,7 @@ DEVICE real bornSumOverOwnBlock(unsigned int x, unsigned int tgx, GLOBAL const r
  * registers, and the y atoms with their sums rotate one lane per step, as in computeGBSAForce1Owned.  The x sums go
  * to slot y and the y sums to slot x of partialBornSum.
  */
-KERNEL void computeBornSumOwned(GLOBAL real* RESTRICT partialBornSum, GLOBAL const real4* RESTRICT posq,
+KERNEL void computeBornSumOwned(GLOBAL mm_ulong* RESTRICT bornSum, GLOBAL const real4* RESTRICT posq,
         GLOBAL const float2* RESTRICT global_params, real4 periodicBoxSize, real4 invPeriodicBoxSize,
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter,
         GLOBAL const real4* RESTRICT blockSize) {
@@ -134,10 +136,29 @@ KERNEL void computeBornSumOwned(GLOBAL real* RESTRICT partialBornSum, GLOBAL con
                 }
             }
         }
-        partialBornSum[y*PADDED_NUM_ATOMS + x*TILE_SIZE + tgx] = sumX;
-        if (x != y)
-            partialBornSum[x*PADDED_NUM_ATOMS + y*TILE_SIZE + tgx] = sumY;
+        if (sumX != 0)
+            ATOMIC_ADD(&bornSum[x*TILE_SIZE + tgx], (mm_ulong) realToFixedPoint(sumX));
+        if (sumY != 0)
+            ATOMIC_ADD(&bornSum[y*TILE_SIZE + tgx], (mm_ulong) realToFixedPoint(sumY));
     }
+}
+
+/**
+ * An atom's charge, Born radius and inverse Born radius from its Born sum, with the OBC chain rule factor in w.
+ */
+DEVICE real4 bornAtomData(unsigned int index, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
+        GLOBAL const real* RESTRICT charge) {
+    float offsetRadius = params[index].x;
+    real sum = RECIP((real) 0x100000000)*bornSum[index];
+    sum *= 0.5f*offsetRadius;
+    real sum2 = sum*sum;
+    real sum3 = sum*sum2;
+    real tanhSum = tanh(OBC_ALPHA*sum - OBC_BETA*sum2 + OBC_GAMMA*sum3);
+    real nonOffsetRadius = offsetRadius + DIELECTRIC_OFFSET;
+    real radius = RECIP(RECIP(offsetRadius) - tanhSum/nonOffsetRadius);
+    real chain = offsetRadius*(OBC_ALPHA - 2*OBC_BETA*sum + 3*OBC_GAMMA*sum2);
+    chain = (1-tanhSum*tanhSum)*chain / nonOffsetRadius;
+    return make_real4(charge[index], radius, RECIP(radius), chain);
 }
 
 /**
@@ -168,8 +189,8 @@ DEVICE real4 gbsaPair(real r2, real4 atomData1, real quarterInvRadius1, real cha
  * nothing is accumulated in device memory.  A diagonal pair is evaluated from both sides, like the Born sum.
  */
 KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL mixed* RESTRICT energyBuffer,
-        GLOBAL const real4* RESTRICT posq, GLOBAL const real4* RESTRICT atomData,
-        int needEnergy, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
+        GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
+        GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii, GLOBAL real* RESTRICT obcChain, int needEnergy, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
         real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize) {
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
@@ -184,11 +205,15 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
         real4 forceY = make_real4(0);
         if (blocksInRange(blockCenter[x], blockSize[x], blockCenter[y], blockSize[y], periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ)) {
             const real4 posq1 = posq[atom1];
-            const real4 atomData1 = atomData[atom1];
+            const real4 atomData1 = bornAtomData(atom1, bornSum, params, charge);
+            if (x == y && atom1 < NUM_ATOMS) {
+                bornRadii[atom1] = atomData1.y;
+                obcChain[atom1] = atomData1.w;
+            }
             const real chargeProduct1 = PREFACTOR*atomData1.x;
             const real quarterInvRadius1 = 0.25f*atomData1.z;
             const real4 posqAtomY = posq[atomY];
-            const real4 atomDataAtomY = atomData[atomY];
+            const real4 atomDataAtomY = (x == y ? atomData1 : bornAtomData(atomY, bornSum, params, charge));
             real3 posY = make_real3(posqAtomY.x, posqAtomY.y, posqAtomY.z);
             real3 atomDataY = make_real3(atomDataAtomY.x, atomDataAtomY.y, atomDataAtomY.z);
             if (x == y) {
@@ -253,49 +278,16 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
  * Add a value over each aligned group of REDUCE_LANES lanes.  Every lane adds the same values in the same order, so
  * the sum doesn't depend on scheduling.
  */
-template <typename T>
-DEVICE T sumOverReduceLanes(T value) {
+DEVICE real4 sumOverReduceLanes(real4 value) {
     for (ushort mask = 1; mask < REDUCE_LANES; mask *= 2)
         value += simd_shuffle_xor(value, mask);
     return value;
 }
 
 /**
- * Add each atom's Born sum over the chunks and compute the Born radii.  REDUCE_LANES lanes share an atom, each
- * adding every REDUCE_LANES-th chunk.  The chunk order is fixed, so plain floating point addition is deterministic.
- */
-KERNEL void reduceBornSumOwned(float alpha, float beta, float gamma, GLOBAL const real* RESTRICT partialBornSum,
-        GLOBAL const float2* RESTRICT params, GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii,
-        GLOBAL real* RESTRICT obcChain, GLOBAL real4* RESTRICT atomData) {
-    const unsigned int part = GLOBAL_ID%REDUCE_LANES;
-    for (unsigned int index = GLOBAL_ID/REDUCE_LANES; index < PADDED_NUM_ATOMS; index += GLOBAL_SIZE/REDUCE_LANES) {
-        real sum = 0;
-        for (unsigned int chunk = part; chunk < NUM_BLOCKS; chunk += REDUCE_LANES)
-            sum += partialBornSum[chunk*PADDED_NUM_ATOMS + index];
-        sum = sumOverReduceLanes(sum);
-        if (part != 0 || index >= NUM_ATOMS)
-            continue;
-
-        // Now calculate Born radius and OBC term.
-
-        float offsetRadius = params[index].x;
-        sum *= 0.5f*offsetRadius;
-        real sum2 = sum*sum;
-        real sum3 = sum*sum2;
-        real tanhSum = tanh(alpha*sum - beta*sum2 + gamma*sum3);
-        real nonOffsetRadius = offsetRadius + DIELECTRIC_OFFSET;
-        real radius = RECIP(RECIP(offsetRadius) - tanhSum/nonOffsetRadius);
-        real chain = offsetRadius*(alpha - 2*beta*sum + 3*gamma*sum2);
-        chain = (1-tanhSum*tanhSum)*chain / nonOffsetRadius;
-        bornRadii[index] = radius;
-        obcChain[index] = chain;
-        atomData[index] = make_real4(charge[index], radius, RECIP(radius), 0);
-    }
-}
-
-/**
  * Add each atom's force and Born force over the chunks, add the force to the force buffer, and finish the Born force
- * for the chain rule term in the nonbonded kernel.  REDUCE_LANES lanes share an atom, as in reduceBornSumOwned.
+ * for the chain rule term in the nonbonded kernel.  REDUCE_LANES lanes share an atom, each adding every REDUCE_LANES-th
+ * chunk.  The chunk order is fixed, so plain floating point addition is deterministic.
  */
 KERNEL void reduceBornForceOwned(GLOBAL const real4* RESTRICT partialForce, GLOBAL mm_ulong* RESTRICT forceBuffers,
         GLOBAL mm_long* RESTRICT bornForce, GLOBAL mixed* RESTRICT energyBuffer, GLOBAL const float2* RESTRICT params,
