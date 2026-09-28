@@ -14,6 +14,34 @@ typedef struct ALIGN {
 } AtomData1;
 
 /**
+ * The Born sum term of an atom with offset radius radius1 from an atom with scaled radius scaledRadius2 at distance r,
+ * for radius1 < r+scaledRadius2.
+ *
+ * Beyond r = radius1+scaledRadius2 the term is invR*x^3*P(x^2) with x = scaledRadius2/r, where
+ * P(y) = sum over k >= 1 of 2k/(2k+1) y^(k-1).  In single and mixed precision a polynomial fitted to float precision
+ * (1.2e-7 relative) for x <= 0.6 replaces the closed form there: it needs no log or divide, and it avoids the closed
+ * form's cancellation at small x.
+ */
+DEVICE real bornSumTerm(real r, real invR, float radius1, float scaledRadius2) {
+#ifndef USE_DOUBLE_PRECISION
+    if (r >= radius1+scaledRadius2 && scaledRadius2 <= 0.6f*r) {
+        real x = scaledRadius2*invR;
+        real y = x*x;
+        real p = 0.666666687f+y*(0.799996376f+y*(0.857358336f+y*(0.883500159f+y*(0.978707075f+y*(0.415265888f+
+                y*(3.07469845f+y*(-4.06764746f+y*6.41090584f)))))));
+        return invR*x*y*p;
+    }
+#endif
+    real l_ij = RECIP(max((real) radius1, fabs(r-scaledRadius2)));
+    real u_ij = RECIP(r+scaledRadius2);
+    real l_ij2 = l_ij*l_ij;
+    real u_ij2 = u_ij*u_ij;
+    real ratio = LOG(u_ij * RECIP(l_ij));
+    real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) + (scaledRadius2*scaledRadius2*invR)*(l_ij2-u_ij2));
+    return term + (radius1 < scaledRadius2-r ? 2.0f*(RECIP(radius1)-l_ij) : 0);
+}
+
+/**
  * Compute the Born sum.
  */
 KERNEL void computeBornSum(
@@ -72,14 +100,7 @@ KERNEL void computeBornSum(
                     float2 params2 = make_float2(localData[tbx+j].radius, localData[tbx+j].scaledRadius);
                     real rScaledRadiusJ = r+params2.y;
                     if ((j != tgx) && (params1.x < rScaledRadiusJ)) {
-                        real l_ij = RECIP(max((real) params1.x, fabs(r-params2.y)));
-                        real u_ij = RECIP(rScaledRadiusJ);
-                        real l_ij2 = l_ij*l_ij;
-                        real u_ij2 = u_ij*u_ij;
-                        real ratio = LOG(u_ij * RECIP(l_ij));
-                        bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                         (params2.y*params2.y*invR)*(l_ij2-u_ij2));
-                        bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+                        bornSum += bornSumTerm(r, invR, params1.x, params2.y);
                     }
                 }
                 SYNC_WARPS;
@@ -119,26 +140,11 @@ KERNEL void computeBornSum(
                     float2 params2 = make_float2(localData[tbx+tj].radius, localData[tbx+tj].scaledRadius);
                     real rScaledRadiusJ = r+params2.y;
                     if (params1.x < rScaledRadiusJ) {
-                        real l_ij = RECIP(max((real) params1.x, fabs(r-params2.y)));
-                        real u_ij = RECIP(rScaledRadiusJ);
-                        real l_ij2 = l_ij*l_ij;
-                        real u_ij2 = u_ij*u_ij;
-                        real ratio = LOG(u_ij * RECIP(l_ij));
-                        bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                         (params2.y*params2.y*invR)*(l_ij2-u_ij2));
-                        bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+                        bornSum += bornSumTerm(r, invR, params1.x, params2.y);
                     }
                     real rScaledRadiusI = r+params1.y;
                     if (params2.x < rScaledRadiusI) {
-                        real l_ij = RECIP(max((real) params2.x, fabs(r-params1.y)));
-                        real u_ij = RECIP(rScaledRadiusI);
-                        real l_ij2 = l_ij*l_ij;
-                        real u_ij2 = u_ij*u_ij;
-                        real ratio = LOG(u_ij * RECIP(l_ij));
-                        real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                         (params1.y*params1.y*invR)*(l_ij2-u_ij2));
-                        term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
-                        localData[tbx+tj].bornSum += term;
+                        localData[tbx+tj].bornSum += bornSumTerm(r, invR, params2.x, params1.y);
                     }
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
@@ -262,26 +268,11 @@ KERNEL void computeBornSum(
                         float2 params2 = make_float2(localData[tbx+tj].radius, localData[tbx+tj].scaledRadius);
                         real rScaledRadiusJ = r+params2.y;
                         if (params1.x < rScaledRadiusJ) {
-                            real l_ij = RECIP(max((real) params1.x, fabs(r-params2.y)));
-                            real u_ij = RECIP(rScaledRadiusJ);
-                            real l_ij2 = l_ij*l_ij;
-                            real u_ij2 = u_ij*u_ij;
-                            real ratio = LOG(u_ij * RECIP(l_ij));
-                            bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                             (params2.y*params2.y*invR)*(l_ij2-u_ij2));
-                            bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+                            bornSum += bornSumTerm(r, invR, params1.x, params2.y);
                         }
                         real rScaledRadiusI = r+params1.y;
                         if (params2.x < rScaledRadiusI) {
-                            real l_ij = RECIP(max((real) params2.x, fabs(r-params1.y)));
-                            real u_ij = RECIP(rScaledRadiusI);
-                            real l_ij2 = l_ij*l_ij;
-                            real u_ij2 = u_ij*u_ij;
-                            real ratio = LOG(u_ij * RECIP(l_ij));
-                            real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                             (params1.y*params1.y*invR)*(l_ij2-u_ij2));
-                            term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
-                            localData[tbx+tj].bornSum += term;
+                            localData[tbx+tj].bornSum += bornSumTerm(r, invR, params2.x, params1.y);
                         }
                     }
                     tj = (tj + 1) & (TILE_SIZE - 1);
@@ -311,26 +302,11 @@ KERNEL void computeBornSum(
                         float2 params2 = make_float2(localData[tbx+tj].radius, localData[tbx+tj].scaledRadius);
                         real rScaledRadiusJ = r+params2.y;
                         if (params1.x < rScaledRadiusJ) {
-                            real l_ij = RECIP(max((real) params1.x, fabs(r-params2.y)));
-                            real u_ij = RECIP(rScaledRadiusJ);
-                            real l_ij2 = l_ij*l_ij;
-                            real u_ij2 = u_ij*u_ij;
-                            real ratio = LOG(u_ij * RECIP(l_ij));
-                            bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                             (params2.y*params2.y*invR)*(l_ij2-u_ij2));
-                            bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+                            bornSum += bornSumTerm(r, invR, params1.x, params2.y);
                         }
                         real rScaledRadiusI = r+params1.y;
                         if (params2.x < rScaledRadiusI) {
-                            real l_ij = RECIP(max((real) params2.x, fabs(r-params1.y)));
-                            real u_ij = RECIP(rScaledRadiusI);
-                            real l_ij2 = l_ij*l_ij;
-                            real u_ij2 = u_ij*u_ij;
-                            real ratio = LOG(u_ij * RECIP(l_ij));
-                            real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
-                                             (params1.y*params1.y*invR)*(l_ij2-u_ij2));
-                            term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
-                            localData[tbx+tj].bornSum += term;
+                            localData[tbx+tj].bornSum += bornSumTerm(r, invR, params2.x, params1.y);
                         }
                     }
                     tj = (tj + 1) & (TILE_SIZE - 1);
