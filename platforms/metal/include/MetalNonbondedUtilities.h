@@ -38,7 +38,6 @@
 namespace OpenMM {
 
 class MetalContext;
-class MetalEvent;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
@@ -308,6 +307,10 @@ public:
      */
     void setKernelSource(const std::string& source);
 private:
+    /**
+     * Wait until copyInteractionCounts has written this step's counts to pinned memory.
+     */
+    void waitForCountCopy();
     class KernelSet;
     class BlockSortTrait;
     void initParamArgs();
@@ -336,9 +339,9 @@ private:
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
     ComputeSort blockSorter;
-    std::shared_ptr<MetalEvent> downloadCountEvent;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
+    unsigned int countCopies;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
