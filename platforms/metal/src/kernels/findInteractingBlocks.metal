@@ -675,7 +675,8 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 // A separate dispatch supplies the device-wide ordering between the per-tile
 // displacement test and the decision.  It runs as one threadgroup, so on rebuild
 // steps it also computes the sort keys and sorts them, with only threadgroup
-// barriers.  Keys are unique, so ranking them gives sortShortList2's order.
+// barriers.  The keys order blocks by size bin, then by index, so a stable counting
+// sort over the bins gives the same order as sorting the keys.
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
 extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
@@ -683,7 +684,11 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
         const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
         unsigned int* __restrict__ dispatch) {
-    __shared__ unsigned int keys[NUM_BLOCKS];
+    const int numSizeBins = 20;
+    const int maxSimdGroups = 32;
+    __shared__ unsigned char blockBin[NUM_BLOCKS];
+    __shared__ unsigned int binStart[numSizeBins];
+    __shared__ unsigned int simdBinCount[maxSimdGroups][numSizeBins];
     __shared__ bool anyMoved;
     if (threadIdx.x == 0)
         anyMoved = false;
@@ -718,25 +723,59 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
     if (!rebuild)
         return;
 
-    // The same keys as computeSortKeys.
+    // The same bins as computeSortKeys.  Count the blocks in each bin, then place each chunk of blocks
+    // after everything in lower bins and earlier chunks, ranking blocks in the same bin by index within a
+    // SIMD group and then across SIMD groups.
 
     real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
-    int numSizeBins = 20;
     real scale = numSizeBins/(sizeRange.y-sizeRange.x);
+    if (threadIdx.x < numSizeBins)
+        binStart[threadIdx.x] = 0;
+    __syncthreads();
     for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
         real4 box = blockBoundingBox[i];
         real size = LOG(box.x+box.y+box.z);
         int bin = (size-sizeRange.x)*scale;
         bin = max(0, min(bin, numSizeBins-1));
-        keys[i] = (((unsigned int) bin)<<BIN_SHIFT) + i;
+        blockBin[i] = bin;
+        atomic_fetch_add_explicit((threadgroup atomic_uint*) &binStart[bin], 1, memory_order_relaxed);
     }
     __syncthreads();
-    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
-        unsigned int key = keys[i];
+    if (threadIdx.x == 0) {
+        unsigned int start = 0;
+        for (int b = 0; b < numSizeBins; b++) {
+            unsigned int count = binStart[b];
+            binStart[b] = start;
+            start += count;
+        }
+    }
+    __syncthreads();
+    unsigned int lane = threadIdx.x%32, simdGroup = threadIdx.x/32, numSimdGroups = (blockDim.x+31)/32;
+    for (unsigned int base = 0; base < NUM_BLOCKS; base += blockDim.x) {
+        unsigned int i = base+threadIdx.x;
+        int bin = (i < NUM_BLOCKS ? blockBin[i] : numSizeBins);
         unsigned int rank = 0;
-        for (unsigned int j = 0; j < NUM_BLOCKS; j++)
-            rank += (keys[j] < key);
-        sortedBlocks[rank] = key;
+        for (int b = 0; b < numSizeBins; b++) {
+            unsigned int inBin = (bin == b);
+            unsigned int before = simd_prefix_exclusive_sum(inBin);
+            unsigned int total = simd_sum(inBin);
+            if (inBin)
+                rank = before;
+            if (lane == 0)
+                simdBinCount[simdGroup][b] = total;
+        }
+        __syncthreads();
+        if (i < NUM_BLOCKS) {
+            rank += binStart[bin];
+            for (unsigned int g = 0; g < simdGroup; g++)
+                rank += simdBinCount[g][bin];
+            sortedBlocks[rank] = (((unsigned int) bin)<<BIN_SHIFT) + i;
+        }
+        __syncthreads();
+        if (threadIdx.x < numSizeBins)
+            for (unsigned int g = 0; g < numSimdGroups; g++)
+                binStart[threadIdx.x] += simdBinCount[g][threadIdx.x];
+        __syncthreads();
     }
 }
 #endif
