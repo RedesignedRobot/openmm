@@ -212,6 +212,9 @@ void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
 // Lanes that share one atom in the reduction kernels.
 static const int REDUCE_LANES = 8;
 
+// Threads per threadgroup in the pair kernels, which launch one SIMD group per block pair.
+static const int PAIR_GROUP_SIZE = 256;
+
 // The block-pair kernels win when the half-list launch leaves the GPU short of work, so that its tail after the last
 // atomics is exposed, and lose when the launch already fills the GPU, since they read and write one partial per atom
 // per block.  gbsa (78 blocks) has 1.27 block pairs per SIMD group of the launch on the M3 Ultra (60 cores), where
@@ -290,6 +293,7 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     ownedReduceBornForceKernel->addArg(params);
     ownedReduceBornForceKernel->addArg(bornRadii);
     ownedReduceBornForceKernel->addArg(obcChain);
+    ownedReduceBornForceKernel->addArg(); // Whether to include energy.
     return true;
 }
 
@@ -304,12 +308,15 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
         return CommonCalcGBSAOBCForceKernel::execute(context, includeForces, includeEnergy);
     MetalNonbondedUtilities& nb = cu.getNonbondedUtilities();
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
+    int numBlocks = cu.getNumAtomBlocks();
+    int pairThreads = min(threads, (numBlocks*(numBlocks+1)/2*32+PAIR_GROUP_SIZE-1)/PAIR_GROUP_SIZE*PAIR_GROUP_SIZE);
     ownedForce1Kernel->setArg(4, (int) includeEnergy);
+    ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
     setPeriodicBoxArgs(cu, ownedForce1Kernel, 5);
-    ownedBornSumKernel->execute(threads, nb.getForceThreadBlockSize());
+    ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedReduceBornSumKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
-    ownedForce1Kernel->execute(threads, nb.getForceThreadBlockSize());
+    ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     return 0.0;
 }
