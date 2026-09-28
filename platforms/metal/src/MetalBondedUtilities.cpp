@@ -22,6 +22,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
+
 #include "MetalBondedUtilities.h"
 #include "MetalContext.h"
 #include <algorithm>
@@ -30,121 +31,158 @@
 using namespace OpenMM;
 using namespace std;
 
-// A chunk is one term per thread of a threadgroup, and BondedUtilities::computeInteractions() launches
-// threadgroups of ThreadBlockSize.  Only forces whose terms touch up to MaxChunkedAtoms atoms are chunked.
-static const int MaxChunkedAtoms = 4;
-
-// Forces with fewer terms keep the per-term atomics.  On the M3 Ultra, chunking every force slowed the
-// bonded kernel of the rf and gbsa dhfr systems (at most 7,310 terms per force) by 10 to 15%, and sped it
-// up 2.8 to 3.4 times on apoa1 and cellulose, where no force has fewer than 11,428 terms.  dhfr's PME
-// exclusions (34,709 terms) stay chunked.
-static const int MinChunkedTerms = 10000;
+// Blocks are 64 to 256 atoms.  Larger blocks evaluate fewer terms twice (terms that cross a block edge:
+// 3.5-6.1% extra at 128 atoms on the benchmark systems, 6.8-12.2% at 64), but give fewer threadgroups.
+// The block doubles while that still leaves MinBlocksPerCore blocks for every GPU core.
+static const int MinBlockSize = 64;
+static const int MaxBlockSize = 256;
+static const int MinBlocksPerCore = 16;
 
 // Metal's limit on a kernel's buffer and value arguments (see MetalContext::createProgram()), and the
 // arguments that BondedUtilities::initialize() gives the kernel before any force's.
 static const int MaxKernelArguments = 31;
 static const int NumFixedArguments = 9;
 
-void MetalBondedUtilities::initialize(const System& system) {
-    // For each chunk, the plan lists the atoms the chunk touches, and for each atom the pad slots that hold
-    // its forces.  A force's plan is the offset of each chunk's first entry, then one entry per atom
-    // (the atom, and its first and end slot in the low and high 16 bits), then numAtoms*chunkSize slots
-    // per chunk as ushorts.  A force keeps the per-term atomics of BondedUtilities if it has too few terms,
-    // if its terms are too large, if its code could leave the loop over its terms early and so skip a
-    // barrier, if its chunks save less than a quarter of its atomic adds, too few to pay for the barriers,
-    // or if its plan would take the whole plan past 1% of the device's working set.  So does every force
-    // when the plan would take the kernel past the argument limit.
+// Terms in a block are listed by their index, with this bit set when the block is not their home.
+static const unsigned int NotHomeBit = 0x80000000u;
 
-    const int chunkSize = MetalContext::ThreadBlockSize;
+void MetalBondedUtilities::initialize(const System& system) {
+    // A force keeps the per-term atomics of BondedUtilities if its code could leave the loop over its terms
+    // early or return, which would skip the block's flush, or if it accumulates energy derivatives, which
+    // a term evaluated in two blocks would count twice.  So does every force when the plan would take the
+    // kernel past the argument limit or the plan past 1% of the device's working set.
+
+    MetalContext& cu = dynamic_cast<MetalContext&>(context);
     int numForces = forceAtoms.size();
-    entryStartOffset.assign(numForces, -1);
-    entryOffset.assign(numForces, -1);
-    slotOffset.assign(numForces, -1);
-    firstChunkedForce = -1;
-    maxChunkedAtoms = 0;
+    int numAtoms = cu.getNumAtoms();
+    blockStartOffset.assign(numForces, -1);
+    termOffset.assign(numForces, -1);
+    blockSource.clear();
+    lastBlockForce = -1;
+    blockSize = MinBlockSize;
+    while (blockSize < MaxBlockSize && numAtoms/(2*blockSize) >= MinBlocksPerCore*cu.getMultiprocessors())
+        blockSize *= 2;
+    numBlocks = (numAtoms+blockSize-1)/blockSize;
     int numArguments = NumFixedArguments+arguments.size()+(energyParameterDerivatives.size() > 0 ? 1 : 0);
     for (int force = 0; force < numForces; force++)
         numArguments += (forceAtoms[force][0].size()+3)/4;
-    long long maxPlanBytes = dynamic_cast<MetalContext&>(context).getDevice()->recommendedMaxWorkingSetSize()/100;
+    long long maxPlanBytes = cu.getDevice()->recommendedMaxWorkingSetSize()/100;
     vector<unsigned int> planData;
     for (int force = 0; force < numForces && numArguments < MaxKernelArguments; force++) {
-        int numBonds = forceAtoms[force].size();
-        int numAtoms = forceAtoms[force][0].size();
         const string& source = forceSource[force];
-        if (numBonds < MinChunkedTerms || numAtoms > MaxChunkedAtoms || source.find("continue") != string::npos || source.find("break") != string::npos || source.find("return") != string::npos)
+        if (source.find("continue") != string::npos || source.find("break") != string::npos || source.find("return") != string::npos || source.find("energyParamDeriv") != string::npos)
             continue;
-        int numChunks = (numBonds+chunkSize-1)/chunkSize;
-        vector<unsigned int> entryStart(1, 0), entries;
-        vector<unsigned short> slots(numChunks*numAtoms*chunkSize, 0);
-        for (int chunk = 0; chunk < numChunks; chunk++) {
-            vector<pair<int, int> > atomSlots;
-            for (int term = 0; term < chunkSize && chunk*chunkSize+term < numBonds; term++)
-                for (int atom = 0; atom < numAtoms; atom++)
-                    atomSlots.push_back(make_pair(forceAtoms[force][chunk*chunkSize+term][atom], atom*chunkSize+term));
-            sort(atomSlots.begin(), atomSlots.end());
-            int last;
-            for (int first = 0; first < atomSlots.size(); first = last) {
-                for (last = first; last < atomSlots.size() && atomSlots[last].first == atomSlots[first].first; last++)
-                    slots[chunk*numAtoms*chunkSize+last] = atomSlots[last].second;
-                entries.push_back(atomSlots[first].first);
-                entries.push_back(first | (last<<16));
+
+        // List the terms touching each block, block by block, in their original order.
+
+        const vector<vector<int> >& atoms = forceAtoms[force];
+        int numTerms = atoms.size();
+        vector<unsigned int> blockStart(numBlocks+1, 0);
+        vector<int> termBlocks, termFirst(numTerms+1, 0);
+        for (int term = 0; term < numTerms; term++) {
+            int first = termBlocks.size();
+            for (int atom : atoms[term]) {
+                int block = atom/blockSize;
+                if (find(termBlocks.begin()+first, termBlocks.end(), block) == termBlocks.end())
+                    termBlocks.push_back(block);
             }
-            entryStart.push_back(entries.size()/2);
+            for (int i = first; i < termBlocks.size(); i++)
+                blockStart[termBlocks[i]+1]++;
+            termFirst[term+1] = termBlocks.size();
         }
-        if (4*(entries.size()/2) > 3*numBonds*numAtoms)
-            continue;
-        long long planSize = planData.size()+entryStart.size()+1+entries.size()+slots.size()/2;
+        for (int block = 0; block < numBlocks; block++)
+            blockStart[block+1] += blockStart[block];
+        int numEvaluations = blockStart[numBlocks];
+        long long planSize = planData.size()+numBlocks+1+numEvaluations;
         if (planSize*sizeof(unsigned int) > maxPlanBytes)
             continue;
-        if (firstChunkedForce == -1)
-            firstChunkedForce = force;
-        maxChunkedAtoms = max(maxChunkedAtoms, numAtoms);
-
-        // Entries are read as uint2, so they start at an even offset.
-
-        entryStartOffset[force] = planData.size();
-        planData.insert(planData.end(), entryStart.begin(), entryStart.end());
-        if (planData.size()%2 == 1)
-            planData.push_back(0);
-        entryOffset[force] = planData.size();
-        planData.insert(planData.end(), entries.begin(), entries.end());
-        slotOffset[force] = planData.size();
-        for (int i = 0; i < slots.size(); i += 2)
-            planData.push_back(slots[i] | (slots[i+1]<<16));
+        vector<unsigned int> terms(numEvaluations);
+        vector<vector<int> > evaluationAtoms(numEvaluations);
+        vector<unsigned int> next(blockStart.begin(), blockStart.end()-1);
+        for (int term = 0; term < numTerms; term++) {
+            int home = atoms[term][0]/blockSize;
+            for (int i = termFirst[term]; i < termFirst[term+1]; i++) {
+                int block = termBlocks[i];
+                int position = next[block]++;
+                terms[position] = term | (block == home ? 0 : NotHomeBit);
+                evaluationAtoms[position] = atoms[term];
+            }
+        }
+        blockStartOffset[force] = planData.size();
+        planData.insert(planData.end(), blockStart.begin(), blockStart.end());
+        termOffset[force] = planData.size();
+        planData.insert(planData.end(), terms.begin(), terms.end());
+        forceAtoms[force] = evaluationAtoms;
+        lastBlockForce = force;
     }
-    if (firstChunkedForce != -1) {
+    if (lastBlockForce != -1) {
         plan.initialize<unsigned int>(context, planData.size(), "bondedPlan");
         plan.upload(planData);
         planArgument = addArgument(plan, "unsigned int");
+        addPrefixCode(
+            "inline void addBlockForce(threadgroup atomic_uint* sum, mm_long value) {\n"
+            "    unsigned int lower = (unsigned int) value;\n"
+            "    unsigned int upper = (unsigned int) (((mm_ulong) value) >> 32);\n"
+            "    unsigned int oldLower = atomic_fetch_add_explicit(&sum[0], lower, memory_order_relaxed);\n"
+            "    if (oldLower+lower < oldLower)\n"
+            "        upper++;\n"
+            "    if (upper != 0)\n"
+            "        atomic_fetch_add_explicit(&sum[1], upper, memory_order_relaxed);\n"
+            "}\n");
     }
     BondedUtilities::initialize(system);
 }
 
 string MetalBondedUtilities::createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const string& computeForce) {
-    if (entryStartOffset[forceIndex] == -1)
+    if (blockStartOffset[forceIndex] == -1)
         return BondedUtilities::createForceSource(forceIndex, numBonds, numAtoms, group, computeForce);
-    maxBonds = max(maxBonds, numBonds);
-    const int chunkSize = MetalContext::ThreadBlockSize;
-    const int padSize = numAtoms*chunkSize;
+    maxBonds = max(maxBonds, numBlocks*MetalContext::ThreadBlockSize);
+    blockSource.push_back(createBlockSource(forceIndex, numAtoms, group, computeForce));
+    if (forceIndex != lastBlockForce)
+        return "";
+
+    // All forces that use blocks share one loop over the blocks, placed where the last of them would go.
+    // The sums hold each owned atom's x, y and z force as the low and high words of 64-bit fixed point.
+
+    stringstream s;
+    s<<"LOCAL atomic_uint blockSums["<<6*blockSize<<"];\n";
+    s<<"for (unsigned int i = LOCAL_ID; i < "<<6*blockSize<<"; i += LOCAL_SIZE)\n";
+    s<<"    atomic_store_explicit(&blockSums[i], 0u, memory_order_relaxed);\n";
+    s<<"threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s<<"for (unsigned int block = GROUP_ID; block < "<<numBlocks<<"; block += NUM_GROUPS) {\n";
+    s<<"    const unsigned int firstAtom = block*"<<blockSize<<";\n";
+    for (const string& source : blockSource)
+        s<<source;
+    s<<"    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s<<"    for (unsigned int i = LOCAL_ID; i < "<<blockSize<<"; i += LOCAL_SIZE) {\n";
+    s<<"        for (int component = 0; component < 3; component++) {\n";
+    s<<"            threadgroup atomic_uint* sum = &blockSums[6*i+2*component];\n";
+    // Read and clear with an exchange: the Apple8 (G14) compiler service crashes on atomic_load_explicit
+    // of a threadgroup atomic_uint.
+    s<<"            mm_ulong total = atomic_exchange_explicit(&sum[0], 0u, memory_order_relaxed) | (((mm_ulong) atomic_exchange_explicit(&sum[1], 0u, memory_order_relaxed)) << 32);\n";
+    s<<"            if (total != 0)\n";
+    s<<"                ATOMIC_ADD(&forceBuffer[firstAtom+i+component*PADDED_NUM_ATOMS], total);\n";
+    s<<"        }\n";
+    s<<"    }\n";
+    s<<"    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s<<"}\n";
+    return s.str();
+}
+
+string MetalBondedUtilities::createBlockSource(int forceIndex, int numAtoms, int group, const string& computeForce) {
     string suffix1[] = {""};
     string suffix4[] = {".x", ".y", ".z", ".w"};
     stringstream s;
-
-    // The pad is declared at kernel scope, in the source of the first force that uses it.  It holds
-    // each component of the forces as [component][atom][term].
-
-    if (forceIndex == firstChunkedForce)
-        s<<"LOCAL real bondedPad["<<3*maxChunkedAtoms*chunkSize<<"];\n";
-    s<<"if ((groups&"<<(1<<group)<<") != 0)\n";
-    s<<"for (unsigned int chunk = GROUP_ID; chunk < "<<(numBonds+chunkSize-1)/chunkSize<<"; chunk += NUM_GROUPS) {\n";
-    s<<"    unsigned int index = chunk*"<<chunkSize<<"+LOCAL_ID;\n";
-    s<<"    if (index < "<<numBonds<<") {\n";
+    s<<"    if ((groups&"<<(1<<group)<<") != 0)\n";
+    s<<"    for (unsigned int position = "<<planArgument<<"["<<blockStartOffset[forceIndex]<<"+block]+LOCAL_ID; position < "<<planArgument<<"["<<blockStartOffset[forceIndex]<<"+block+1]; position += LOCAL_SIZE) {\n";
+    s<<"    unsigned int term = "<<planArgument<<"["<<termOffset[forceIndex]<<"+position];\n";
+    s<<"    unsigned int index = term & "<<(~NotHomeBit)<<"u;\n";
     int startAtom = 0;
     for (int i = 0; i < (int) atomIndices[forceIndex].size(); i++) {
         int indexWidth = atomIndices[forceIndex][i].getElementSize()/4;
         string* suffix = (indexWidth == 1 ? suffix1 : suffix4);
         string indexType = (indexWidth == 1 ? "unsigned int" : "uint"+context.intToString(indexWidth));
-        s<<"    "<<indexType<<" atoms"<<i<<" = atomIndices"<<forceIndex<<"_"<<i<<"[index];\n";
+        s<<"    "<<indexType<<" atoms"<<i<<" = atomIndices"<<forceIndex<<"_"<<i<<"[position];\n";
         int atomsToLoad = min(indexWidth, numAtoms-startAtom);
         for (int j = 0; j < atomsToLoad; j++) {
             s<<"    unsigned int atom"<<(startAtom+j+1)<<" = atoms"<<i<<suffix[j]<<";\n";
@@ -152,31 +190,18 @@ string MetalBondedUtilities::createForceSource(int forceIndex, int numBonds, int
         }
         startAtom += indexWidth;
     }
+    s<<"    mixed energyBeforeTerm = energy;\n";
     s<<computeForce<<"\n";
+    s<<"    if (term >= "<<NotHomeBit<<"u)\n";
+    s<<"        energy = energyBeforeTerm;\n";
     for (int i = 0; i < numAtoms; i++) {
-        s<<"    bondedPad["<<i*chunkSize<<"+LOCAL_ID] = force"<<(i+1)<<".x;\n";
-        s<<"    bondedPad["<<padSize+i*chunkSize<<"+LOCAL_ID] = force"<<(i+1)<<".y;\n";
-        s<<"    bondedPad["<<2*padSize+i*chunkSize<<"+LOCAL_ID] = force"<<(i+1)<<".z;\n";
+        s<<"    if (atom"<<(i+1)<<"-firstAtom < "<<blockSize<<") {\n";
+        s<<"        threadgroup atomic_uint* sum = &blockSums[6*(atom"<<(i+1)<<"-firstAtom)];\n";
+        s<<"        addBlockForce(&sum[0], realToFixedPoint(force"<<(i+1)<<".x));\n";
+        s<<"        addBlockForce(&sum[2], realToFixedPoint(force"<<(i+1)<<".y));\n";
+        s<<"        addBlockForce(&sum[4], realToFixedPoint(force"<<(i+1)<<".z));\n";
+        s<<"    }\n";
     }
     s<<"    }\n";
-    s<<"    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    s<<"    GLOBAL const unsigned int* entryStart = "<<planArgument<<"+"<<entryStartOffset[forceIndex]<<";\n";
-    s<<"    GLOBAL const uint2* entries = (GLOBAL const uint2*) ("<<planArgument<<"+"<<entryOffset[forceIndex]<<");\n";
-    s<<"    GLOBAL const ushort* slots = (GLOBAL const ushort*) ("<<planArgument<<"+"<<slotOffset[forceIndex]<<")+chunk*"<<padSize<<";\n";
-    s<<"    for (unsigned int i = entryStart[chunk]+LOCAL_ID; i < entryStart[chunk+1]; i += LOCAL_SIZE) {\n";
-    s<<"        uint2 entry = entries[i];\n";
-    s<<"        mm_ulong fx = 0, fy = 0, fz = 0;\n";
-    s<<"        for (unsigned int j = (entry.y&0xFFFF); j < (entry.y>>16); j++) {\n";
-    s<<"            unsigned int slot = slots[j];\n";
-    s<<"            fx += (mm_ulong) realToFixedPoint(bondedPad[slot]);\n";
-    s<<"            fy += (mm_ulong) realToFixedPoint(bondedPad["<<padSize<<"+slot]);\n";
-    s<<"            fz += (mm_ulong) realToFixedPoint(bondedPad["<<2*padSize<<"+slot]);\n";
-    s<<"        }\n";
-    s<<"        ATOMIC_ADD(&forceBuffer[entry.x], fx);\n";
-    s<<"        ATOMIC_ADD(&forceBuffer[entry.x+PADDED_NUM_ATOMS], fy);\n";
-    s<<"        ATOMIC_ADD(&forceBuffer[entry.x+PADDED_NUM_ATOMS*2], fz);\n";
-    s<<"    }\n";
-    s<<"    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    s<<"}\n";
     return s.str();
 }
