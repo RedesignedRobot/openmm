@@ -453,6 +453,9 @@ double MetalNonbondedUtilities::getMaxCutoffDistance() {
 
 double MetalNonbondedUtilities::padCutoff(double cutoff) {
     double padding = (usePadding ? 0.08*cutoff : 0.0);
+    // Probe only, never for merge: M29_PADDING overrides the padding as a fraction of the cutoff.
+    if (usePadding && getenv("M29_PADDING"))
+        padding = atof(getenv("M29_PADDING"))*cutoff;
     return cutoff+padding;
 }
 
