@@ -10,6 +10,15 @@
 #else
 #define SOLVE_SETTLE true
 #endif
+// FUSED_PROBE_ITERS makes integrateLangevinMiddleFused write int4(velocity iterations, position iterations, unit type,
+// finish ticket) per unit to probeOut, where the ticket counts SIMD groups in the order they finish.
+#ifdef FUSED_PROBE_ITERS
+#define PROBE_ITERS_VEL , &velIters
+#define PROBE_ITERS_POS , &posIters
+#else
+#define PROBE_ITERS_VEL
+#define PROBE_ITERS_POS
+#endif
 #ifdef FUSED_SHAKE_FIRST
 #define CLASSIFY_UNIT(unit) \
         bool isShake = (unit < numShake); \
@@ -91,7 +100,11 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
-        GLOBAL const float4* RESTRICT cmVelocity) {
+        GLOBAL const float4* RESTRICT cmVelocity
+#ifdef FUSED_PROBE_ITERS
+        , GLOBAL int4* RESTRICT probeOut
+#endif
+        ) {
     float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
@@ -118,20 +131,28 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             if (atoms[i] != -1)
                 kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos[i], vel[i]);
         }
+        int velIters = 0, posIters = 0;
         if (isSettle && SOLVE_SETTLE)
             applySettleToClusterVelocities(pos, vel);
         else if (isShake && SOLVE_SHAKE)
-            applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, pos, vel);
+            applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, pos, vel PROBE_ITERS_VEL);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 bathAtom(atoms[i], random, randomIndex, halfdt, vscale, noisescale, vel[i], delta[i], oldDelta[i]);
         if (isSettle && SOLVE_SETTLE)
-            applySettleToCluster(settleParams[settleIndex], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
+            applySettleToCluster(settleParams[settleIndex], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta PROBE_ITERS_POS);
         else if (isShake && SOLVE_SHAKE)
-            applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, pos, delta);
+            applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, pos, delta PROBE_ITERS_POS);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 finishAtom(atoms[i], posq, posqCorrection, velm, invDt, pos[i], vel[i], delta[i], oldDelta[i]);
+#ifdef FUSED_PROBE_ITERS
+        int ticket = 0;
+        if (simd_is_first())
+            ticket = atomic_fetch_add_explicit((device atomic_int*) (probeOut+numUnits), 1, memory_order_relaxed);
+        ticket = simd_broadcast_first(ticket);
+        probeOut[unit] = make_int4(velIters, posIters, isSettle ? 1 : (isShake ? 2 : 0), ticket);
+#endif
     }
 }
 
@@ -160,7 +181,11 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
-        GLOBAL const float4* RESTRICT cmVelocity) {
+        GLOBAL const float4* RESTRICT cmVelocity
+#ifdef FUSED_PROBE_ITERS
+        , GLOBAL int4* RESTRICT probeOut
+#endif
+        ) {
     float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
@@ -198,7 +223,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             if (isSettle && SOLVE_SETTLE)
                 applySettleToClusterVelocities(clusterPos, clusterVel);
             else if (isShake && SOLVE_SHAKE)
-                applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterVel);
+                applyShakeToClusterVelocities(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterVel PROBE_ITERS_NONE);
             vel = laneElement(clusterVel, lane);
         }
         if (atom != -1 && vel.w != 0.0)
@@ -208,9 +233,9 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             for (int i = 0; i < 4; i++)
                 clusterDelta[i] = shuffleMixed4(delta, i);
             if (isSettle && SOLVE_SETTLE)
-                applySettleToCluster(settleParams[settleIndex], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
+                applySettleToCluster(settleParams[settleIndex], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta PROBE_ITERS_NONE);
             else if (isShake && SOLVE_SHAKE)
-                applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterDelta);
+                applyShakeToCluster(atoms, shakeParams[shakeIndex], tol, clusterPos, clusterDelta PROBE_ITERS_NONE);
             delta = laneElement(clusterDelta, lane);
         }
         if (atom != -1 && vel.w != 0.0)

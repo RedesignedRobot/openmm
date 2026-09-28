@@ -100,6 +100,9 @@ private:
     ComputeArray freeAtoms;
     int numLangevinMiddleThreads;
     bool flatLangevinMiddle; // Probe (r2-mixed, not for merge).
+    ComputeArray probeIters; // Probe (r2-mixed, not for merge).
+    std::string probeItersTag;
+    int probeCalls;
     ComputeKernel pendingCMCalc;
     int pendingCMBlockSize;
     ComputeArray* pendingCMVelocity;

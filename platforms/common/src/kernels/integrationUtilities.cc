@@ -102,6 +102,18 @@ inline DEVICE void storePos(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT 
 #define EMULATED_MIXED_PRECISION
 #endif
 
+// Probe (r2-mixed, not for merge): with FUSED_PROBE_ITERS the SHAKE and SETTLE solvers report their iteration counts
+// through a trailing argument, which callers that don't want them pass as null.
+#ifdef FUSED_PROBE_ITERS
+#define PROBE_ITERS_ARG , PRIVATE int* probeIters
+#define PROBE_ITERS_NONE , nullptr
+#define PROBE_ITERS_STORE(n) if (probeIters != nullptr) *probeIters = (n);
+#else
+#define PROBE_ITERS_ARG
+#define PROBE_ITERS_NONE
+#define PROBE_ITERS_STORE(n)
+#endif
+
 /**
  * Load the positions of the atoms in a SHAKE cluster at the start of the step, and their displacements or velocities.
  * The peripheral atoms a cluster lacks get zeros.
@@ -142,7 +154,7 @@ inline DEVICE void storeShakeCluster(int4 atoms, GLOBAL mixed4s* RESTRICT values
  * Enforce constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the step, and
  * delta their displacements, which this updates.
  */
-DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta) {
+DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta PROBE_ITERS_ARG) {
     mixed4 pos = clusterPos[0], pos1 = clusterPos[1], pos2 = clusterPos[2], pos3 = clusterPos[3];
     mixed4 xpi = delta[0], xpj1 = delta[1], xpj2 = delta[2], xpj3 = delta[3];
     float invMassCentral = params.x;
@@ -246,6 +258,7 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
         }
         iteration++;
     }
+    PROBE_ITERS_STORE(iteration)
     delta[0] = xpi;
     delta[1] = xpj1;
     delta[2] = xpj2;
@@ -269,7 +282,7 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
         int4 atoms = clusterAtoms[index];
         mixed4 pos[4], xp[4];
         loadShakeCluster(atoms, oldPos, posqCorrection, posDelta, pos, xp);
-        applyShakeToCluster(atoms, clusterParams[index], tol, pos, xp);
+        applyShakeToCluster(atoms, clusterParams[index], tol, pos, xp PROBE_ITERS_NONE);
         storeShakeCluster(atoms, posDelta, xp);
         index += GLOBAL_SIZE;
     }
@@ -279,7 +292,7 @@ KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4
  * Enforce velocity constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the
  * step, and vel their velocities, which this updates.
  */
-DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* vel) {
+DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* vel PROBE_ITERS_ARG) {
     mixed4 pos = clusterPos[0], pos1 = clusterPos[1], pos2 = clusterPos[2], pos3 = clusterPos[3];
     mixed4 xpi = vel[0], xpj1 = vel[1], xpj2 = vel[2], xpj3 = vel[3];
     float invMassCentral = params.x;
@@ -367,6 +380,7 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
         }
         iteration++;
     }
+    PROBE_ITERS_STORE(iteration)
     vel[0] = xpi;
     vel[1] = xpj1;
     vel[2] = xpj2;
@@ -390,7 +404,7 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
         int4 atoms = clusterAtoms[index];
         mixed4 pos[4], vel[4];
         loadShakeCluster(atoms, oldPos, posqCorrection, posDelta, pos, vel);
-        applyShakeToClusterVelocities(atoms, clusterParams[index], tol, pos, vel);
+        applyShakeToClusterVelocities(atoms, clusterParams[index], tol, pos, vel PROBE_ITERS_NONE);
         storeShakeCluster(atoms, posDelta, vel);
         index += GLOBAL_SIZE;
     }
@@ -400,7 +414,7 @@ KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real
  * Enforce constraints on one SETTLE cluster.  pos holds the positions of its atoms at the start of the step, invMass
  * their inverse masses, and delta their displacements, which this updates.
  */
-DEVICE void applySettleToCluster(float2 params, mixed3 invMass, PRIVATE const mixed4* pos, PRIVATE mixed4* delta) {
+DEVICE void applySettleToCluster(float2 params, mixed3 invMass, PRIVATE const mixed4* pos, PRIVATE mixed4* delta PROBE_ITERS_ARG) {
     mixed4 apos0 = pos[0], apos1 = pos[1], apos2 = pos[2];
     mixed4 xp0 = delta[0], xp1 = delta[1], xp2 = delta[2];
 #ifdef EMULATED_MIXED_PRECISION
@@ -433,6 +447,7 @@ DEVICE void applySettleToCluster(float2 params, mixed3 invMass, PRIVATE const mi
         real g12 = d12sq-dot(f12, f12);
         // After 15 iterations the loop stops without an error, even if the residuals have not converged.
         last = (iteration == 14 || (fabs(g01) < 1e-6f*d01sq && fabs(g02) < 1e-6f*d01sq && fabs(g12) < 1e-6f*d12sq));
+        PROBE_ITERS_STORE(iteration+1)
         if (last) {
             // Move the corrections so far into the mixed precision displacements, so the last step is not
             // rounded to the resolution of the earlier ones.
@@ -636,7 +651,7 @@ KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real
         xp[1] = posDelta[atoms.y];
         pos[2] = loadPos(oldPos, posqCorrection, atoms.z);
         xp[2] = posDelta[atoms.z];
-        applySettleToCluster(clusterParams[index], make_mixed3(velm[atoms.x].w, velm[atoms.y].w, velm[atoms.z].w), pos, xp);
+        applySettleToCluster(clusterParams[index], make_mixed3(velm[atoms.x].w, velm[atoms.y].w, velm[atoms.z].w), pos, xp PROBE_ITERS_NONE);
         posDelta[atoms.x] = xp[0];
         posDelta[atoms.y] = xp[1];
         posDelta[atoms.z] = xp[2];

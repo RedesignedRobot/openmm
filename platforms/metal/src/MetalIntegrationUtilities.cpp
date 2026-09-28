@@ -252,7 +252,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
-        for (string name : {"SKIP_SHAKE", "SKIP_SETTLE", "SHAKE_FIRST"})
+        for (string name : {"SKIP_SHAKE", "SKIP_SETTLE", "SHAKE_FIRST", "PROBE_ITERS"})
             if (probeSwitch("OPENMM_METAL_FUSED_"+name))
                 fusedDefines["FUSED_"+name] = "";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
@@ -283,6 +283,16 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         }
         langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
         langevinMiddleKernel->addArg(nullptr);
+        // Probe (r2-mixed, not for merge): per unit iteration counts and SIMD group finish tickets, with the ticket
+        // counter in the last element.  Steps 200-204 are written to /tmp/openmm-metal-bench/ultra-r2-mixed/iters.
+        probeCalls = 0;
+        if (fusedDefines.count("FUSED_PROBE_ITERS") != 0) {
+            probeIters.initialize<mm_int4>(context, numUnits+1, "probeIters");
+            probeIters.upload(vector<mm_int4>(numUnits+1, mm_int4(0, 0, 0, 0)));
+            langevinMiddleKernel->addArg(probeIters);
+            probeItersTag = (useQuads ? "quads" : "units");
+            probeItersTag += (fusedDefines.count("FUSED_SHAKE_FIRST") != 0 ? "-shakefirst" : "-settlefirst");
+        }
     }
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
@@ -298,6 +308,13 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         dynamic_cast<MetalKernel&>(*langevinMiddleKernel).executeFlat(numLangevinMiddleThreads);
     else
         langevinMiddleKernel->execute(numLangevinMiddleThreads);
+    probeCalls++;
+    if (probeIters.isInitialized() && probeCalls >= 200 && probeCalls < 205) {
+        vector<mm_int4> counts;
+        probeIters.download(counts);
+        ofstream out("/tmp/openmm-metal-bench/ultra-r2-mixed/iters/"+probeItersTag+"-"+to_string(probeCalls)+".bin", ios::binary);
+        out.write((const char*) counts.data(), counts.size()*sizeof(mm_int4));
+    }
     pendingCMVelocity = NULL;
     return true;
 }
