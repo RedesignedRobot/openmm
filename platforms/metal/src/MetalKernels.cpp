@@ -99,12 +99,15 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // energy parameter derivatives when there are any, so those steps keep them in order.  The pass
     // boundaries on either side order them against the clear before and the readers after.  A pending
     // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
-    // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.
+    // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.  Force
+    // pass kernels (PME interpolation) also add to the force buffer only with integer atomics and write
+    // nothing else.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
         cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
+        cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }

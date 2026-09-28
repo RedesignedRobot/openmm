@@ -169,7 +169,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
+    bool usePmeQueue, deferPmeInterpolation, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;

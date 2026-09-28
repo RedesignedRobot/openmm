@@ -217,6 +217,7 @@ CommonCalcNonbondedForceKernel::~CommonCalcNonbondedForceKernel() {
 void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue,
         bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme, bool sortPmeAtoms) {
     this->usePmeQueue = false;
+    this->deferPmeInterpolation = false;
     this->deviceIsCpu = deviceIsCpu;
     this->useFixedPointChargeSpreading = useFixedPointChargeSpreading;
     this->useCpuPme = useCpuPme;
@@ -473,6 +474,13 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 if (doLJPME)
                     dispersionFft = cc.createFFT(dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ, true);
                 this->usePmeQueue = usePmeQueue;
+
+                // Interpolation runs next to the bonded and nonbonded kernels where the platform allows it.  LJPME
+                // reuses pmeGrid1 for the dispersion grid before that pass, so it keeps interpolation in place.
+
+                deferPmeInterpolation = (!usePmeQueue && !doLJPME && cc.getSupportsForcePassKernels());
+                if (deferPmeInterpolation)
+                    pmeDefines["ATOMIC_PME_FORCES"] = "1";
                 if (usePmeQueue) {
                     pmeDefines["USE_PME_STREAM"] = "1";
                     pmeQueue = cc.createQueue();
@@ -1041,6 +1049,8 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             }
             if (deviceIsCpu)
                 pmeInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);
+            else if (deferPmeInterpolation)
+                cc.addForcePassKernel(pmeInterpolateForceKernel, cc.getNumAtoms());
             else
                 pmeInterpolateForceKernel->execute(cc.getNumAtoms());
         }
