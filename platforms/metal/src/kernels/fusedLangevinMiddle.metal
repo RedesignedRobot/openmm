@@ -52,10 +52,12 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
 }
 
 /**
- * Take one LangevinMiddleIntegrator step.  Each thread owns a unit: a SETTLE cluster, a SHAKE cluster, or an atom in
- * neither, taken in that order.  It runs the velocity step, the velocity constraints, the position update with the heat
- * bath, the position constraints and the final velocity correction on its atoms in registers, so the displacements
- * never pass through device memory.  Each atom sees the same operations as in integrateLangevinMiddlePart1-3.
+ * Take one LangevinMiddleIntegrator step.  Each thread owns a unit: a SHAKE cluster, a SETTLE cluster, or an atom in
+ * neither, taken in that order.  SHAKE clusters iterate the longest, so starting them first keeps them out of the
+ * kernel's last wave, where a few slow threads would otherwise hold the GPU mostly idle.  It runs the velocity step,
+ * the velocity constraints, the position update with the heat bath, the position constraints and the final velocity
+ * correction on its atoms in registers, so the displacements never pass through device memory.  Each atom sees the
+ * same operations as in integrateLangevinMiddlePart1-3.
  *
  * When removeCM is nonzero, it also does removeCenterOfMassMomentum's work: it subtracts the
  * center of mass velocity that calcCenterOfMassVelocity wrote to cmVelocity[0] from every atom as it loads it.  That
@@ -75,15 +77,16 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
     mixed halfdt = 0.5f*dt[0].y;
     mixed invDt = 1/dt[0].y;
     for (int unit = GLOBAL_ID; unit < numUnits; unit += GLOBAL_SIZE) {
-        bool isSettle = (unit < numSettle);
-        bool isShake = (!isSettle && unit < numSettle+numShake);
+        bool isShake = (unit < numShake);
+        bool isSettle = (!isShake && unit < numShake+numSettle);
+        int settleIndex = unit-numShake;
         int4 atoms;
         if (isSettle) {
-            atoms = settleAtoms[unit];
+            atoms = settleAtoms[settleIndex];
             atoms.w = -1; // The host leaves 0 in the unused fourth slot of a SETTLE cluster.
         }
         else if (isShake)
-            atoms = shakeAtoms[unit-numSettle];
+            atoms = shakeAtoms[unit];
         else
             atoms = make_int4(freeAtoms[unit-numSettle-numShake], -1, -1, -1);
         mixed4 pos[4], vel[4], delta[4], oldDelta[4];
@@ -98,14 +101,14 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         if (isSettle)
             applySettleToClusterVelocities(pos, vel);
         else if (isShake)
-            applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, pos, vel);
+            applyShakeToClusterVelocities(atoms, shakeParams[unit], tol, pos, vel);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 bathAtom(atoms[i], random, randomIndex, halfdt, vscale, noisescale, vel[i], delta[i], oldDelta[i]);
         if (isSettle)
-            applySettleToCluster(settleParams[unit], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
+            applySettleToCluster(settleParams[settleIndex], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
         else if (isShake)
-            applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, pos, delta);
+            applyShakeToCluster(atoms, shakeParams[unit], tol, pos, delta);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 finishAtom(atoms[i], posq, posqCorrection, velm, invDt, pos[i], vel[i], delta[i], oldDelta[i]);
@@ -126,7 +129,7 @@ inline mixed4 laneElement(PRIVATE const mixed4* values, int lane) {
 }
 
 /**
- * The same step with each quad of threads owning a unit: a SETTLE cluster, a SHAKE cluster, or four atoms in neither
+ * The same step with each quad of threads owning a unit: a SHAKE cluster, a SETTLE cluster, or four atoms in neither
  * (freeAtoms is padded with -1 to a multiple of four).  Each lane kicks, heat-baths and finishes its own atom, so that
  * work runs four wide.  For a cluster, every lane gathers the four atoms and runs the same constraint code, then keeps
  * its own atom's result.  Each atom sees the same operations as in integrateLangevinMiddleFused.
@@ -146,17 +149,18 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
     mixed invDt = 1/dt[0].y;
     const int lane = GLOBAL_ID & 3;
     for (int unit = GLOBAL_ID/4; unit < numUnits; unit += GLOBAL_SIZE/4) {
-        bool isSettle = (unit < numSettle);
-        bool isShake = (!isSettle && unit < numSettle+numShake);
+        bool isShake = (unit < numShake);
+        bool isSettle = (!isShake && unit < numShake+numSettle);
+        int settleIndex = unit-numShake;
         int4 atoms = make_int4(-1);
         int atom;
         if (isSettle) {
-            atoms = settleAtoms[unit];
+            atoms = settleAtoms[settleIndex];
             atoms.w = -1; // The host leaves 0 in the unused fourth slot of a SETTLE cluster.
             atom = atoms[lane];
         }
         else if (isShake) {
-            atoms = shakeAtoms[unit-numSettle];
+            atoms = shakeAtoms[unit];
             atom = atoms[lane];
         }
         else
@@ -176,7 +180,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             if (isSettle)
                 applySettleToClusterVelocities(clusterPos, clusterVel);
             else
-                applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterVel);
+                applyShakeToClusterVelocities(atoms, shakeParams[unit], tol, clusterPos, clusterVel);
             vel = laneElement(clusterVel, lane);
         }
         if (atom != -1 && vel.w != 0.0)
@@ -186,9 +190,9 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             for (int i = 0; i < 4; i++)
                 clusterDelta[i] = shuffleMixed4(delta, i);
             if (isSettle)
-                applySettleToCluster(settleParams[unit], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
+                applySettleToCluster(settleParams[settleIndex], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
             else
-                applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterDelta);
+                applyShakeToCluster(atoms, shakeParams[unit], tol, clusterPos, clusterDelta);
             delta = laneElement(clusterDelta, lane);
         }
         if (atom != -1 && vel.w != 0.0)
