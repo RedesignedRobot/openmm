@@ -124,7 +124,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                     LOAD_ATOM2_PARAMETERS
                     int atom2 = y*TILE_SIZE+j;
 #ifdef USE_SYMMETRIC
-                    real dEdR = 0.0f;
+                    // -0.0f, not 0.0f: -0.0f + x is exactly x, so the compiler drops the first "dEdR +=" of the
+                    // interaction code even in safe math mode.  0.0f + x is not x when x is -0.0f, so it stays an add.
+                    real dEdR = -0.0f;
 #else
                     real3 dEdR1 = make_real3(0);
                     real3 dEdR2 = make_real3(0);
@@ -187,7 +189,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                     LOAD_ATOM2_PARAMETERS
                     int atom2 = atomIndex;
 #ifdef USE_SYMMETRIC
-                    real dEdR = 0.0f;
+                    real dEdR = -0.0f;
 #else
                     real3 dEdR1 = make_real3(0);
                     real3 dEdR2 = make_real3(0);
@@ -203,13 +205,12 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
-                    delta *= dEdR;
-                    force.x -= delta.x;
-                    force.y -= delta.y;
-                    force.z -= delta.z;
-                    shflForce.x += delta.x;
-                    shflForce.y += delta.y;
-                    shflForce.z += delta.z;
+                    force.x = FMA(-dEdR, delta.x, force.x);
+                    force.y = FMA(-dEdR, delta.y, force.y);
+                    force.z = FMA(-dEdR, delta.z, force.z);
+                    shflForce.x = FMA(dEdR, delta.x, shflForce.x);
+                    shflForce.y = FMA(dEdR, delta.y, shflForce.y);
+                    shflForce.z = FMA(dEdR, delta.z, shflForce.z);
 #else // !USE_SYMMETRIC
                     force.x -= dEdR1.x;
                     force.y -= dEdR1.y;
@@ -346,7 +347,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                         LOAD_ATOM2_PARAMETERS
                         int atom2 = atomIndex;
 #ifdef USE_SYMMETRIC
-                        real dEdR = 0.0f;
+                        real dEdR = -0.0f;
 #else
                         real3 dEdR1 = make_real3(0);
                         real3 dEdR2 = make_real3(0);
@@ -362,13 +363,12 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
-                        delta *= dEdR;
-                        force.x -= delta.x;
-                        force.y -= delta.y;
-                        force.z -= delta.z;
-                        shflForce.x += delta.x;
-                        shflForce.y += delta.y;
-                        shflForce.z += delta.z;
+                        force.x = FMA(-dEdR, delta.x, force.x);
+                        force.y = FMA(-dEdR, delta.y, force.y);
+                        force.z = FMA(-dEdR, delta.z, force.z);
+                        shflForce.x = FMA(dEdR, delta.x, shflForce.x);
+                        shflForce.y = FMA(dEdR, delta.y, shflForce.y);
+                        shflForce.z = FMA(dEdR, delta.z, shflForce.z);
 #else // !USE_SYMMETRIC
                         force.x -= dEdR1.x;
                         force.y -= dEdR1.y;
@@ -405,7 +405,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                         LOAD_ATOM2_PARAMETERS
                         int atom2 = atomIndex;
 #ifdef USE_SYMMETRIC
-                        real dEdR = 0.0f;
+                        real dEdR = -0.0f;
 #else
                         real3 dEdR1 = make_real3(0);
                         real3 dEdR2 = make_real3(0);
@@ -421,13 +421,12 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #endif
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
-                        delta *= dEdR;
-                        force.x -= delta.x;
-                        force.y -= delta.y;
-                        force.z -= delta.z;
-                        shflForce.x += delta.x;
-                        shflForce.y += delta.y;
-                        shflForce.z += delta.z;
+                        force.x = FMA(-dEdR, delta.x, force.x);
+                        force.y = FMA(-dEdR, delta.y, force.y);
+                        force.z = FMA(-dEdR, delta.z, force.z);
+                        shflForce.x = FMA(dEdR, delta.x, shflForce.x);
+                        shflForce.y = FMA(dEdR, delta.y, shflForce.y);
+                        shflForce.z = FMA(dEdR, delta.z, shflForce.z);
 #else // !USE_SYMMETRIC
                         force.x -= dEdR1.x;
                         force.y -= dEdR1.y;
@@ -498,7 +497,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             real invR = RSQRT(r2);
             real r = r2*invR;
 #ifdef USE_SYMMETRIC
-            real dEdR = 0.0f;
+            real dEdR = -0.0f;
 #else
             real3 dEdR1 = make_real3(0);
             real3 dEdR2 = make_real3(0);
