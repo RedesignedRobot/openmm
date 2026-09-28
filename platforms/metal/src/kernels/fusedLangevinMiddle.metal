@@ -45,9 +45,11 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
     vel.y += (delta.y-oldDelta.y)*invDt;
     vel.z += (delta.z-oldDelta.z)*invDt;
     velm[atom] = vel;
+#ifndef P_FREEZE
     pos.x += delta.x;
     pos.y += delta.y;
     pos.z += delta.z;
+#endif
     storePos(posq, posqCorrection, atom, pos);
 }
 

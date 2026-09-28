@@ -23,6 +23,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
+#include <cstdlib>
 #include "MetalIntegrationUtilities.h"
 #include "MetalContext.h"
 #include "MetalKernelSources.h"
@@ -231,6 +232,9 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        // Probe only, never merges: P_FREEZE keeps every atom at its starting position, so timing runs on one frame.
+        if (getenv("P_FREEZE") && atoi(getenv("P_FREEZE")) != 0)
+            fusedDefines["P_FREEZE"] = "1";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
