@@ -266,20 +266,24 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
         ownedBornSumKernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
+    defines["INCLUDE_ENERGY"] = "1";
+    ComputeProgram energyProgram = cu.compileProgram(MetalKernelSources::gbsaObcOwned, defines);
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
-    ownedForce1Kernel->addArg(partialForce);
-    ownedForce1Kernel->addArg(cu.getEnergyBuffer());
-    ownedForce1Kernel->addArg(cu.getPosq());
-    ownedForce1Kernel->addArg(bornSum);
-    ownedForce1Kernel->addArg(params);
-    ownedForce1Kernel->addArg(charges);
-    ownedForce1Kernel->addArg(bornRadii);
-    ownedForce1Kernel->addArg(obcChain);
-    ownedForce1Kernel->addArg(); // Whether to include energy.
-    for (int i = 0; i < 5; i++)
-        ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
-    ownedForce1Kernel->addArg(nb.getBlockCenters());
-    ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
+    ownedForce1EnergyKernel = energyProgram->createKernel("computeGBSAForce1Owned");
+    for (ComputeKernel kernel : {ownedForce1Kernel, ownedForce1EnergyKernel}) {
+        kernel->addArg(partialForce);
+        kernel->addArg(cu.getEnergyBuffer());
+        kernel->addArg(cu.getPosq());
+        kernel->addArg(bornSum);
+        kernel->addArg(params);
+        kernel->addArg(charges);
+        kernel->addArg(bornRadii);
+        kernel->addArg(obcChain);
+        for (int i = 0; i < 5; i++)
+            kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
+        kernel->addArg(nb.getBlockCenters());
+        kernel->addArg(nb.getBlockBoundingBoxes());
+    }
     ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
     ownedReduceBornForceKernel->addArg(partialForce);
     ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
@@ -305,12 +309,12 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
     int numBlocks = cu.getNumAtomBlocks();
     int pairThreads = min(threads, (numBlocks*(numBlocks+1)/2*32+PAIR_GROUP_SIZE-1)/PAIR_GROUP_SIZE*PAIR_GROUP_SIZE);
-    ownedForce1Kernel->setArg(8, (int) includeEnergy);
+    ComputeKernel& force1Kernel = (includeEnergy ? ownedForce1EnergyKernel : ownedForce1Kernel);
     ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
-    setPeriodicBoxArgs(cu, ownedForce1Kernel, 9);
+    setPeriodicBoxArgs(cu, force1Kernel, 8);
     ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
+    force1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     return 0.0;
 }

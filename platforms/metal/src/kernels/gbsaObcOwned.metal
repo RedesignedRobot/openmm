@@ -187,14 +187,19 @@ DEVICE real4 gbsaPair(real r2, real4 atomData1, real quarterInvRadius1, real cha
  * y atoms with their sums rotate one lane per step, so each lane ends holding one y atom's sum.  The x sums go to
  * slot y and the y sums to slot x of partialForce, so every (atom, slot) is written by exactly one SIMD group and
  * nothing is accumulated in device memory.  A diagonal pair is evaluated from both sides, like the Born sum.
+ *
+ * INCLUDE_ENERGY selects a separate build for energy steps.  A runtime flag would keep the energy sum in the pair
+ * loop, and in mixed precision that sum is a df64 the force-only steps still pay for.
  */
 KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL mixed* RESTRICT energyBuffer,
         GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
-        GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii, GLOBAL real* RESTRICT obcChain, int needEnergy, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
+        GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii, GLOBAL real* RESTRICT obcChain, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
         real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize) {
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
+#ifdef INCLUDE_ENERGY
     mixed energy = 0;
+#endif
     for (unsigned int owner = GLOBAL_ID/TILE_SIZE; owner < NUM_BLOCK_PAIRS; owner += totalWarps) {
         const uint2 pair = decodeBlockPair(owner);
         const unsigned int x = pair.x;
@@ -229,8 +234,9 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
                     if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS && r2 < CUTOFF_SQUARED) {
                         real4 terms = gbsaPair(r2, atomData1, quarterInvRadius1, chargeProduct1, atomData2, atom1 == atom2);
                         force.w += terms.y*atomData2.y;
-                        if (needEnergy)
-                            energy += 0.5f*terms.z;
+#ifdef INCLUDE_ENERGY
+                        energy += 0.5f*terms.z;
+#endif
                         delta *= terms.x;
                         force.x -= delta.x;
                         force.y -= delta.y;
@@ -250,8 +256,9 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
                         real4 terms = gbsaPair(r2, atomData1, quarterInvRadius1, chargeProduct1, atomDataY, false);
                         force.w += terms.y*atomDataY.y;
                         forceY.w += terms.y*atomData1.y;
-                        if (needEnergy)
-                            energy += terms.z;
+#ifdef INCLUDE_ENERGY
+                        energy += terms.z;
+#endif
                         delta *= terms.x;
                         force.x -= delta.x;
                         force.y -= delta.y;
@@ -270,8 +277,9 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
         if (x != y)
             partialForce[x*PADDED_NUM_ATOMS + atomY] = forceY;
     }
-    if (needEnergy)
-        energyBuffer[GLOBAL_ID] += energy;
+#ifdef INCLUDE_ENERGY
+    energyBuffer[GLOBAL_ID] += energy;
+#endif
 }
 
 /**
