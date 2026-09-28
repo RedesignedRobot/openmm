@@ -45,6 +45,20 @@ int MetalKernel::getMaxBlockSize() const {
 }
 
 void MetalKernel::execute(int threads, int blockSize) {
+    prepareArguments();
+    // The float charge spread keeps one slab per SIMD group, and a 64 thread launch leaves too few
+    // SIMD groups in flight to hide the slab latency.
+    if (blockSize == -1 && name == "gridSpreadCharge" && !context.getUseFixedPointChargeSpreading())
+        blockSize = MetalContext::SpreadBlockSize;
+    context.executeKernel(kernel, argPointers.data(), threads, blockSize);
+}
+
+void MetalKernel::executeFlat(int threads) {
+    prepareArguments();
+    context.executeKernelFlat(kernel, argPointers.data(), threads);
+}
+
+void MetalKernel::prepareArguments() {
     int numArgs = arrayArgs.size();
     argPointers.resize(numArgs);
     for (int i = 0; i < numArgs; i++) {
@@ -58,11 +72,6 @@ void MetalKernel::execute(int threads, int blockSize) {
         else
             argPointers[i] = &primitiveArgs[i];
     }
-    // The float charge spread keeps one slab per SIMD group, and a 64 thread launch leaves too few
-    // SIMD groups in flight to hide the slab latency.
-    if (blockSize == -1 && name == "gridSpreadCharge" && !context.getUseFixedPointChargeSpreading())
-        blockSize = MetalContext::SpreadBlockSize;
-    context.executeKernel(kernel, argPointers.data(), threads, blockSize);
 }
 
 void MetalKernel::addArrayArg(ArrayInterface& value) {

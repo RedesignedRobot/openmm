@@ -99,6 +99,7 @@ private:
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
     int numLangevinMiddleThreads;
+    bool flatLangevinMiddle; // Probe (r2-mixed, not for merge).
     ComputeKernel pendingCMCalc;
     int pendingCMBlockSize;
     ComputeArray* pendingCMVelocity;

@@ -25,6 +25,8 @@
 
 #include "MetalIntegrationUtilities.h"
 #include "MetalContext.h"
+#include "MetalKernel.h"
+#include <cstdlib>
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
@@ -227,6 +229,10 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // that, each quad runs several units in sequence and pays the redundant constraint work in full.
         int numQuadUnits = numSettle+numShake+numFreeQuads;
         bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
+        // Probe (r2-mixed, not for merge): force the quads path, and launch every thread in one uncapped grid.
+        if (getenv("OPENMM_METAL_FUSED_QUADS") != NULL)
+            useQuads = true;
+        flatLangevinMiddle = (getenv("OPENMM_METAL_FUSED_FLAT") != NULL);
 
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
@@ -270,7 +276,10 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
     langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
     if (pendingCMVelocity != NULL)
         langevinMiddleKernel->setArg(19, *pendingCMVelocity);
-    langevinMiddleKernel->execute(numLangevinMiddleThreads);
+    if (flatLangevinMiddle)
+        dynamic_cast<MetalKernel&>(*langevinMiddleKernel).executeFlat(numLangevinMiddleThreads);
+    else
+        langevinMiddleKernel->execute(numLangevinMiddleThreads);
     pendingCMVelocity = NULL;
     return true;
 }

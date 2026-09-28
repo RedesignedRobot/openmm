@@ -64,6 +64,11 @@ public:
      *                     default size that is appropriate for the computing device is used.
      */
     void execute(int threads, int blockSize=-1);
+    /**
+     * Execute this kernel on at least the given number of threads, in blocks of the default size.  Unlike execute(),
+     * the grid is not capped at the context's number of thread blocks.
+     */
+    void executeFlat(int threads);
 protected:
     /**
      * Add an argument to pass the kernel when it is invoked, where the value is a
@@ -100,6 +105,10 @@ protected:
      */
     void setPrimitiveArg(int index, const void* value, int size);
 private:
+    /**
+     * Point argPointers at the current arguments, checking each array's storage against its layout.
+     */
+    void prepareArguments();
     MetalContext& context;
     metalFunction_t kernel;
     std::string name;
