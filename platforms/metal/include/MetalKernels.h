@@ -201,8 +201,10 @@ public:
      */
     void execute(ContextImpl& context);
 private:
+    static const int MaxCMBlockSize = 1024;
     MetalContext& cu;
     bool laterForcesIgnoreVelocities;
+    int cmBlockSize;
     ComputeArray cmMomentum, cmVelocity;
     ComputeKernel kernel1, kernel2, kernel3;
 };

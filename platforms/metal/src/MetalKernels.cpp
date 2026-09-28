@@ -236,7 +236,7 @@ void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionR
         totalMass += system.getParticleMass(i);
     map<string, string> defines;
     defines["INVERSE_TOTAL_MASS"] = cu.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
-    defines["CM_BLOCK_SIZE"] = cu.intToString(cu.getMaxThreadBlockSize());
+    defines["CM_BLOCK_SIZE"] = cu.intToString(MaxCMBlockSize);
     ComputeProgram program = cu.compileProgram(CommonKernelSources::removeCM+MetalKernelSources::centerOfMass, defines);
     kernel1 = program->createKernel("calcCenterOfMassMomentum");
     kernel1->addArg(numAtoms);
@@ -251,6 +251,10 @@ void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionR
     kernel3->addArg(numAtoms);
     kernel3->addArg(cu.getVelm());
     kernel3->addArg(cmVelocity);
+    // calcCenterOfMassVelocity runs as one thread group, so it gets as many threads as its pipeline allows.
+    cmBlockSize = MaxCMBlockSize;
+    while (cmBlockSize > kernel3->getMaxBlockSize())
+        cmBlockSize /= 2;
 }
 
 void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
@@ -259,7 +263,7 @@ void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
     MetalIntegrationUtilities& integration = cu.getIntegrationUtilities();
     if (laterForcesIgnoreVelocities && integration.canRemoveCenterOfMassMomentum() &&
             dynamic_cast<LangevinMiddleIntegrator*>(&context.getIntegrator()) != NULL) {
-        integration.removeCenterOfMassMomentum(kernel3, cu.getMaxThreadBlockSize(), cmVelocity);
+        integration.removeCenterOfMassMomentum(kernel3, cmBlockSize, cmVelocity);
         return;
     }
     kernel1->execute(numAtoms, 64);

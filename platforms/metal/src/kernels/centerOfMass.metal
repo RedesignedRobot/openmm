@@ -1,23 +1,34 @@
 /**
- * Compute the center of mass velocity in one thread group of CM_BLOCK_SIZE threads (a power of 2), and write it to
- * cmVelocity[0].  One group needs no second pass to combine partial sums, so the fused LangevinMiddle kernel can read
- * the result directly.  The kernel runs alongside the force kernels, which hide its length.
+ * Compute the center of mass velocity in one thread group and write it to cmVelocity[0].  The group has a power of 2
+ * threads, at most CM_BLOCK_SIZE.  One group needs no second pass to combine partial sums, so the fused LangevinMiddle
+ * kernel can read the result directly.  The kernel runs alongside the force kernels, which hide it only while it is
+ * shorter than they are.  A single group is bound by memory latency, so each thread keeps CM_LOADS velocities in
+ * flight.  It sums in float, the precision of the result, which in mixed precision skips a df64 reciprocal and three
+ * df64 products per atom.  With 256 threads, one load at a time and df64 arithmetic it took 207 us per step on the
+ * Ultra for 92k atoms, and slowed the steps it was meant to hide in.
  */
+#define CM_LOADS 4
 KERNEL void calcCenterOfMassVelocity(int numAtoms, GLOBAL const mixed4* RESTRICT velm, GLOBAL float4* RESTRICT cmVelocity) {
     LOCAL float4 temp[CM_BLOCK_SIZE];
     float4 cm = make_float4(0);
-    for (int index = LOCAL_ID; index < numAtoms; index += CM_BLOCK_SIZE) {
-        mixed4 velocity = velm[index];
-        if (velocity.w != 0) {
-            mixed mass = RECIP(velocity.w);
-            cm.x += (float) (velocity.x*mass);
-            cm.y += (float) (velocity.y*mass);
-            cm.z += (float) (velocity.z*mass);
+    for (int first = LOCAL_ID; first < numAtoms; first += CM_LOADS*LOCAL_SIZE) {
+        float4 velocity[CM_LOADS];
+        for (int i = 0; i < CM_LOADS; i++) {
+            int index = first+i*LOCAL_SIZE;
+            velocity[i] = (index < numAtoms ? (float4) mixed4(velm[index]) : make_float4(0));
+        }
+        for (int i = 0; i < CM_LOADS; i++) {
+            if (velocity[i].w != 0) {
+                float mass = RECIP(velocity[i].w);
+                cm.x += velocity[i].x*mass;
+                cm.y += velocity[i].y*mass;
+                cm.z += velocity[i].z*mass;
+            }
         }
     }
     int thread = LOCAL_ID;
     temp[thread] = cm;
-    for (int step = CM_BLOCK_SIZE/2; step > 0; step /= 2) {
+    for (int step = LOCAL_SIZE/2; step > 0; step /= 2) {
         SYNC_THREADS;
         if (thread < step)
             temp[thread] += temp[thread+step];
