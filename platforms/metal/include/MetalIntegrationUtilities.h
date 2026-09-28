@@ -70,6 +70,27 @@ public:
      * @param tol      the constraint tolerance
      */
     bool integrateLangevinMiddle(ComputeArray& params, double tol);
+    /**
+     * Get whether integrateLangevinMiddle() can remove center of mass motion for a CMMotionRemover.  That holds in
+     * single and mixed precision when the fused kernel runs.
+     */
+    bool canRemoveCenterOfMassMomentum() const;
+    /**
+     * Remove center of mass motion as part of the next step.  calcKernel runs in the force computation's concurrent
+     * pass (see calcPendingCenterOfMassMomentum()) and writes the center of mass velocity to cmVelocity[0].  The next
+     * integrateLangevinMiddle() subtracts it from every atom as it loads it, in place of the
+     * removeCenterOfMassMomentum kernel.
+     *
+     * @param calcKernel   the calcCenterOfMassVelocity kernel, with its arguments set
+     * @param blockSize    the size of calcKernel's single thread group
+     * @param cmVelocity   the array calcKernel writes to
+     */
+    void removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity);
+    /**
+     * Run the calcCenterOfMassVelocity kernel that removeCenterOfMassMomentum() left pending, if there is one.  It
+     * reads the velocities and writes only its own output, so it can share a concurrent pass with the force kernels.
+     */
+    void calcPendingCenterOfMassMomentum();
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     int* ccmaConvergedMemory;
@@ -78,6 +99,9 @@ private:
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
     int numLangevinMiddleUnits;
+    ComputeKernel pendingCMCalc;
+    int pendingCMBlockSize;
+    ComputeArray* pendingCMVelocity;
 };
 
 } // namespace OpenMM
