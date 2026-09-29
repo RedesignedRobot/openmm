@@ -1,6 +1,9 @@
 #define BUFFER_SIZE 256
 // Fewest atoms of block X passing the sphere test for which findBlocksWithInteractions tests all 32 unrolled.
 #define MIN_ATOMS_TO_UNROLL 8
+// Slack in nm by which verifyList errs toward a rebuild.  The builder's fused distance test at
+// coordinates near 10 nm rounds by about 3e-5 nm.
+#define VERIFY_MARGIN 0.001f
 
 #if defined(AMD_RDNA)
 
@@ -43,7 +46,8 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
         real2* __restrict__ blockSizeRange
 #ifdef INDIRECT_REBUILD
-        , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
+        , const real4* __restrict__ oldPositions, float* __restrict__ blockDisplacement, unsigned int* __restrict__ listCheck,
+        bool forceRebuild
 #endif
         ) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
@@ -54,14 +58,23 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
 
     real4 tPos = posq[base + indexInTile < numAtoms ? base + indexInTile : 0];
 #ifdef INDIRECT_REBUILD
-    bool moved = forceRebuild;
-    if (!forceRebuild && base+indexInTile < numAtoms) {
+    // Each block records how far its atoms moved since the last build, for verifyList, and counts
+    // itself in listCheck[0] if that is more than half the padding and in listCheck[1] if more than
+    // the padding.  A forced rebuild records FLT_MAX.
+    real moved2 = 0;
+    if (base+indexInTile < numAtoms) {
         real4 displacement = oldPositions[base+indexInTile]-tPos;
-        moved = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
+        moved2 = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z;
     }
-    bool tileMoved = simd_any(moved);
-    if (indexInTile == 0 && validBlock)
-        displacementFlags[index] = tileMoved;
+    real blockMoved2 = simd_max(moved2);
+    if (indexInTile == 0 && validBlock) {
+        float moved = (forceRebuild ? FLT_MAX : SQRT(blockMoved2));
+        blockDisplacement[index] = moved;
+        if (moved > 0.5f*PADDING)
+            atomicAdd(&listCheck[0], 1u);
+        if (moved > PADDING)
+            atomicAdd(&listCheck[1], 1u);
+    }
 #endif
     real4 pos = make_real4(tPos.x, tPos.y, tPos.z, 0);
 #ifdef USE_PERIODIC
@@ -648,6 +661,92 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 }
 
 #ifdef INDIRECT_REBUILD
+#ifndef TRICLINIC
+/**
+ * Whether any pair of atoms is within the cutoff now but was not within the padded cutoff when the list was
+ * built, so the list may miss it.  Such a pair's two atoms moved more than the padding between them, so only
+ * blocks that moved more than half the padding (block A) are tested, against the blocks near them now whose
+ * displacements add up to more than the padding (block B), and inside those only the atoms that moved far enough.
+ * Each SIMD group takes one block A, and the whole test is skipped when findBlockBounds counted more than
+ * MAX_VERIFIED_BLOCKS such blocks or one that moved more than the padding, since the list rebuilds then anyway.
+ * A miss sets listCheck[2].  The margins make the test err toward rebuilding, since the builder's fused
+ * distance test rounds differently.
+ */
+extern "C" __global__ void verifyList(const float* __restrict__ blockDisplacement, unsigned int* __restrict__ listCheck,
+        const real4* __restrict__ blockCenter, const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
+        real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ) {
+    const int blockA = (blockIdx.x*blockDim.x+threadIdx.x)/32;
+    const int lane = threadIdx.x%32;
+    if (blockA >= NUM_BLOCKS)
+        return;
+    const float movedA = blockDisplacement[blockA];
+    if (movedA <= 0.5f*PADDING || listCheck[0] > MAX_VERIFIED_BLOCKS || listCheck[1] != 0)
+        return;
+    const real cutoff = PADDED_CUTOFF-PADDING;
+    const int atomA = blockA*TILE_SIZE+lane;
+    const bool validA = atomA < NUM_ATOMS;
+    const real4 posA = posq[validA ? atomA : 0];
+    const real4 oldA = oldPositions[validA ? atomA : 0];
+    const real4 moveA = posA-oldA;
+    const real movedAtomA = SQRT(moveA.x*moveA.x+moveA.y*moveA.y+moveA.z*moveA.z);
+    const real4 centerA = blockCenter[blockA];
+    for (int base = 0; base < NUM_BLOCKS; base += 32) {
+        const int blockB = base+lane;
+        bool candidate = false;
+        if (blockB < NUM_BLOCKS && blockB != blockA) {
+            const float movedB = blockDisplacement[blockB];
+            // Two blocks that both moved far are tested once, from the lower one.
+            candidate = movedA+movedB > PADDING-VERIFY_MARGIN && !(movedB > 0.5f*PADDING && blockB < blockA);
+            const real4 centerB = blockCenter[blockB];
+            real4 delta = centerA-centerB;
+#ifdef USE_PERIODIC
+            APPLY_PERIODIC_TO_DELTA(delta)
+#endif
+            const real reach = cutoff+VERIFY_MARGIN+centerA.w+centerB.w;
+            candidate = candidate && delta.x*delta.x+delta.y*delta.y+delta.z*delta.z < reach*reach;
+        }
+        unsigned int candidates = BALLOT(candidate);
+        while (candidates != 0) {
+            const int b = base+ctz(candidates);
+            candidates &= candidates-1;
+            const float movedB = blockDisplacement[b];
+            const int atomB = b*TILE_SIZE+lane;
+            const bool validB = atomB < NUM_ATOMS;
+            const real4 posB = posq[validB ? atomB : 0];
+            const real4 oldB = oldPositions[validB ? atomB : 0];
+            const real4 moveB = posB-oldB;
+            const real movedAtomB = SQRT(moveB.x*moveB.x+moveB.y*moveB.y+moveB.z*moveB.z);
+            // A pair's two displacements add up to more than the padding, so each is more than the padding
+            // minus the other block's largest.
+            unsigned int fastB = BALLOT(validB && movedAtomB > PADDING-VERIFY_MARGIN-movedA);
+            const bool fastA = validA && movedAtomA > PADDING-VERIFY_MARGIN-movedB;
+            bool miss = false;
+            while (fastB != 0) {
+                const int k = ctz(fastB);
+                fastB &= fastB-1;
+                real4 delta = posA-SHFL(posB, k);
+                real4 oldDelta = oldA-SHFL(oldB, k);
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_DELTA(delta)
+                APPLY_PERIODIC_TO_DELTA(oldDelta)
+#endif
+                const real r2 = delta.x*delta.x+delta.y*delta.y+delta.z*delta.z;
+                const real oldR2 = oldDelta.x*oldDelta.x+oldDelta.y*oldDelta.y+oldDelta.z*oldDelta.z;
+                miss = miss || (fastA && r2 < (cutoff+VERIFY_MARGIN)*(cutoff+VERIFY_MARGIN) &&
+                        oldR2 >= (PADDED_CUTOFF-VERIFY_MARGIN)*(PADDED_CUTOFF-VERIFY_MARGIN));
+            }
+            if (simd_any(miss)) {
+                if (lane == 0)
+                    atomicAdd(&listCheck[2], 1u);
+                return;
+            }
+        }
+        if (atomic_load_explicit((device atomic_uint*) &listCheck[2], memory_order_relaxed) != 0)
+            return;
+    }
+}
+#endif
+
 // A separate dispatch supplies the device-wide ordering between the per-tile
 // displacement test and the decision.  It runs as one threadgroup, so on rebuild
 // steps it also computes the sort keys and sorts them, with only threadgroup
@@ -656,7 +755,10 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 // it sizes the bin sort's three dispatches instead.
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
-extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
+// The list rebuilds when a block moved more than half the padding, unless verifyList
+// ran and found no missed pair.  It clears findBlockBounds' and verifyList's counts
+// for the next step.
+extern "C" __global__ void prepareRebuildDispatch(unsigned int* __restrict__ listCheck,
         int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
         unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
         const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
@@ -664,18 +766,17 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
 #ifndef SORT_BLOCKS_BY_BINS
     __shared__ unsigned int keys[NUM_BLOCKS];
 #endif
-    __shared__ bool anyMoved;
-    if (threadIdx.x == 0)
-        anyMoved = false;
+    const unsigned int numMoved = listCheck[0];
+#ifdef TRICLINIC
+    const bool rebuild = (numMoved > 0);
+#else
+    const bool rebuild = (numMoved > 0 && (numMoved > MAX_VERIFIED_BLOCKS || listCheck[1] != 0 || listCheck[2] != 0));
+#endif
     __syncthreads();
-    bool moved = false;
-    for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
-        moved = moved || displacementFlags[i] != 0;
-    if (simd_any(moved))
-        anyMoved = true;
-    __syncthreads();
-    bool rebuild = anyMoved;
     if (threadIdx.x == 0) {
+        listCheck[0] = 0;
+        listCheck[1] = 0;
+        listCheck[2] = 0;
         pinnedInteractionCount[0] = interactionCount[0];
         pinnedInteractionCount[1] = interactionCount[1];
         rebuildNeighborList[0] = rebuild;

@@ -67,6 +67,11 @@ static const int MaxBlocksSortedInOneGroup = 1024;
 static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
+// verifyList tests whether the old list still covers every pair when at most this many blocks moved
+// more than half the padding, and the list rebuilds without the test above it.  At the second step
+// after a build, apoa1 has 55-97 such blocks with RF and 178-280 with PME; at the third, over 1200.
+static const int MaxVerifiedBlocks = 384;
+static const int VerifyListThreadBlockSize = 64;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -332,7 +337,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         oldPositions.initialize(context, numAtoms, 4*elementSize, "oldPositions");
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
         if (useIndirectRebuild) {
-            displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
+            blockDisplacement.initialize<float>(context, numAtomBlocks, "blockDisplacement");
+            listCheck.initialize<unsigned int>(context, 3, "listCheck");
+            listCheck.upload(vector<unsigned int>(3, 0));
             rebuildDispatch.initialize<unsigned int>(context, 12, "rebuildDispatch");
         }
         if (sortBlocksByBins) {
@@ -397,7 +404,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findBlockBoundsArgs.push_back(&blockSizeRange.getDevicePointer());
         if (useIndirectRebuild) {
             findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
-            findBlockBoundsArgs.push_back(&displacementFlags.getDevicePointer());
+            findBlockBoundsArgs.push_back(&blockDisplacement.getDevicePointer());
+            findBlockBoundsArgs.push_back(&listCheck.getDevicePointer());
             findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
         }
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
@@ -488,11 +496,25 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         forceRebuildNeighborList = true;
     }
 
+    if (useIndirectRebuild && usePeriodic && !context.getBoxIsTriclinic()) {
+        double4 box = context.getPeriodicBoxSize();
+        if (box.x != lastBoxSize.x || box.y != lastBoxSize.y || box.z != lastBoxSize.z)
+            forceRebuildNeighborList = true;
+        lastBoxSize = box;
+    }
+
     // Compute the neighbor list.
 
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), FindBlockBoundsThreadBlockSize);
     if (useIndirectRebuild) {
-        void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
+        if (kernels.verifyListKernel != NULL) {
+            void* verifyArgs[] = {&blockDisplacement.getDevicePointer(), &listCheck.getDevicePointer(),
+                    &blockCenter.getDevicePointer(), &context.unwrap(context.getPosq()).getDevicePointer(),
+                    &oldPositions.getDevicePointer(), context.getPeriodicBoxSizePointer(), context.getInvPeriodicBoxSizePointer(),
+                    context.getPeriodicBoxVecXPointer(), context.getPeriodicBoxVecYPointer(), context.getPeriodicBoxVecZPointer()};
+            context.executeKernelFlat(kernels.verifyListKernel, verifyArgs, context.getNumAtomBlocks()*context.getSIMDWidth(), VerifyListThreadBlockSize);
+        }
+        void* args[] = {&listCheck.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
                 &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
                 &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
         int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
@@ -726,8 +748,10 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
-        if (useIndirectRebuild)
+        if (useIndirectRebuild) {
             defines["INDIRECT_REBUILD"] = "1";
+            defines["MAX_VERIFIED_BLOCKS"] = context.intToString(MaxVerifiedBlocks);
+        }
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);
@@ -741,8 +765,12 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         metalModule_t interactingBlocksProgram = context.createModule(MetalKernelSources::vectorOps+MetalKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
-        if (useIndirectRebuild)
+        kernels.verifyListKernel = NULL;
+        if (useIndirectRebuild) {
+            if (!context.getBoxIsTriclinic())
+                kernels.verifyListKernel = context.getKernel(interactingBlocksProgram, "verifyList");
             kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
+        }
         if (sortBlocksByBins) {
             kernels.countBlockBinsKernel = context.getKernel(interactingBlocksProgram, "countBlockBins");
             kernels.sumBlockBinsKernel = context.getKernel(interactingBlocksProgram, "sumBlockBins");
