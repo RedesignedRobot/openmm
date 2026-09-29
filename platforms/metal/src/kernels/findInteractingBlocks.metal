@@ -334,6 +334,20 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
     __shared__ real4 workgroupPosBuffer[TILE_SIZE*warpsPerBlock];
     __shared__ int workgroupExclusions[MAX_EXCLUSIONS*warpsPerBlock];
     __shared__ int workgroupBlock2Buffer[(warpSize+1)*warpsPerBlock];
+#ifdef FB_PROBE_ATOM2_INDEP
+    __shared__ real4 workgroupPosBufferDup[TILE_SIZE*warpsPerBlock];
+    threadgroup real4* posBufferDup = workgroupPosBufferDup+TILE_SIZE*warpInBlock;
+#define FB_DUP_BUF posBufferDup
+#else
+#define FB_DUP_BUF posBuffer
+#endif
+#ifdef FB_PROBE_HALF
+    // Scratch probe: block X positions relative to its center as half4 (w = half the squared length), so the
+    // 32x32 test reads 8 bytes per atom instead of 16.  Rounding is under 2.5e-4 nm per coordinate at |p| < 1 nm,
+    // covered by widening the padded cutoff 0.001 nm: the list is a superset and the force kernel applies the cutoff.
+    __shared__ half4 workgroupPosBufferH[TILE_SIZE*warpsPerBlock];
+    threadgroup half4* posBufferH = workgroupPosBufferH+TILE_SIZE*warpInBlock;
+#endif
 
     threadgroup int* buffer = workgroupBuffer+BUFFER_SIZE*warpInBlock;
     threadgroup real4* posBuffer = workgroupPosBuffer+TILE_SIZE*warpInBlock;
@@ -372,6 +386,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         pos1.w = 0.5f * (pos1.x * pos1.x + pos1.y * pos1.y + pos1.z * pos1.z);
         if (tileInWarp == 0) {
             posBuffer[indexInTile] = pos1;
+#ifdef FB_PROBE_ATOM2_INDEP
+            posBufferDup[indexInTile] = pos1;
+#endif
+#ifdef FB_PROBE_HALF
+            {
+                real3 p = trimTo3(pos1)-trimTo3(blockCenterX);
+                posBufferH[indexInTile] = half4((half) p.x, (half) p.y, (half) p.z, (half) (0.5f*(p.x*p.x+p.y*p.y+p.z*p.z)));
+            }
+#endif
         }
 
         // Load exclusion data for block x.
@@ -614,6 +637,33 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 else {
 #endif
                     const real lim = 0.5f * PADDED_CUTOFF_SQUARED - pos2.w;
+#ifdef FB_PROBE_NOTEST
+                    // Scratch probe: no 32x32 test, every atom passing the sphere test is listed (a superset).
+#ifdef ROLE_ORDER
+                    interacts = atomFlags & roleFlags;
+#else
+                    interacts = atomFlags;
+#endif
+                    atomFlags = 0;
+#endif
+#ifdef FB_PROBE_HALF
+                    if (__popc(atomFlags) >= MIN_ATOMS_TO_UNROLL) {
+                        const real3 p2r = trimTo3(pos2)-trimTo3(blockCenterX);
+                        const real limH = 0.5f*(PADDED_CUTOFF+0.001f)*(PADDED_CUTOFF+0.001f) - 0.5f*(p2r.x*p2r.x+p2r.y*p2r.y+p2r.z*p2r.z);
+                        #pragma unroll
+                        for (int j = 0; j < TILE_SIZE; j++) {
+                            float4 pj = float4(posBufferH[j]);
+                            real d = fma(-pj.x, p2r.x, fma(-pj.y, p2r.y, fma(-pj.z, p2r.z, pj.w - limH)));
+                            interacts |= (__float_as_uint(d) >> 31) << j;
+                        }
+#ifdef ROLE_ORDER
+                        interacts &= atomFlags & roleFlags;
+#else
+                        interacts &= atomFlags;
+#endif
+                        atomFlags = 0;
+                    }
+#endif
 #if defined(USE_MFMA)
                     const vfloat c = { -lim, -lim, -lim, -lim };
                     mfma4x4<0>(pos1, pos2, c, interacts);
@@ -670,7 +720,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     if (__popc(atomFlags2) >= MIN_ATOMS_TO_UNROLL) {
                         #pragma unroll
                         for (int j = 0; j < TILE_SIZE; j++) {
-                            real4 posj = posBuffer[j];
+                            real4 posj = FB_DUP_BUF[j];
                             real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim2)));
                             interacts2 |= (__float_as_uint(d) >> 31) << j;
                         }
@@ -684,7 +734,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     while (atomFlags2) {
                         int j = __ffs(atomFlags2)-1;
                         atomFlags2 = atomFlags2 ^ (static_cast<tileflags>(1) << j);
-                        real4 posj = posBuffer[j];
+                        real4 posj = FB_DUP_BUF[j];
                         real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim2)));
 #ifdef ROLE_ORDER
                         d = ((roleFlags >> j) & 1) ? d : 1.0f;
