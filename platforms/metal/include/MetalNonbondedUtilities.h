@@ -39,6 +39,7 @@
 namespace OpenMM {
 
 class MetalContext;
+class MetalAtomReorder;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
@@ -317,6 +318,7 @@ private:
     class BlockSortTrait;
     void initParamArgs();
     MetalContext& context;
+    std::unique_ptr<MetalAtomReorder> atomReorder;
     std::map<int, KernelSet> groupKernels;
     MetalArray exclusionTiles;
     MetalArray exclusions;

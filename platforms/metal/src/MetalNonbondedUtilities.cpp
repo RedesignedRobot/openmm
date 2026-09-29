@@ -25,6 +25,7 @@
 
 #include "openmm/OpenMMException.h"
 #include "MetalNonbondedUtilities.h"
+#include "MetalAtomReorder.h"
 #include "MetalArray.h"
 #include "MetalContext.h"
 #include "MetalSort.h"
@@ -115,6 +116,8 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
 }
 
 MetalNonbondedUtilities::~MetalNonbondedUtilities() {
+    if (atomReorder != nullptr)
+        context.setReorderPlanner(NULL);
     pinnedCountDeviceMemory->release();
 }
 
@@ -292,6 +295,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     // Create data structures for the neighbor list.
 
+    maxCutoff = getMaxCutoffDistance();
+    if (useCutoff && !context.getUseDoublePrecision() && context.getNumContexts() == 1) {
+        atomReorder.reset(new MetalAtomReorder(context));
+        context.setReorderPlanner(atomReorder.get());
+    }
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {
         // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
