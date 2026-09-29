@@ -82,6 +82,215 @@ inline void placeVsite(int vsite, GLOBAL real4* RESTRICT posq, GLOBAL real4* RES
 }
 #endif
 
+#ifdef EMULATED_MIXED_PRECISION
+/**
+ * Solve the 3x3 system a l = g for the multipliers of a cluster's three bonds by cofactors, as applySettleToCluster
+ * does.  A cluster with fewer bonds passes identity rows and zero residuals for the missing ones and gets zero
+ * multipliers there.
+ */
+inline real3 solveBondMultipliers(real a11, real a12, real a13, real a21, real a22, real a23, real a31, real a32, real a33,
+        real g1, real g2, real g3) {
+    real c11 = a22*a33-a23*a32, c12 = a23*a31-a21*a33, c13 = a21*a32-a22*a31;
+    real scale = 1/(a11*c11 + a12*c12 + a13*c13);
+    real l1 = (g1*c11 + g2*(a13*a32-a12*a33) + g3*(a12*a23-a13*a22))*scale;
+    real l2 = (g1*c12 + g2*(a11*a33-a13*a31) + g3*(a13*a21-a11*a23))*scale;
+    real l3 = (g1*c13 + g2*(a12*a31-a11*a32) + g3*(a11*a22-a12*a21))*scale;
+    return make_real3(l1, l2, l3);
+}
+
+/**
+ * A SHAKE cluster's position constraints solved together by Newton's method, the way applySettleToCluster solves a
+ * water in emulated mixed precision: one linear solve per iteration for the multipliers of the 1 to 3 bonds, in
+ * place of applyShakeToCluster's Gauss-Seidel sweep over them.  The bonds couple through the central atom, and the
+ * sweep converges slowly when the hydrogens are heavy (about 9 sweeps on a 4 fs HMR unit); Newton takes 2 or 3
+ * steps at any mass.  Iterations run in real precision until the residuals are near its resolution, then one step
+ * from residuals in mixed precision, so the constraint error ends near 1e-12 of the squared bond length, below the
+ * tolerance the sweep stops at.  The same equations, another path: the displacements are not bitwise with the sweep.
+ */
+inline void applyShakeToClusterNewton(int4 atoms, float4 params, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta) {
+    mixed4 pos = clusterPos[0];
+    mixed4 xpi = delta[0];
+    mixed4 xpj1 = delta[1], xpj2 = delta[2], xpj3 = delta[3];
+    real invMassCentral = params.x;
+    real d2 = params.z;
+    real invMassPeripheral = params.w;
+    bool has2 = (atoms.z != -1), has3 = (atoms.w != -1);
+
+    // Bond vectors at the start of the step, and the residuals' constant parts, as in applyShakeToCluster.
+
+    mixed3 rij1 = make_mixed3(pos.x-clusterPos[1].x, pos.y-clusterPos[1].y, pos.z-clusterPos[1].z);
+    mixed3 rij2 = make_mixed3(pos.x-clusterPos[2].x, pos.y-clusterPos[2].y, pos.z-clusterPos[2].z);
+    mixed3 rij3 = make_mixed3(pos.x-clusterPos[3].x, pos.y-clusterPos[3].y, pos.z-clusterPos[3].z);
+    mixed ld1 = d2-(rij1.x*rij1.x + rij1.y*rij1.y + rij1.z*rij1.z);
+    mixed ld2 = d2-(rij2.x*rij2.x + rij2.y*rij2.y + rij2.z*rij2.z);
+    mixed ld3 = d2-(rij3.x*rij3.x + rij3.y*rij3.y + rij3.z*rij3.z);
+    real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
+    real3 r2 = (has2 ? make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z) : make_real3(0));
+    real3 r3 = (has3 ? make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z) : make_real3(0));
+    real3 p1 = r1+make_real3((real) (xpi.x-xpj1.x), (real) (xpi.y-xpj1.y), (real) (xpi.z-xpj1.z));
+    real3 p2 = r2+make_real3((real) (xpi.x-xpj2.x), (real) (xpi.y-xpj2.y), (real) (xpi.z-xpj2.z));
+    real3 p3 = r3+make_real3((real) (xpi.x-xpj3.x), (real) (xpi.y-xpj3.y), (real) (xpi.z-xpj3.z));
+    real3 dxi = make_real3(0), dxj1 = make_real3(0), dxj2 = make_real3(0), dxj3 = make_real3(0);
+    bool last = false;
+    for (int iteration = 0; !last; iteration++) {
+        real3 f1 = p1+dxi-dxj1;
+        real3 f2 = p2+dxi-dxj2;
+        real3 f3 = p3+dxi-dxj3;
+        real g1 = d2-dot(f1, f1);
+        real g2 = (has2 ? d2-dot(f2, f2) : 0);
+        real g3 = (has3 ? d2-dot(f3, f3) : 0);
+        // After 15 iterations the loop stops without an error, even if the residuals have not converged.
+        last = (iteration == 14 || (fabs(g1) < 1e-6f*d2 && fabs(g2) < 1e-6f*d2 && fabs(g3) < 1e-6f*d2));
+        if (last) {
+            // Move the corrections so far into the mixed precision displacements, so the last step is not
+            // rounded to the resolution of the earlier ones, and measure the residuals in mixed precision.
+
+            xpi.x += dxi.x;
+            xpi.y += dxi.y;
+            xpi.z += dxi.z;
+            xpj1.x += dxj1.x;
+            xpj1.y += dxj1.y;
+            xpj1.z += dxj1.z;
+            xpj2.x += dxj2.x;
+            xpj2.y += dxj2.y;
+            xpj2.z += dxj2.z;
+            xpj3.x += dxj3.x;
+            xpj3.y += dxj3.y;
+            xpj3.z += dxj3.z;
+            dxi = make_real3(0);
+            dxj1 = make_real3(0);
+            dxj2 = make_real3(0);
+            dxj3 = make_real3(0);
+            mixed3 rp = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
+            g1 = (real) (ld1 - 2.0f*(rij1.x*rp.x + rij1.y*rp.y + rij1.z*rp.z) - (rp.x*rp.x + rp.y*rp.y + rp.z*rp.z));
+            if (has2) {
+                rp = make_mixed3(xpi.x-xpj2.x, xpi.y-xpj2.y, xpi.z-xpj2.z);
+                g2 = (real) (ld2 - 2.0f*(rij2.x*rp.x + rij2.y*rp.y + rij2.z*rp.z) - (rp.x*rp.x + rp.y*rp.y + rp.z*rp.z));
+            }
+            if (has3) {
+                rp = make_mixed3(xpi.x-xpj3.x, xpi.y-xpj3.y, xpi.z-xpj3.z);
+                g3 = (real) (ld3 - 2.0f*(rij3.x*rp.x + rij3.y*rp.y + rij3.z*rp.z) - (rp.x*rp.x + rp.y*rp.y + rp.z*rp.z));
+            }
+        }
+
+        // Linearize: bond k moves by invMassCentral*sum_j r_j*l_j on the central atom and invMassPeripheral*r_k*l_k
+        // on its own atom, so 2*f_k.(that) = g_k.  The factor 2 is in the residuals' half below.
+
+        real a11 = dot(f1, r1)*(invMassCentral+invMassPeripheral);
+        real a12 = (has2 ? dot(f1, r2)*invMassCentral : 0), a13 = (has3 ? dot(f1, r3)*invMassCentral : 0);
+        real a21 = (has2 ? dot(f2, r1)*invMassCentral : 0), a22 = (has2 ? dot(f2, r2)*(invMassCentral+invMassPeripheral) : 1);
+        real a23 = (has3 ? dot(f2, r3)*invMassCentral : 0);
+        real a31 = (has3 ? dot(f3, r1)*invMassCentral : 0), a32 = (has3 ? dot(f3, r2)*invMassCentral : 0);
+        real a33 = (has3 ? dot(f3, r3)*(invMassCentral+invMassPeripheral) : 1);
+        real3 l = solveBondMultipliers(a11, a12, a13, a21, a22, a23, a31, a32, a33, 0.5f*g1, 0.5f*g2, 0.5f*g3);
+        dxi += (r1*l.x + r2*l.y + r3*l.z)*invMassCentral;
+        dxj1 -= r1*(l.x*invMassPeripheral);
+        dxj2 -= r2*(l.y*invMassPeripheral);
+        dxj3 -= r3*(l.z*invMassPeripheral);
+    }
+    xpi.x += dxi.x;
+    xpi.y += dxi.y;
+    xpi.z += dxi.z;
+    xpj1.x += dxj1.x;
+    xpj1.y += dxj1.y;
+    xpj1.z += dxj1.z;
+    xpj2.x += dxj2.x;
+    xpj2.y += dxj2.y;
+    xpj2.z += dxj2.z;
+    xpj3.x += dxj3.x;
+    xpj3.y += dxj3.y;
+    xpj3.z += dxj3.z;
+    delta[0] = xpi;
+    delta[1] = xpj1;
+    delta[2] = xpj2;
+    delta[3] = xpj3;
+}
+
+/**
+ * A SHAKE cluster's velocity constraints solved together: they are linear in the multipliers, so one solve removes
+ * the relative velocity along every bond at once, in place of applyShakeToClusterVelocities' sweeps.  The relative
+ * velocities are measured in mixed precision and the solve runs in real, which leaves about 1e-6 of them; the next
+ * pass measures what is left and removes it, until a pass's multipliers are all within the tolerance, the sweep's
+ * own stopping rule.  Two or three passes.
+ */
+inline void applyShakeToClusterVelocitiesSolve(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* vel) {
+    mixed4 pos = clusterPos[0];
+    mixed4 vi = vel[0];
+    mixed4 vj1 = vel[1], vj2 = vel[2], vj3 = vel[3];
+    real invMassCentral = params.x;
+    real invMassPeripheral = params.w;
+    bool has2 = (atoms.z != -1), has3 = (atoms.w != -1);
+    mixed3 rij1 = make_mixed3(pos.x-clusterPos[1].x, pos.y-clusterPos[1].y, pos.z-clusterPos[1].z);
+    mixed3 rij2 = make_mixed3(pos.x-clusterPos[2].x, pos.y-clusterPos[2].y, pos.z-clusterPos[2].z);
+    mixed3 rij3 = make_mixed3(pos.x-clusterPos[3].x, pos.y-clusterPos[3].y, pos.z-clusterPos[3].z);
+    real3 r1 = make_real3((real) rij1.x, (real) rij1.y, (real) rij1.z);
+    real3 r2 = (has2 ? make_real3((real) rij2.x, (real) rij2.y, (real) rij2.z) : make_real3(0));
+    real3 r3 = (has3 ? make_real3((real) rij3.x, (real) rij3.y, (real) rij3.z) : make_real3(0));
+
+    // Bond k's relative velocity changes by invMassCentral*sum_j r_k.r_j*l_j + invMassPeripheral*r_k.r_k*l_k.
+
+    real a11 = dot(r1, r1)*(invMassCentral+invMassPeripheral);
+    real a12 = (has2 ? dot(r1, r2)*invMassCentral : 0), a13 = (has3 ? dot(r1, r3)*invMassCentral : 0);
+    real a22 = (has2 ? dot(r2, r2)*(invMassCentral+invMassPeripheral) : 1);
+    real a23 = (has3 ? dot(r2, r3)*invMassCentral : 0);
+    real a33 = (has3 ? dot(r3, r3)*(invMassCentral+invMassPeripheral) : 1);
+    real realTol = (real) tol;
+    bool converged = false;
+    for (int pass = 0; pass < 15 && !converged; pass++) {
+        mixed3 rv = make_mixed3(vi.x-vj1.x, vi.y-vj1.y, vi.z-vj1.z);
+        real g1 = -(real) (rij1.x*rv.x + rij1.y*rv.y + rij1.z*rv.z);
+        real g2 = 0, g3 = 0;
+        if (has2) {
+            rv = make_mixed3(vi.x-vj2.x, vi.y-vj2.y, vi.z-vj2.z);
+            g2 = -(real) (rij2.x*rv.x + rij2.y*rv.y + rij2.z*rv.z);
+        }
+        if (has3) {
+            rv = make_mixed3(vi.x-vj3.x, vi.y-vj3.y, vi.z-vj3.z);
+            g3 = -(real) (rij3.x*rv.x + rij3.y*rv.y + rij3.z*rv.z);
+        }
+        real3 l = solveBondMultipliers(a11, a12, a13, a12, a22, a23, a13, a23, a33, g1, g2, g3);
+        real3 dvi = (r1*l.x + r2*l.y + r3*l.z)*invMassCentral;
+        vi.x += dvi.x;
+        vi.y += dvi.y;
+        vi.z += dvi.z;
+        vj1.x -= r1.x*(l.x*invMassPeripheral);
+        vj1.y -= r1.y*(l.x*invMassPeripheral);
+        vj1.z -= r1.z*(l.x*invMassPeripheral);
+        vj2.x -= r2.x*(l.y*invMassPeripheral);
+        vj2.y -= r2.y*(l.y*invMassPeripheral);
+        vj2.z -= r2.z*(l.y*invMassPeripheral);
+        vj3.x -= r3.x*(l.z*invMassPeripheral);
+        vj3.y -= r3.y*(l.z*invMassPeripheral);
+        vj3.z -= r3.z*(l.z*invMassPeripheral);
+        converged = (fabs(l.x) <= realTol && fabs(l.y) <= realTol && fabs(l.z) <= realTol);
+    }
+    vel[0] = vi;
+    vel[1] = vj1;
+    vel[2] = vj2;
+    vel[3] = vj3;
+}
+#endif
+
+/**
+ * The SHAKE cluster code the fused kernels run: the joint solves in emulated mixed precision, the common sweeps
+ * otherwise.
+ */
+inline void applyShakeToClusterFused(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta) {
+#ifdef EMULATED_MIXED_PRECISION
+    applyShakeToClusterNewton(atoms, params, clusterPos, delta);
+#else
+    applyShakeToCluster(atoms, params, tol, clusterPos, delta);
+#endif
+}
+
+inline void applyShakeToClusterVelocitiesFused(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* vel) {
+#ifdef EMULATED_MIXED_PRECISION
+    applyShakeToClusterVelocitiesSolve(atoms, params, tol, clusterPos, vel);
+#else
+    applyShakeToClusterVelocities(atoms, params, tol, clusterPos, vel);
+#endif
+}
+
 /**
  * Zero an atom's force once the kick has read it.  This is the next step's clear of the force buffer, done by the only
  * thread that reads the atom, so no thread can read a zero it wasn't meant to.
@@ -203,14 +412,14 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         if (isSettle)
             applySettleToClusterVelocities(pos, vel);
         else if (isShake)
-            applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, pos, vel);
+            applyShakeToClusterVelocitiesFused(atoms, shakeParams[unit-numSettle], tol, pos, vel);
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 bathAtom(atoms[i], random, randomIndex, halfdt, vscale, noisescale, vel[i], delta[i], oldDelta[i]);
         if (isSettle)
             applySettleToCluster(settleParams[unit], make_mixed3(vel[0].w, vel[1].w, vel[2].w), pos, delta);
         else if (isShake)
-            applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, pos, delta);
+            applyShakeToClusterFused(atoms, shakeParams[unit-numSettle], tol, pos, delta);
         mixed4 finalPos[4];
         for (int i = 0; i < 4; i++) {
             finalPos[i] = pos[i];
@@ -477,7 +686,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             if (isSettle)
                 applySettleToClusterVelocities(clusterPos, clusterVel);
             else
-                applyShakeToClusterVelocities(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterVel);
+                applyShakeToClusterVelocitiesFused(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterVel);
             vel = laneElement(clusterVel, lane);
         }
 #ifdef EMULATED_MIXED_PRECISION
@@ -493,7 +702,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
             if (isSettle)
                 applySettleToCluster(settleParams[unit], make_mixed3(clusterVel[0].w, clusterVel[1].w, clusterVel[2].w), clusterPos, clusterDelta);
             else
-                applyShakeToCluster(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterDelta);
+                applyShakeToClusterFused(atoms, shakeParams[unit-numSettle], tol, clusterPos, clusterDelta);
             delta = laneElement(clusterDelta, lane);
         }
 #ifdef EMULATED_MIXED_PRECISION
