@@ -377,6 +377,13 @@ public:
         return useDoublePrecision || !supportsHardwareFloatGlobalAtomicAdd || platformData.deterministicForces;
     }
     /**
+     * Get whether gridInterpolateForce gives each atom PME_ORDER lanes (pme.cc, PME_INTERP_LANES).  MetalKernel
+     * then launches 32 threads per 32/PME_ORDER atoms.  Only Apple9 does.
+     */
+    bool getUsePmeInterpolationLanes() const {
+        return !useDoublePrecision && supportsHardwareFloatGlobalAtomicAdd;
+    }
+    /**
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
