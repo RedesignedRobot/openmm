@@ -250,7 +250,13 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // of them (no cutoff).
 
 #ifdef USE_NEIGHBOR_LIST
+#ifdef NB_TILE_PCT
+    // Scratch probe (lab, never for merge): run only this share of the neighbor tiles, to price how the concurrent
+    // pass responds to a shorter nonbonded kernel.  Forces are wrong.
+    const unsigned int numTiles = (unsigned int) ((unsigned long long) interactionCount[0]*NB_TILE_PCT/100);
+#else
     const unsigned int numTiles = interactionCount[0];
+#endif
     if (numTiles > maxTiles)
         return; // There wasn't enough memory for the neighbor list.
 

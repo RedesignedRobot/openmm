@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unistd.h>
 #include <map>
@@ -880,6 +881,8 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    if (getenv("OPENMM_METAL_NB_TILE_PCT") != NULL)
+        defines["NB_TILE_PCT"] = getenv("OPENMM_METAL_NB_TILE_PCT"); // scratch probe, see nonbonded.metal
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
