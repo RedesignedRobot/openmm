@@ -1012,27 +1012,35 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             pmeSpreadChargeKernel->execute(cc.getNumAtoms());
             if (useFixedPointChargeSpreading)
                 pmeFinishSpreadChargeKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-            // Energy steps take the separate kernels, since gridEvaluateEnergy needs the transformed grid.
-            if (includeEnergy || !fft->execPmeConvolution(pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha))) {
+            // gridEvaluateEnergy needs the transformed grid.  Its transform leaves pmeGrid1 as spread, so the fused
+            // convolution below still takes it, and an energy pass leaves the same force bits as a force pass.
+            if (includeEnergy) {
                 fft->execFFT(pmeGrid1, pmeGrid2, true);
                 if (cc.getUseDoublePrecision()) {
-                    pmeConvolutionKernel->setArg<mm_double4>(4, recipBoxVectors[0]);
-                    pmeConvolutionKernel->setArg<mm_double4>(5, recipBoxVectors[1]);
-                    pmeConvolutionKernel->setArg<mm_double4>(6, recipBoxVectors[2]);
                     pmeEvalEnergyKernel->setArg<mm_double4>(5, recipBoxVectors[0]);
                     pmeEvalEnergyKernel->setArg<mm_double4>(6, recipBoxVectors[1]);
                     pmeEvalEnergyKernel->setArg<mm_double4>(7, recipBoxVectors[2]);
                 }
                 else {
-                    pmeConvolutionKernel->setArg<mm_float4>(4, recipBoxVectorsFloat[0]);
-                    pmeConvolutionKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[1]);
-                    pmeConvolutionKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[2]);
                     pmeEvalEnergyKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[0]);
                     pmeEvalEnergyKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[1]);
                     pmeEvalEnergyKernel->setArg<mm_float4>(7, recipBoxVectorsFloat[2]);
                 }
-                if (includeEnergy)
-                    pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+                pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+            }
+            if (!fft->execPmeConvolution(pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha))) {
+                if (!includeEnergy)
+                    fft->execFFT(pmeGrid1, pmeGrid2, true);
+                if (cc.getUseDoublePrecision()) {
+                    pmeConvolutionKernel->setArg<mm_double4>(4, recipBoxVectors[0]);
+                    pmeConvolutionKernel->setArg<mm_double4>(5, recipBoxVectors[1]);
+                    pmeConvolutionKernel->setArg<mm_double4>(6, recipBoxVectors[2]);
+                }
+                else {
+                    pmeConvolutionKernel->setArg<mm_float4>(4, recipBoxVectorsFloat[0]);
+                    pmeConvolutionKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[1]);
+                    pmeConvolutionKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[2]);
+                }
                 pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
                 fft->execFFT(pmeGrid2, pmeGrid1, false);
             }
