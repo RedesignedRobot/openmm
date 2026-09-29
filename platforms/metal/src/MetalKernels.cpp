@@ -133,6 +133,11 @@ void MetalCalcNonbondedForceKernel::initialize(const System& system, const Nonbo
     commonInitialize(system, force, usePmeQueue, false, useFixedPointChargeSpreading, cu.getPlatformData().useCpuPme, false);
 }
 
+void MetalCalcNonbondedForceKernel::copyParametersToContext(ContextImpl& context, const NonbondedForce& force, int firstParticle, int lastParticle, int firstException, int lastException) {
+    cu.getNonbondedUtilities().checkRoleOrder(force);
+    CommonCalcNonbondedForceKernel::copyParametersToContext(context, force, firstParticle, lastParticle, firstException, lastException);
+}
+
 void MetalCalcConstantPotentialForceKernel::initialize(const System& system, const ConstantPotentialForce& force) {
     bool usePmeQueue, useFixedPointChargeSpreading;
     getMetalPmeParameters(cu, usePmeQueue, useFixedPointChargeSpreading);

@@ -27,6 +27,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/System.h"
+#include "openmm/NonbondedForce.h"
 #include "MetalArray.h"
 #include "MetalExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
@@ -162,6 +163,11 @@ public:
      * Get the maximum cutoff distance used by any force group.
      */
     double getMaxCutoffDistance();
+    /**
+     * Throw if a NonbondedForce update gives a particle charge or Lennard-Jones parameters that it lacked when role
+     * order was chosen.  The list skips pairs by those roles, so a new role would lose interactions.
+     */
+    void checkRoleOrder(const NonbondedForce& force) const;
     /**
      * Given a nonbonded cutoff, get the padded cutoff distance used in computing
      * the neighbor list.
@@ -350,6 +356,7 @@ private:
     bool useRoleOrder = false;
     int numInteractions = 0;
     MetalArray atomOrder, atomRoles, orderedPosq;
+    std::vector<int> contextRoles;
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;

@@ -23,7 +23,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
  * -------------------------------------------------------------------------- */
 
-#include "openmm/NonbondedForce.h"
 #include "openmm/OpenMMException.h"
 #include "MetalNonbondedUtilities.h"
 #include "MetalArray.h"
@@ -461,6 +460,33 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     }
 }
 
+// Role of each particle in a NonbondedForce: 1 if it has LJ, 2 if it has charge, counting parameter offsets.
+static vector<int> nonbondedRoles(const NonbondedForce& force) {
+    vector<int> roles(force.getNumParticles());
+    for (int i = 0; i < force.getNumParticles(); i++) {
+        double charge, sigma, epsilon;
+        force.getParticleParameters(i, charge, sigma, epsilon);
+        roles[i] = (epsilon != 0 ? 1 : 0) | (charge != 0 ? 2 : 0);
+    }
+    for (int i = 0; i < force.getNumParticleParameterOffsets(); i++) {
+        string parameter;
+        int particle;
+        double chargeScale, sigmaScale, epsilonScale;
+        force.getParticleParameterOffset(i, parameter, particle, chargeScale, sigmaScale, epsilonScale);
+        roles[particle] |= (epsilonScale != 0 ? 1 : 0) | (chargeScale != 0 ? 2 : 0);
+    }
+    return roles;
+}
+
+void MetalNonbondedUtilities::checkRoleOrder(const NonbondedForce& force) const {
+    if (!useRoleOrder)
+        return;
+    vector<int> roles = nonbondedRoles(force);
+    for (int i = 0; i < (int) roles.size(); i++)
+        if ((roles[i] & ~contextRoles[i]) != 0)
+            throw OpenMMException("updateParametersInContext: A particle gained charge or Lennard-Jones parameters it did not have when the Context was created");
+}
+
 // A water model whose oxygen has LJ but no charge and whose other sites have charge but no LJ (TIP4P-Ew, TIP5P, OPC)
 // has site pairs that never interact: in a tile of such waters 6 of 16 site pairs do nothing.  Role order puts the
 // atoms of small molecules that have only one role after all other atoms, LJ only first and charge only second,
@@ -483,19 +509,7 @@ bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
     }
     if (nonbonded == NULL || nonbonded->getNonbondedMethod() == NonbondedForce::LJPME || nonbonded->getNumParticles() != numAtoms)
         return false;
-    vector<int> roles(numAtoms);
-    for (int i = 0; i < numAtoms; i++) {
-        double charge, sigma, epsilon;
-        nonbonded->getParticleParameters(i, charge, sigma, epsilon);
-        roles[i] = (epsilon != 0 ? 1 : 0) | (charge != 0 ? 2 : 0);
-    }
-    for (int i = 0; i < nonbonded->getNumParticleParameterOffsets(); i++) {
-        string parameter;
-        int particle;
-        double chargeScale, sigmaScale, epsilonScale;
-        nonbonded->getParticleParameterOffset(i, parameter, particle, chargeScale, sigmaScale, epsilonScale);
-        roles[particle] |= (epsilonScale != 0 ? 1 : 0) | (chargeScale != 0 ? 2 : 0);
-    }
+    vector<int> roles = nonbondedRoles(*nonbonded);
 
     // Molecules are the groups the exclusions connect.  Only atoms of molecules up to 8 atoms move, so the atoms of
     // a protein stay together.
@@ -539,6 +553,7 @@ bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
                 orderedExclusions[i].push_back(position[j]);
     }
     atomExclusions = orderedExclusions;
+    contextRoles = roles;
     atomOrder.initialize<int>(context, paddedNumAtoms, "atomOrder");
     atomRoles.initialize<int>(context, paddedNumAtoms, "atomRoles");
     orderedPosq.initialize(context, paddedNumAtoms, context.getPosq().getElementSize(), "orderedPosq");
