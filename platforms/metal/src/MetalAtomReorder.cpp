@@ -9,92 +9,159 @@
 #include "MetalContext.h"
 #include "MetalKernelSources.h"
 #include "MetalQueue.h"
-#include <cmath>
-#include <cstdlib>
+#include "openmm/OpenMMException.h"
+#include <algorithm>
+#include <cstring>
+#include <map>
 
 using namespace OpenMM;
 using namespace std;
 
-MetalAtomReorder::MetalAtomReorder(MetalContext& context) : context(context), orderReady(false) {
-    ComputeProgram program = context.compileProgram(MetalKernelSources::reorderAtoms);
+// The key packs group, bin and molecule index into 12, 28 and 24 bits (GROUP_SHIFT and BIN_SHIFT in
+// reorderAtoms.metal).  A system that doesn't fit is reordered on the host.
+static const int MaxGroups = 1<<12;
+static const long long MaxBins = 1<<28;
+static const int MaxMolecules = 1<<24;
+
+// Molecules with more atoms than this get a threadgroup of LargeBlockSize threads to sum their center.
+static const int LargeMolecule = 32;
+static const int LargeBlockSize = 256;
+
+class MoleculeKeyTrait : public ComputeSortImpl::SortTrait {
+public:
+    int getDataSize() const {return sizeof(unsigned long long);}
+    int getKeySize() const {return sizeof(unsigned long long);}
+    const char* getDataType() const {return "ulong";}
+    const char* getKeyType() const {return "ulong";}
+    const char* getMinKey() const {return "0";}
+    const char* getMaxKey() const {return "0xFFFFFFFFFFFFFFFFUL";}
+    const char* getMaxValue() const {return "0xFFFFFFFFFFFFFFFFUL";}
+    const char* getSortKey() const {return "value";}
+};
+
+MetalAtomReorder::MetalAtomReorder(MetalContext& context) : context(context), tablesVersion(-1), tablesUsable(false),
+        hostStale(false), deviceOffsetsStale(true), numLarge(0) {
+    map<string, string> defines;
+    defines["LARGE_MOLECULE"] = context.intToString(LargeMolecule);
+    defines["LARGE_BLOCK_SIZE"] = context.intToString(LargeBlockSize);
+    ComputeProgram program = context.compileProgram(MetalKernelSources::reorderAtoms, defines);
     bool mixed = context.getUseMixedPrecision();
-    copyKernel = program->createKernel("copyPositions");
-    for (int i = 0; i < 3; i++)
-        copyKernel->addArg();
+    keysKernel = program->createKernel("computeMoleculeKeys");
+    for (int i = 0; i < 15; i++)
+        keysKernel->addArg();
+    largeKeysKernel = program->createKernel("computeLargeMoleculeKeys");
+    for (int i = 0; i < 16; i++)
+        largeKeysKernel->addArg();
     gatherKernel = program->createKernel("gatherAtoms");
-    for (int i = 0; i < (mixed ? 13 : 12); i++)
+    for (int i = 0; i < (mixed ? 20 : 19); i++)
         gatherKernel->addArg();
     storeKernel = program->createKernel("storeAtoms");
-    for (int i = 0; i < (mixed ? 8 : 7); i++)
+    for (int i = 0; i < (mixed ? 10 : 9); i++)
         storeKernel->addArg();
+    int paddedNumAtoms = context.getPaddedNumAtoms();
+    scratch.reset(new MetalArray(context, (size_t) paddedNumAtoms*(mixed ? 4 : 2), sizeof(mm_float4), "reorderScratch"));
+    scratchIndex.reset(new MetalArray(context, paddedNumAtoms, sizeof(int), "reorderScratchIndex"));
+    scratchOffsets.reset(new MetalArray(context, paddedNumAtoms, sizeof(mm_int4), "reorderScratchOffsets"));
+    nanFlag.reset(new MetalArray(context, 1, sizeof(int), "reorderNaNFlag"));
+    *(int*) nanFlag->getDevicePointer()->contents() = 0;
 }
 
-void MetalAtomReorder::prepare() {
-    if (orderReady)
-        return;
-    if (snapshot != nullptr) {
-        if (snapshotDone->load())
-            computeOrder();
-        return;
-    }
-    if (context.getStepsSinceReorder() != 250-ReorderLead)
-        return;
+bool MetalAtomReorder::buildTables() {
+    // Fresh buffers are not in use by the GPU, so the host fills them directly.
+
+    tablesVersion = context.getMoleculeGroupsVersion();
+    tablesUsable = false;
+    const vector<ComputeContext::MoleculeGroup>& groups = context.getMoleculeGroups();
     int numAtoms = context.getNumAtoms();
-    snapshot.reset(new MetalArray(context, numAtoms, sizeof(mm_float4), "reorderSnapshot"));
-    snapshotDone = make_shared<atomic<bool> >(false);
-    copyKernel->setArg(0, numAtoms);
-    copyKernel->setArg(1, context.getPosq());
-    copyKernel->setArg(2, *snapshot);
-    copyKernel->execute(numAtoms);
-    shared_ptr<atomic<bool> > done = snapshotDone;
-    context.getCurrentStream().addCompletedHandler([done](MTL::CommandBuffer*) {
-        done->store(true);
-    });
+    if (groups.size() == 0 || groups.size() > MaxGroups)
+        return false;
+    vector<mm_int4> moleculeVec;
+    vector<int> templateVec;
+    vector<int> slotVec(numAtoms, -1);
+    vector<int> largeVec;
+    for (int g = 0; g < (int) groups.size(); g++) {
+        const vector<int>& atoms = groups[g].atoms;
+        const vector<int>& offsets = groups[g].offsets;
+        bool useHilbert = (offsets.size() > 5000 || atoms.size() > 8); // As in ComputeContext::findAtomOrder().
+        int templateStart = templateVec.size();
+        templateVec.insert(templateVec.end(), atoms.begin(), atoms.end());
+        for (int offset : offsets) {
+            int m = moleculeVec.size();
+            if (m >= MaxMolecules)
+                return false;
+            moleculeVec.push_back(mm_int4(offset, 2*g+(useHilbert ? 1 : 0), templateStart, atoms.size()));
+            if (atoms.size() > LargeMolecule)
+                largeVec.push_back(m);
+            for (int atom : atoms) {
+                int slot = offset+atom;
+                if (slot < 0 || slot >= numAtoms || slotVec[slot] != -1)
+                    return false;
+                slotVec[slot] = m;
+            }
+        }
+    }
+    for (int m : slotVec)
+        if (m == -1)
+            return false;
+    int numMolecules = moleculeVec.size();
+    molecules.reset(new MetalArray(context, numMolecules, sizeof(mm_int4), "reorderMolecules"));
+    memcpy(molecules->getDevicePointer()->contents(), moleculeVec.data(), numMolecules*sizeof(mm_int4));
+    templateAtoms.reset(new MetalArray(context, templateVec.size(), sizeof(int), "reorderTemplateAtoms"));
+    memcpy(templateAtoms->getDevicePointer()->contents(), templateVec.data(), templateVec.size()*sizeof(int));
+    slotMolecule.reset(new MetalArray(context, numAtoms, sizeof(int), "reorderSlotMolecule"));
+    memcpy(slotMolecule->getDevicePointer()->contents(), slotVec.data(), numAtoms*sizeof(int));
+    numLarge = largeVec.size();
+    largeMolecules.reset();
+    if (numLarge > 0) {
+        largeMolecules.reset(new MetalArray(context, numLarge, sizeof(int), "reorderLargeMolecules"));
+        memcpy(largeMolecules->getDevicePointer()->contents(), largeVec.data(), numLarge*sizeof(int));
+    }
+    keys.reset(new MetalArray(context, numMolecules, sizeof(unsigned long long), "reorderKeys"));
+    moleculeCells.reset(new MetalArray(context, numMolecules, sizeof(mm_int4), "reorderMoleculeCells"));
+    sort = context.createSort(new MoleculeKeyTrait(), numMolecules, false);
+    tablesUsable = true;
+    return true;
 }
 
-void MetalAtomReorder::computeOrder() {
-    const mm_float4* positions = (const mm_float4*) snapshot->getDevicePointer()->contents();
-    context.findAtomOrder<float, mm_float4>(positions, newToOld, cells);
-    snapshot.reset();
-    orderReady = true;
+void MetalAtomReorder::uploadCellOffsets() {
+    const vector<mm_int4>& offsets = hostCellOffsets(context);
+    cellOffsets.reset(new MetalArray(context, offsets.size(), sizeof(mm_int4), "reorderCellOffsets"));
+    memcpy(cellOffsets->getDevicePointer()->contents(), offsets.data(), offsets.size()*sizeof(mm_int4));
+    deviceOffsetsStale = false;
+}
+
+void MetalAtomReorder::checkForNaN() {
+    if (*(volatile int*) nanFlag->getDevicePointer()->contents() != 0)
+        throw OpenMMException("Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan");
 }
 
 bool MetalAtomReorder::apply() {
-    if (!orderReady) {
-        if (snapshot == nullptr)
-            return false;
-        if (!snapshotDone->load())
-            context.getCurrentStream().finish();
-        computeOrder();
-    }
-    orderReady = false;
-    int numAtoms = context.getNumAtoms();
-    int paddedNumAtoms = context.getPaddedNumAtoms();
+    if (tablesVersion != context.getMoleculeGroupsVersion())
+        buildTables();
+    if (!tablesUsable)
+        return false;
+    checkForNaN();
 
-    // The shift is packed into three signed bytes.  A molecule 128 boxes away is left to the host path.
+    // Bins as in ComputeContext::findAtomOrder() for a periodic system, whose range is the box.
 
-    for (int i = 0; i < numAtoms; i++)
-        if (abs(cells[i].x) > 127 || abs(cells[i].y) > 127 || abs(cells[i].z) > 127)
-            return false;
-    context.updateAtomOrder(newToOld, cells);
-    const vector<int>& atomIndex = context.getAtomIndex();
-
-    // Fresh buffers are not in use by the GPU, so the host writes them directly.  The command buffer
-    // retains them after they go out of scope here.
-
-    MetalArray order(context, numAtoms, sizeof(mm_int4), "reorderOrder");
-    mm_int4* entries = (mm_int4*) order.getDevicePointer()->contents();
-    for (int i = 0; i < numAtoms; i++) {
-        int old = newToOld[i];
-        const mm_int4& c = cells[old];
-        int packed = (c.x & 0xFF) | ((c.y & 0xFF) << 8) | ((c.z & 0xFF) << 16);
-        entries[i] = mm_int4(old, packed, atomIndex[i], 0);
-    }
-    bool mixed = context.getUseMixedPrecision();
-    int words = (mixed ? 4 : 2);
-    MetalArray scratch(context, (size_t) paddedNumAtoms*words, sizeof(mm_float4), "reorderScratch");
     Vec3 box[3];
     context.getPeriodicBoxVectors(box[0], box[1], box[2]);
+    float boxSize[3] = {(float) box[0][0], (float) box[1][1], (float) box[2][2]};
+    float hilbertWidth = (float) (max(max(boxSize[0], boxSize[1]), boxSize[2])/255.0);
+    float invHilbertWidth = (float) (1.0/hilbertWidth);
+    float zigzagWidth = (float) (0.2*context.getNonbondedUtilities().getMaxCutoffDistance());
+    float invZigzagWidth = (float) (1.0/zigzagWidth);
+    int zigzagBins[3];
+    for (int i = 0; i < 3; i++)
+        zigzagBins[i] = 1+(int) (boxSize[i]*invZigzagWidth);
+    if ((long long) zigzagBins[0]*zigzagBins[1]*(zigzagBins[2]+1) >= MaxBins)
+        return false;
+    if (deviceOffsetsStale)
+        uploadCellOffsets();
+    int numMolecules = molecules->getSize();
+    int numAtoms = context.getNumAtoms();
+    int paddedNumAtoms = context.getPaddedNumAtoms();
+    bool mixed = context.getUseMixedPrecision();
     mm_float4 hi[3], lo[3];
     for (int i = 0; i < 3; i++) {
         float h[3], l[3];
@@ -105,15 +172,59 @@ bool MetalAtomReorder::apply() {
         hi[i] = mm_float4(h[0], h[1], h[2], 0);
         lo[i] = mm_float4(l[0], l[1], l[2], 0);
     }
+    mm_float4 invBoxSize((float) (1.0/box[0][0]), (float) (1.0/box[1][1]), (float) (1.0/box[2][2]), 0);
     int arg = 0;
+    keysKernel->setArg(arg++, numMolecules);
+    keysKernel->setArg(arg++, *molecules);
+    keysKernel->setArg(arg++, *templateAtoms);
+    keysKernel->setArg(arg++, context.getPosq());
+    for (int i = 0; i < 3; i++)
+        keysKernel->setArg(arg++, hi[i]);
+    keysKernel->setArg(arg++, invBoxSize);
+    keysKernel->setArg(arg++, invHilbertWidth);
+    keysKernel->setArg(arg++, invZigzagWidth);
+    keysKernel->setArg(arg++, zigzagBins[0]);
+    keysKernel->setArg(arg++, zigzagBins[1]);
+    keysKernel->setArg(arg++, *keys);
+    keysKernel->setArg(arg++, *moleculeCells);
+    keysKernel->setArg(arg++, *nanFlag);
+    keysKernel->execute(numMolecules);
+    if (numLarge > 0) {
+        arg = 0;
+        largeKeysKernel->setArg(arg++, numLarge);
+        largeKeysKernel->setArg(arg++, *largeMolecules);
+        largeKeysKernel->setArg(arg++, *molecules);
+        largeKeysKernel->setArg(arg++, *templateAtoms);
+        largeKeysKernel->setArg(arg++, context.getPosq());
+        for (int i = 0; i < 3; i++)
+            largeKeysKernel->setArg(arg++, hi[i]);
+        largeKeysKernel->setArg(arg++, invBoxSize);
+        largeKeysKernel->setArg(arg++, invHilbertWidth);
+        largeKeysKernel->setArg(arg++, invZigzagWidth);
+        largeKeysKernel->setArg(arg++, zigzagBins[0]);
+        largeKeysKernel->setArg(arg++, zigzagBins[1]);
+        largeKeysKernel->setArg(arg++, *keys);
+        largeKeysKernel->setArg(arg++, *moleculeCells);
+        largeKeysKernel->setArg(arg++, *nanFlag);
+        largeKeysKernel->execute(numLarge*LargeBlockSize, LargeBlockSize);
+    }
+    sort->sort(*keys);
+    arg = 0;
     gatherKernel->setArg(arg++, numAtoms);
     gatherKernel->setArg(arg++, paddedNumAtoms);
-    gatherKernel->setArg(arg++, order);
+    gatherKernel->setArg(arg++, *slotMolecule);
+    gatherKernel->setArg(arg++, *molecules);
+    gatherKernel->setArg(arg++, *keys);
+    gatherKernel->setArg(arg++, *moleculeCells);
     gatherKernel->setArg(arg++, context.getPosq());
     if (mixed)
         gatherKernel->setArg(arg++, context.getPosqCorrection());
     gatherKernel->setArg(arg++, context.getVelm());
-    gatherKernel->setArg(arg++, scratch);
+    gatherKernel->setArg(arg++, context.getAtomIndexArray());
+    gatherKernel->setArg(arg++, *cellOffsets);
+    gatherKernel->setArg(arg++, *scratch);
+    gatherKernel->setArg(arg++, *scratchIndex);
+    gatherKernel->setArg(arg++, *scratchOffsets);
     for (int i = 0; i < 3; i++)
         gatherKernel->setArg(arg++, hi[i]);
     for (int i = 0; i < 3; i++)
@@ -122,18 +233,37 @@ bool MetalAtomReorder::apply() {
     arg = 0;
     storeKernel->setArg(arg++, numAtoms);
     storeKernel->setArg(arg++, paddedNumAtoms);
-    storeKernel->setArg(arg++, order);
-    storeKernel->setArg(arg++, scratch);
+    storeKernel->setArg(arg++, *scratch);
+    storeKernel->setArg(arg++, *scratchIndex);
+    storeKernel->setArg(arg++, *scratchOffsets);
     storeKernel->setArg(arg++, context.getPosq());
     if (mixed)
         storeKernel->setArg(arg++, context.getPosqCorrection());
     storeKernel->setArg(arg++, context.getVelm());
     storeKernel->setArg(arg++, context.getAtomIndexArray());
+    storeKernel->setArg(arg++, *cellOffsets);
     storeKernel->execute(paddedNumAtoms);
+    hostStale = true;
     return true;
 }
 
-void MetalAtomReorder::cancel() {
-    snapshot.reset();
-    orderReady = false;
+void MetalAtomReorder::syncHost() {
+    // Readers on other threads must not see the flag cleared before the copies are done.
+    if (!hostStale.load(memory_order_acquire))
+        return;
+    lock_guard<mutex> lock(syncLock);
+    if (!hostStale.load(memory_order_relaxed))
+        return;
+    context.getCurrentStream().finish();
+    int numAtoms = context.getNumAtoms();
+    const int* index = (const int*) context.unwrap(context.getAtomIndexArray()).getDevicePointer()->contents();
+    const mm_int4* offsets = (const mm_int4*) cellOffsets->getDevicePointer()->contents();
+    copy(index, index+numAtoms, hostAtomIndex(context).begin());
+    copy(offsets, offsets+numAtoms, hostCellOffsets(context).begin());
+    hostStale.store(false, memory_order_release);
+    checkForNaN();
+}
+
+void MetalAtomReorder::hostChanged() {
+    deviceOffsetsStale = true;
 }

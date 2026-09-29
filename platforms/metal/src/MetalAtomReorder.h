@@ -11,42 +11,48 @@
 #include "MetalArray.h"
 #include "openmm/common/ComputeContext.h"
 #include "openmm/common/ComputeKernel.h"
+#include "openmm/common/ComputeSort.h"
 #include <atomic>
 #include <memory>
-#include <vector>
+#include <mutex>
 
 namespace OpenMM {
 
 class MetalContext;
 
 /**
- * Computes each scheduled atom reorder ahead of time, so it does not drain the queue.  The synchronous path
- * downloads positions and velocities, which waits for every queued step, then sorts on the host while the GPU
- * sits idle, about 3 ms per reorder on apoa1.  Here a kernel copies positions ReorderLead steps before the
- * reorder is due, the host computes the order once that copy has completed, and two kernels apply it in stream
- * order.  MetalQueue keeps at most 9 committed buffers of 8 steps, so the host runs at most about 72 steps
- * ahead of the GPU, and the copy has finished by the time the order is needed.
+ * Reorders atoms on the device, so a reorder does not drain the queue.  The host path downloads positions and
+ * velocities, which waits for every queued step, then sorts while the GPU sits idle, about 3 ms per reorder on
+ * apoa1.  Here the order comes from the positions at the reorder step, computed and applied by kernels in
+ * stream order: the same molecule groups, curves and bins as ComputeContext::findAtomOrder(), with the box
+ * shift done in float (single) or df64 (mixed).
  *
- * The order comes from positions ReorderLead steps old.  It is still an exchange of identical molecules and a
- * whole number of box vectors per molecule, so the physics is unchanged; molecules are sorted slightly less
- * tightly.  A NaN position is reported up to ReorderLead steps after the reorder that would have caught it.
+ * The device atom index and cell offsets are the current ones after apply().  The host copies catch up in
+ * syncHost(), which ComputeContext calls before anything reads them; that waits for the queue, as every
+ * reader of positions does anyway.  A NaN position is reported at the next reorder or host sync.
  */
-class MetalAtomReorder : public ComputeContext::ReorderPlanner {
+class MetalAtomReorder : public ComputeContext::DeviceReorder {
 public:
     MetalAtomReorder(MetalContext& context);
-    void prepare();
     bool apply();
-    void cancel();
+    void syncHost();
+    void hostChanged();
 private:
-    static const int ReorderLead = 100;
-    void computeOrder();
+    bool buildTables();
+    void uploadCellOffsets();
+    void checkForNaN();
     MetalContext& context;
-    ComputeKernel copyKernel, gatherKernel, storeKernel;
-    std::unique_ptr<MetalArray> snapshot;
-    std::shared_ptr<std::atomic<bool> > snapshotDone;
-    std::vector<int> newToOld;
-    std::vector<mm_int4> cells;
-    bool orderReady;
+    ComputeKernel keysKernel, largeKeysKernel, gatherKernel, storeKernel;
+    ComputeSort sort;
+    std::unique_ptr<MetalArray> molecules, templateAtoms, slotMolecule, largeMolecules, keys, moleculeCells, cellOffsets;
+    std::unique_ptr<MetalArray> scratch, scratchIndex, scratchOffsets, nanFlag;
+    int tablesVersion;
+    bool tablesUsable;
+    // getPositions() reads the atom order from thread pool workers, so the host sync is guarded.
+    std::atomic<bool> hostStale;
+    std::atomic<bool> deviceOffsetsStale;
+    std::mutex syncLock;
+    int numLarge;
 };
 
 } // namespace OpenMM

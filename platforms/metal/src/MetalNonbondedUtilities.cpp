@@ -117,7 +117,7 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
 
 MetalNonbondedUtilities::~MetalNonbondedUtilities() {
     if (atomReorder != nullptr)
-        context.setReorderPlanner(NULL);
+        context.setDeviceReorder(NULL);
     pinnedCountDeviceMemory->release();
 }
 
@@ -295,10 +295,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     // Create data structures for the neighbor list.
 
-    maxCutoff = getMaxCutoffDistance();
-    if (useCutoff && !context.getUseDoublePrecision() && context.getNumContexts() == 1) {
+    if (useCutoff && usePeriodic && !context.getUseDoublePrecision() && context.getNumContexts() == 1) {
         atomReorder.reset(new MetalAtomReorder(context));
-        context.setReorderPlanner(atomReorder.get());
+        context.setDeviceReorder(atomReorder.get());
     }
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {

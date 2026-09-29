@@ -118,8 +118,10 @@ void ComputeContext::addForce(ComputeForceInfo* force) {
 }
 
 void ComputeContext::setAtomIndex(std::vector<int>& index){
+    syncAtomOrder();
     atomIndex = index;
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
 }
@@ -512,6 +514,7 @@ void ComputeContext::findMoleculeGroups() {
         for (int j = 0; j < (int) atoms.size(); j++)
             moleculeGroups[i].atoms[j] = atoms[j]-atoms[0];
     }
+    moleculeGroupsVersion++;
 }
 
 void ComputeContext::invalidateMolecules() {
@@ -578,6 +581,7 @@ bool ComputeContext::invalidateMolecules(ComputeForceInfo* force, bool checkAtom
 
 void ComputeContext::resetAtomOrder() {
     ContextSelector selector(*this);
+    syncAtomOrder();
     vector<mm_int4> newCellOffsets(numAtoms);
     if (getUseDoublePrecision()) {
         vector<mm_double4> oldPosq(paddedNumAtoms);
@@ -637,12 +641,14 @@ void ComputeContext::resetAtomOrder() {
         posCellOffsets[i] = newCellOffsets[i];
     }
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
     forceNextReorder = true;
 }
 
 void ComputeContext::validateAtomOrder() {
+    syncAtomOrder();
     for (auto& mol : moleculeGroups) {
         for (int atom : mol.atoms) {
             set<int> identical;
@@ -673,9 +679,14 @@ void ComputeContext::updateAtomOrder(const vector<int>& newToOld, const vector<m
     }
 }
 
-void ComputeContext::cancelPreparedReorder() {
-    if (reorderPlanner != NULL)
-        reorderPlanner->cancel();
+void ComputeContext::syncAtomOrder() const {
+    if (deviceReorder != NULL)
+        deviceReorder->syncHost();
+}
+
+void ComputeContext::atomOrderChangedOnHost() {
+    if (deviceReorder != NULL)
+        deviceReorder->hostChanged();
 }
 
 void ComputeContext::forceReorder() {
@@ -690,17 +701,12 @@ void ComputeContext::reorderAtoms() {
     }
     if (stepsSinceReorder < 250 && !forceNextReorder) {
         stepsSinceReorder++;
-        if (reorderPlanner != NULL)
-            reorderPlanner->prepare();
         return;
     }
-    bool forced = forceNextReorder;
     forceNextReorder = false;
     atomsWereReordered = true;
     stepsSinceReorder = 0;
-    if (forced)
-        cancelPreparedReorder();
-    else if (reorderPlanner != NULL && reorderPlanner->apply()) {
+    if (deviceReorder != NULL && deviceReorder->apply()) {
         for (auto listener : reorderListeners)
             listener->execute();
         return;
@@ -837,6 +843,7 @@ template void ComputeContext::findAtomOrder<double, mm_double4>(const mm_double4
 
 template <class Real, class Real4, class Mixed, class Mixed4>
 void ComputeContext::reorderAtomsImpl() {
+    syncAtomOrder();
     vector<Real4> oldPosq(paddedNumAtoms);
     vector<Real4> oldPosqCorrection(paddedNumAtoms);
     vector<Mixed4> oldVelm(paddedNumAtoms);
@@ -896,6 +903,7 @@ void ComputeContext::reorderAtomsImpl() {
         getPosqCorrection().upload(newPosqCorrection);
     getVelm().upload(newVelm);
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
 }
