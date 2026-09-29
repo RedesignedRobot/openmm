@@ -173,6 +173,16 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+void MetalIntegrationUtilities::computeVirtualSites() {
+    // Without this, every system with virtual sites (TIP4P water) would pay the clear twice: the vsite kernel runs
+    // after the integrator and counts as work, so beginComputation() would clear again.
+    MetalContext& cu = dynamic_cast<MetalContext&>(context);
+    bool cleared = cu.getAutoclearBuffersMarkedCleared();
+    IntegrationUtilities::computeVirtualSites();
+    if (cleared)
+        cu.markAutoclearBuffersCleared();
+}
+
 bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
     return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision();
 }

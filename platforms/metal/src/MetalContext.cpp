@@ -887,8 +887,12 @@ void MetalContext::markAutoclearBuffersCleared() {
     autoclearBufferCount = autoclearBuffers.size();
 }
 
+bool MetalContext::getAutoclearBuffersMarkedCleared() const {
+    return autoclearWorkCount == MetalQueue::getWorkCount() && autoclearBufferCount == autoclearBuffers.size();
+}
+
 void MetalContext::clearAutoclearBuffersIfNeeded() {
-    bool cleared = (autoclearWorkCount == MetalQueue::getWorkCount() && autoclearBufferCount == autoclearBuffers.size());
+    bool cleared = getAutoclearBuffersMarkedCleared();
     autoclearWorkCount = -1;
     if (!cleared)
         clearAutoclearBuffers();

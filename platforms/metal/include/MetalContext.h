@@ -525,6 +525,11 @@ public:
      */
     void markAutoclearBuffersCleared();
     /**
+     * Get whether the mark markAutoclearBuffersCleared() set still holds: no work was encoded, no array written and no
+     * buffer added since.
+     */
+    bool getAutoclearBuffersMarkedCleared() const;
+    /**
      * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
      */
     void clearAutoclearBuffersIfNeeded();

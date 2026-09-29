@@ -104,7 +104,7 @@ public:
     /**
      * Compute the positions of virtual sites.
      */
-    void computeVirtualSites();
+    virtual void computeVirtualSites();
     /**
      * Distribute forces from virtual sites to the atoms they are based on.
      */

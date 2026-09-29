@@ -59,6 +59,11 @@ public:
      */
     MetalArray& getStepSize();
     /**
+     * Compute the positions of virtual sites.  The kernel writes only positions, so a clear of the autoclear buffers
+     * that integrateLangevinMiddle() folded into the step stays valid across it.
+     */
+    void computeVirtualSites();
+    /**
      * Distribute forces from virtual sites to the atoms they are based on.
      */
     void distributeForcesFromVirtualSites();
