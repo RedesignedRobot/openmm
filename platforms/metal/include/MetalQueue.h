@@ -109,6 +109,9 @@ private:
     std::condition_variable_any bufferOpened;
     std::thread committer;
     bool stopCommitter;
+    MTL::SharedEvent* finishEvent;
+    uint64_t finishValue;
+    long long finishedCommits;   // commitCount when finish() last saw the queue's final signal
 };
 
 } // namespace OpenMM
