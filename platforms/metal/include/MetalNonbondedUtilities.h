@@ -27,6 +27,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/System.h"
+#include "openmm/NonbondedForce.h"
 #include "MetalArray.h"
 #include "MetalExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
@@ -163,6 +164,17 @@ public:
      * Get the maximum cutoff distance used by any force group.
      */
     double getMaxCutoffDistance();
+    /**
+     * Throw if a NonbondedForce update gives a particle charge or Lennard-Jones parameters that it lacked when role
+     * order was chosen.  The list skips pairs by those roles, so a new role would lose interactions.
+     */
+    void checkRoleOrder(const NonbondedForce& force) const;
+    /**
+     * In role order the nonbonded kernel accumulates into orderedForces, contiguous in nonbonded order, so its
+     * atomics do not interleave with the bonded kernel's on the context force buffer.  After the force pass this
+     * adds them into the context force buffer in a fixed order and clears them.  A no-op otherwise.
+     */
+    void scatterRoleForces();
     /**
      * Given a nonbonded cutoff, get the padded cutoff distance used in computing
      * the neighbor list.
@@ -313,6 +325,11 @@ private:
      * Wait until copyInteractionCounts has written this step's counts to pinned memory.
      */
     void waitForCountCopy();
+    /**
+     * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
+     * atomOrder, atomRoles and the exclusions in that order.  See initialize().
+     */
+    bool chooseRoleOrder(const System& system);
     class KernelSet;
     struct CountAudit;
     class BlockSortTrait;
@@ -342,6 +359,14 @@ private:
     MetalArray displacementFlags, rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
+    // Role order: atomOrder maps a nonbonded index to a context index, atomRoles holds 1 for LJ and 2 for charge,
+    // and orderedPosq holds the positions in nonbonded order for the neighbor list kernels.
+    bool useRoleOrder = false;
+    int numInteractions = 0;
+    MetalArray atomOrder, atomRoles, orderedPosq, orderedForces;
+    bool roleForcesPending = false;
+    metalFunction_t scatterOrderedForcesKernel = NULL;
+    std::vector<int> contextRoles;
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
@@ -381,6 +406,7 @@ public:
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;
     metalFunction_t copyInteractionCountsKernel;
+    metalFunction_t gatherOrderedPositionsKernel;
 };
 
 } // namespace OpenMM

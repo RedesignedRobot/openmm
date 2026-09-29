@@ -111,6 +111,7 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
+    cu.getNonbondedUtilities().scatterRoleForces();
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
@@ -131,6 +132,11 @@ void MetalCalcNonbondedForceKernel::initialize(const System& system, const Nonbo
     getMetalPmeParameters(cu, usePmeQueue, useFixedPointChargeSpreading);
     // Sorting atoms by PME grid index costs more than it saves: reorderAtoms already keeps the stored order spatially coherent.
     commonInitialize(system, force, usePmeQueue, false, useFixedPointChargeSpreading, cu.getPlatformData().useCpuPme, false);
+}
+
+void MetalCalcNonbondedForceKernel::copyParametersToContext(ContextImpl& context, const NonbondedForce& force, int firstParticle, int lastParticle, int firstException, int lastException) {
+    cu.getNonbondedUtilities().checkRoleOrder(force);
+    CommonCalcNonbondedForceKernel::copyParametersToContext(context, force, firstParticle, lastParticle, firstException, lastException);
 }
 
 void MetalCalcConstantPotentialForceKernel::initialize(const System& system, const ConstantPotentialForce& force) {

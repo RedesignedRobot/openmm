@@ -293,7 +293,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
 #endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
-        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList
+#ifdef ROLE_ORDER
+        , const int* __restrict__ atomRoles
+#endif
+        ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
@@ -335,6 +339,13 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
         int neighborsInBuffer = 0;
         real4 pos1 = posq[x*TILE_SIZE+indexInTile];
+#ifdef ROLE_ORDER
+        // In role order an atom is listed only for the x atoms it shares a role with (1 LJ, 2 charge): any other
+        // pair contributes nothing.
+        const int role1 = atomRoles[x*TILE_SIZE+indexInTile];
+        const tileflags ljAtomsX = BALLOT((role1 & 1) != 0);
+        const tileflags chargedAtomsX = BALLOT((role1 & 2) != 0);
+#endif
 #ifdef USE_PERIODIC
         const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= PADDED_CUTOFF &&
                                          0.5f*periodicBoxSize.y-blockSizeX.y >= PADDED_CUTOFF &&
@@ -463,6 +474,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const bool forceInclude = b & 1;
                 const int block2 = b >> 1;
                 int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#ifdef ROLE_ORDER
+                // An atom is listed only for the x atoms it shares a role with.  The role regions are contiguous, so
+                // a block of LJ-only atoms against a block of charge-only atoms (water O against H/H/M) has no pair to
+                // test, and one ballot skips its atom test.  On tip4pew that was a third of the candidate blocks.
+                const int role2 = atomRoles[y*TILE_SIZE+indexInTile];
+                const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
+                if (BALLOT(roleFlags != 0) == 0)
+                    continue;
+#endif
 
                 #pragma unroll 1
                 for (int k = indexInTile; k < numExclusions; k += TILE_SIZE)
@@ -498,6 +518,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         real3 delta = trimTo3(pos2)-trimTo3(posBuffer[j]);
                         APPLY_PERIODIC_TO_DELTA(delta)
                         real d = delta.x*delta.x+delta.y*delta.y+delta.z*delta.z - PADDED_CUTOFF_SQUARED;
+#ifdef ROLE_ORDER
+                        d = ((roleFlags >> j) & 1) ? d : 1.0f;
+#endif
                         collectInteractions(interacts, d, j);
                     }
                 }
@@ -526,7 +549,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                             real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim)));
                             interacts |= (__float_as_uint(d) >> 31) << j;
                         }
+#ifdef ROLE_ORDER
+                        interacts &= atomFlags & roleFlags;
+#else
                         interacts &= atomFlags;
+#endif
                         atomFlags = 0;
                     }
                     while (atomFlags) {
@@ -534,6 +561,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         atomFlags = atomFlags ^ (static_cast<tileflags>(1) << j);
                         real4 posj = posBuffer[j];
                         real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim)));
+#ifdef ROLE_ORDER
+                        d = ((roleFlags >> j) & 1) ? d : 1.0f;
+#endif
                         collectInteractions(interacts, d, j);
                     }
 #endif
@@ -861,4 +891,33 @@ extern "C" __global__ void scatterBlocks(const unsigned int* __restrict__ binRan
     }
 }
 #endif
+#endif
+
+#ifdef ROLE_ORDER
+/**
+ * Copy the positions into role order for the neighbor list kernels.  The nonbonded kernel reads posq through atomOrder
+ * itself, so it sees charges written after this runs.
+ */
+extern "C" __global__ void gatherOrderedPositions(const real4* __restrict__ posq, const int* __restrict__ atomOrder,
+        real4* __restrict__ orderedPosq) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x)
+        orderedPosq[i] = posq[atomOrder[i]];
+}
+
+/**
+ * Add the forces the nonbonded kernel accumulated in nonbonded order into the context force buffer, and clear them
+ * for the next step.  Runs after the force pass, so a plain add in a fixed order is exact.
+ */
+extern "C" __global__ void scatterOrderedForces(unsigned long long* __restrict__ orderedForces, const int* __restrict__ atomOrder,
+        unsigned long long* __restrict__ forceBuffers) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x) {
+        const int atom = atomOrder[i];
+        forceBuffers[atom] += orderedForces[i];
+        forceBuffers[atom+PADDED_NUM_ATOMS] += orderedForces[i+PADDED_NUM_ATOMS];
+        forceBuffers[atom+2*PADDED_NUM_ATOMS] += orderedForces[i+2*PADDED_NUM_ATOMS];
+        orderedForces[i] = 0;
+        orderedForces[i+PADDED_NUM_ATOMS] = 0;
+        orderedForces[i+2*PADDED_NUM_ATOMS] = 0;
+    }
+}
 #endif
