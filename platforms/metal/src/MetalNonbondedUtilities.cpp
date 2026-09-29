@@ -63,7 +63,7 @@ static const int FindBlockBoundsThreadBlockSize = 256;
 // prepareRebuildDispatch sorts up to this many blocks in its one threadgroup.  Larger systems sort in
 // three dispatches of BinSortThreadBlockSize threads (at most 256, since a block's rank inside its
 // threadgroup takes 8 bits).
-static const int MaxBlocksSortedInOneGroup = 1024;
+static const int MaxBlocksSortedInOneGroup = 2048;
 static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
