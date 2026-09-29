@@ -427,6 +427,112 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
     real3 data[PME_ORDER];
     real3 ddata[PME_ORDER];
     const real scale = RECIP((real) (PME_ORDER-1));
+#ifdef PME_INTERP_LANES
+    // Metal on Apple9.  With one thread per atom, each thread issues all 125 grid loads of its atom, and
+    // the M3 Ultra spent 37 us on apoa1pme where OpenCL in sorted order spends 22.  Here PME_ORDER
+    // consecutive lanes share one atom, 32/PME_ORDER atoms per SIMD group, and lane iz loads the grid
+    // points at z offset iz, so the lanes of an atom read consecutive addresses.  Every lane computes the
+    // atom's splines itself, which is cheaper than broadcasting them.  The first lane sums the partial
+    // forces in lane order, so the result doesn't depend on scheduling.  MetalKernel launches 32 threads
+    // per 32/PME_ORDER atoms.
+
+    const int lane = LOCAL_ID%32;
+    const int slot = lane/PME_ORDER;
+    const int iz = lane-PME_ORDER*slot;
+    const int atomsPerGroup = 32/PME_ORDER;
+    for (int base = (GLOBAL_ID/32)*atomsPerGroup; base < NUM_ATOMS; base += (GLOBAL_SIZE/32)*atomsPerGroup) {
+        const int i = base+slot;
+        const bool active = (slot < atomsPerGroup && i < NUM_ATOMS);
+        int atom = 0;
+        real q = 0;
+        real4 pos = make_real4(0);
+        real3 force = make_real3(0);
+        if (active) {
+            atom = pmeAtomGridIndex[i].x;
+            pos = posq[atom];
+#ifdef CHARGE_FROM_SIGEPS
+            const float2 sigEps = sigmaEpsilon[atom];
+            q = 8*sigEps.x*sigEps.x*sigEps.x*sigEps.y;
+#else
+            q = CHARGE*EPSILON_FACTOR;
+#endif
+        }
+        if (q != 0) {
+            APPLY_PERIODIC_TO_POS(pos)
+            real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
+                                 pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
+                                 pos.z*recipBoxVecZ.z);
+            t.x = (t.x-floor(t.x))*GRID_SIZE_X;
+            t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
+            t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
+            int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
+                                       ((int) t.y) % GRID_SIZE_Y,
+                                       ((int) t.z) % GRID_SIZE_Z);
+            real3 dr = make_real3(t.x-(int) t.x, t.y-(int) t.y, t.z-(int) t.z);
+            data[PME_ORDER-1] = make_real3(0);
+            data[1] = dr;
+            data[0] = make_real3(1)-dr;
+            for (int j = 3; j < PME_ORDER; j++) {
+                real div = RECIP((real) (j-1));
+                data[j-1] = div*dr*data[j-2];
+                for (int k = 1; k < (j-1); k++)
+                    data[j-k-1] = div*((dr+make_real3(k))*data[j-k-2] + (make_real3(j-k)-dr)*data[j-k-1]);
+                data[0] = div*(make_real3(1)-dr)*data[0];
+            }
+            ddata[0] = -data[0];
+            for (int j = 1; j < PME_ORDER; j++)
+                ddata[j] = data[j-1]-data[j];
+            data[PME_ORDER-1] = scale*dr*data[PME_ORDER-2];
+            for (int j = 1; j < (PME_ORDER-1); j++)
+                data[PME_ORDER-j-1] = scale*((dr+make_real3(j))*data[PME_ORDER-j-2] + (make_real3(PME_ORDER-j)-dr)*data[PME_ORDER-j-1]);
+            data[0] = scale*(make_real3(1)-dr)*data[0];
+            int zindex = gridIndex.z+iz;
+            zindex -= (zindex >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
+            for (int ix = 0; ix < PME_ORDER; ix++) {
+                int xbase = gridIndex.x+ix;
+                xbase -= (xbase >= GRID_SIZE_X ? GRID_SIZE_X : 0);
+                xbase = xbase*GRID_SIZE_Y*GRID_SIZE_Z;
+                real dx = data[ix].x;
+                real ddx = ddata[ix].x;
+                for (int iy = 0; iy < PME_ORDER; iy++) {
+                    int ybase = gridIndex.y+iy;
+                    ybase -= (ybase >= GRID_SIZE_Y ? GRID_SIZE_Y : 0);
+                    real gridvalue = pmeGrid[xbase + ybase*GRID_SIZE_Z + zindex];
+                    force.x += ddx*data[iy].y*gridvalue;
+                    force.y += dx*ddata[iy].y*gridvalue;
+                    force.z += dx*data[iy].y*gridvalue;
+                }
+            }
+
+            // Select this lane's z weights with fixed indices, so data and ddata stay in registers.
+
+            real dz = 0, ddz = 0;
+            for (int k = 0; k < PME_ORDER; k++) {
+                dz = (k == iz ? data[k].z : dz);
+                ddz = (k == iz ? ddata[k].z : ddz);
+            }
+            force *= make_real3(dz, dz, ddz);
+        }
+        real3 sum = force;
+        for (int k = 1; k < PME_ORDER; k++)
+            sum += make_real3(simd_shuffle_down(force.x, (ushort) k), simd_shuffle_down(force.y, (ushort) k), simd_shuffle_down(force.z, (ushort) k));
+        if (iz != 0 || q == 0)
+            continue;
+        real forceX = -q*(sum.x*GRID_SIZE_X*recipBoxVecX.x);
+        real forceY = -q*(sum.x*GRID_SIZE_X*recipBoxVecY.x+sum.y*GRID_SIZE_Y*recipBoxVecY.y);
+        real forceZ = -q*(sum.x*GRID_SIZE_X*recipBoxVecZ.x+sum.y*GRID_SIZE_Y*recipBoxVecZ.y+sum.z*GRID_SIZE_Z*recipBoxVecZ.z);
+#if defined(USE_PME_STREAM) || defined(ATOMIC_PME_FORCES)
+        ATOMIC_ADD(&forceBuffers[atom], (mm_ulong) realToFixedPoint(forceX));
+        ATOMIC_ADD(&forceBuffers[atom+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(forceY));
+        ATOMIC_ADD(&forceBuffers[atom+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(forceZ));
+#else
+        forceBuffers[atom] += (mm_ulong) realToFixedPoint(forceX);
+        forceBuffers[atom+PADDED_NUM_ATOMS] += (mm_ulong) realToFixedPoint(forceY);
+        forceBuffers[atom+2*PADDED_NUM_ATOMS] += (mm_ulong) realToFixedPoint(forceZ);
+#endif
+    }
+    return;
+#endif
 
     // Process the atoms in spatially sorted order.  This improves cache performance when loading
     // the grid values.
