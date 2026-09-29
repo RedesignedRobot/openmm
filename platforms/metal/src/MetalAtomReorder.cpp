@@ -265,5 +265,8 @@ void MetalAtomReorder::syncHost() {
 }
 
 void MetalAtomReorder::hostChanged() {
-    deviceOffsetsStale = true;
+    // getPositions() reaches this once per atom from every thread pool worker.  Storing only when the flag
+    // is clear keeps the workers from fighting over one cache line.
+    if (!deviceOffsetsStale.load(memory_order_relaxed))
+        deviceOffsetsStale.store(true, memory_order_relaxed);
 }
