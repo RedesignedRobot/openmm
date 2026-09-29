@@ -848,6 +848,19 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     }
     replacements["CLEAR_LOCAL_PARAMETERS"] = clearLocal.str();
 
+    // The neighbor list loop loads the next tile's y parameters one tile ahead.
+    stringstream declareNext, loadNext, clearNext, moveNext;
+    for (const ComputeParameterInfo& param : params) {
+        declareNext<<param.getType()<<" next"<<param.getName()<<";\n";
+        loadNext<<"next"<<param.getName()<<" = "<<loadParameter(param, "nextJ")<<";\n";
+        clearNext<<"next"<<param.getName()<<" = "<<(param.getNumComponents() == 1 ? "0" : "make_"+param.getType()+"(0)")<<";\n";
+        moveNext<<"shfl"<<param.getName()<<" = next"<<param.getName()<<";\n";
+    }
+    replacements["DECLARE_NEXT_PARAMETERS"] = declareNext.str();
+    replacements["LOAD_NEXT_PARAMETERS_FROM_GLOBAL"] = loadNext.str();
+    replacements["CLEAR_NEXT_PARAMETERS"] = clearNext.str();
+    replacements["MOVE_NEXT_PARAMETERS"] = moveNext.str();
+
     stringstream initDerivs;
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
         initDerivs<<"mixed energyParamDeriv"<<i<<" = 0;\n";

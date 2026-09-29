@@ -259,8 +259,23 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // adds per tile. They are summed in fixed point, because which tiles share a write varies from one neighbor list
     // build to the next, and the forces must not.
     mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
+    const unsigned int first = firstNeighborListTile(numTiles, warp, totalWarps);
     const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
-    for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
+
+    // Software pipeline for the y atoms: each tile loads the next tile's position and parameters, and the list entry
+    // of the tile after that, so the pair loop hides the latency of both dependent loads instead of waiting on them.
+    unsigned int nextJ = (first < end ? interactingAtoms[first*TILE_SIZE+tgx] : PADDED_NUM_ATOMS);
+    unsigned int afterJ = (first+1 < end ? interactingAtoms[(first+1)*TILE_SIZE+tgx] : PADDED_NUM_ATOMS);
+    real4 nextPosq = make_real4(0, 0, 0, 0);
+    DECLARE_NEXT_PARAMETERS
+    if (nextJ < PADDED_NUM_ATOMS) {
+        nextPosq = posq[nextJ];
+        LOAD_NEXT_PARAMETERS_FROM_GLOBAL
+    }
+    else {
+        CLEAR_NEXT_PARAMETERS
+    }
+    for (unsigned int pos = first; pos < end; pos++) {
 #else
     int pos = (int) (startTileIndex+warp*numTileIndices/totalWarps);
     int end = (int) (startTileIndex+(warp+1)*numTileIndices/totalWarps);
@@ -307,7 +322,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             real4 posq1 = posq[atom1];
             LOAD_ATOM1_PARAMETERS
 #ifdef USE_NEIGHBOR_LIST
-            unsigned int j = interactingAtoms[pos*TILE_SIZE+tgx];
+            unsigned int j = nextJ;
 #else
             unsigned int j = y*TILE_SIZE + tgx;
 #endif
@@ -318,6 +333,20 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             shflForce.x = 0.0f;
             shflForce.y = 0.0f;
             shflForce.z = 0.0f;
+#ifdef USE_NEIGHBOR_LIST
+            shflPosq = nextPosq;
+            MOVE_NEXT_PARAMETERS
+            nextJ = afterJ;
+            if (nextJ < PADDED_NUM_ATOMS) {
+                nextPosq = posq[nextJ];
+                LOAD_NEXT_PARAMETERS_FROM_GLOBAL
+            }
+            else {
+                nextPosq = make_real4(0, 0, 0, 0);
+                CLEAR_NEXT_PARAMETERS
+            }
+            afterJ = (pos+2 < end ? interactingAtoms[(pos+2)*TILE_SIZE+tgx] : PADDED_NUM_ATOMS);
+#else
             if (j < PADDED_NUM_ATOMS) {
                 // Load position of atom j from from global memory
                 shflPosq = posq[j];
@@ -327,6 +356,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                 shflPosq = make_real4(0, 0, 0, 0);
                 CLEAR_LOCAL_PARAMETERS
             }
+#endif
 #ifdef USE_PERIODIC
             if (singlePeriodicCopy) {
                 // The box is small enough that we can just translate all the atoms into a single periodic
