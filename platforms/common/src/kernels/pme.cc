@@ -708,3 +708,12 @@ KERNEL void addEnergy(GLOBAL const mixed* RESTRICT pmeEnergyBuffer, GLOBAL mixed
     for (int i = GLOBAL_ID; i < bufferSize; i += GLOBAL_SIZE)
         energyBuffer[i] += pmeEnergyBuffer[i];
 }
+
+/**
+ * Add the reciprocal space forces computed on the PME queue to the main force buffer.  Both hold fixed point
+ * values, so the sum is the same as interpolating into the main buffer directly.
+ */
+KERNEL void addPmeForces(GLOBAL const mm_long* RESTRICT pmeForces, GLOBAL mm_long* RESTRICT forceBuffers, int bufferSize) {
+    for (int i = GLOBAL_ID; i < bufferSize; i += GLOBAL_SIZE)
+        forceBuffers[i] += pmeForces[i];
+}

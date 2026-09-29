@@ -146,7 +146,7 @@ private:
     ComputeArray pmeDispersionBsplineModuliY;
     ComputeArray pmeDispersionBsplineModuliZ;
     ComputeArray pmeAtomGridIndex;
-    ComputeArray pmeEnergyBuffer;
+    ComputeArray pmeForces;
     ComputeArray chargeBuffer;
     ComputeSort sort;
     ComputeQueue pmeQueue;
@@ -162,7 +162,7 @@ private:
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
     ComputeKernel pmeEvalEnergyKernel, pmeDispersionEvalEnergyKernel;
-    ComputeKernel pmeInterpolateForceKernel, pmeDispersionInterpolateForceKernel;
+    ComputeKernel pmeInterpolateForceKernel, pmeInterpolateForceQueueKernel, pmeDispersionInterpolateForceKernel;
     std::map<std::string, std::string> pmeDefines;
     std::vector<std::pair<int, int> > exceptionAtoms;
     std::vector<std::string> paramNames;
@@ -174,7 +174,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
+    bool usePmeQueue, reciprocalOnQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;

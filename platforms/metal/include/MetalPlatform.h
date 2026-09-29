@@ -98,7 +98,8 @@ public:
         return key;
     }
     /**
-     * This is the name of the parameter for selecting whether to disable use of a separate stream for PME.
+     * This is the name of the parameter for selecting whether to disable use of a separate stream for PME.  "true"
+     * or "false" force it; the default "auto" uses the stream on GPUs where it runs beside the force pass (Apple9).
      */
     static const std::string& MetalDisablePmeStream() {
         static const std::string key = "DisablePmeStream";
