@@ -1067,19 +1067,12 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             if (deferPmeSpread) {
                 cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
                 cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
-                // PRICE PROBE ONLY: a second FFT chain and interpolation on dummy buffers, inside the pass.
+                // PRICE PROBE ONLY: a second charge spread into a dummy grid, inside the pass.
                 if (!includeEnergy)
                     cc.addForcePassWork([=] () {
-                        fft->execPmeConvolution(probeGrid1, probeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha));
-                        setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
-                        pmeInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
-                        pmeInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
-                        pmeInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
-                        pmeInterpolateForceKernel->setArg(1, probeForces);
-                        pmeInterpolateForceKernel->setArg(2, probeGrid1);
-                        pmeInterpolateForceKernel->execute(cc.getNumAtoms());
-                        pmeInterpolateForceKernel->setArg(1, cc.getLongForceBuffer());
-                        pmeInterpolateForceKernel->setArg(2, pmeGrid1);
+                        pmeSpreadChargeKernel->setArg(1, probeGrid1);
+                        pmeSpreadChargeKernel->execute(cc.getNumAtoms());
+                        pmeSpreadChargeKernel->setArg(1, pmeGrid1);
                     });
             }
             else {
