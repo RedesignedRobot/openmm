@@ -29,6 +29,7 @@
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
+#include "openmm/VirtualSite.h"
 
 using namespace OpenMM;
 using namespace std;
@@ -38,11 +39,18 @@ using namespace std;
 // comes two arguments before them, followed by the atom count.
 static const int MaxClearedBuffers = 4;
 static const int ClearArgument = 22;
+// With the virtual sites folded in, the SETTLE clusters' sites and weights follow the clear arguments, then the flag
+// that tells the kick to add each site's force to its atoms.
+static const int VsiteShareArgument = ClearArgument+MaxClearedBuffers+3;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
         ccmaConvergedMemory(NULL), numClearThreads(0), numBoundAutoclearBuffers(-1), clearsAutoclearBuffers(false),
         pendingCMBlockSize(0), pendingCMVelocity(NULL), prefetchesKineticEnergy(false), kineticEnergyQueued(false),
-        kineticEnergyWorkCount(-1) {
+        kineticEnergyWorkCount(-1), numThreeParticleAverageSites(0), foldsVsites(false), vsiteForcesDistributed(true),
+        vsitesPlacedByStep(false) {
+        for (int i = 0; i < system.getNumParticles(); i++)
+            if (system.isVirtualSite(i) && dynamic_cast<const ThreeParticleAverageSite*>(&system.getVirtualSite(i)) != NULL)
+                numThreeParticleAverageSites++;
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -137,6 +145,23 @@ void MetalIntegrationUtilities::applyConstraintsImpl(bool constrainVelocities, d
 }
 
 void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
+    if (foldsVsites) {
+        // The next integrateLangevinMiddle() adds each site's force to its atoms as it kicks them.  Only a
+        // getState(Forces) before then needs the kernels, through ensureVirtualSiteForcesDistributed().
+        vsiteForcesDistributed = false;
+        return;
+    }
+    runVsiteForceKernels();
+}
+
+void MetalIntegrationUtilities::ensureVirtualSiteForcesDistributed() {
+    if (vsiteForcesDistributed)
+        return;
+    runVsiteForceKernels();
+    vsiteForcesDistributed = true;
+}
+
+void MetalIntegrationUtilities::runVsiteForceKernels() {
     ContextSelector selector(context);
     if (numVsites > 0) {
         Vec3 boxVectors[3];
@@ -176,6 +201,11 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
 }
 
 void MetalIntegrationUtilities::computeVirtualSites() {
+    if (vsitesPlacedByStep) {
+        // The fused kernel placed the sites as it finished their clusters; this is the call that follows it.
+        vsitesPlacedByStep = false;
+        return;
+    }
     // Without this, every system with virtual sites (TIP4P water) would pay the clear twice: the vsite kernel runs
     // after the integrator and counts as work, so beginComputation() would clear again.
     MetalContext& cu = dynamic_cast<MetalContext&>(context);
@@ -212,12 +242,66 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         int numAtoms = context.getNumAtoms();
         vector<bool> isConstrained(numAtoms, false);
         int numSettle = 0, numShake = 0;
+        vector<mm_int4> settleClusters;
         if (settleAtoms.isInitialized()) {
-            vector<mm_int4> atoms;
-            settleAtoms.download(atoms);
-            numSettle = atoms.size();
-            for (mm_int4 cluster : atoms)
+            settleAtoms.download(settleClusters);
+            numSettle = settleClusters.size();
+            for (mm_int4 cluster : settleClusters)
                 isConstrained[cluster.x] = isConstrained[cluster.y] = isConstrained[cluster.z] = true;
+        }
+
+        // Virtual sites fold into the SETTLE clusters when every site is a three particle average of the atoms of
+        // one cluster, as in four-site waters.  The cluster then owns the site: its unit adds the site's force to
+        // the three atoms before the kick and places the site from their final positions, so computeVirtualSites and
+        // distributeVirtualSiteForces stop running each step (about 20 us of 530 on a 38876-atom TIP4P-Ew unit, two
+        // dispatches with nothing else to overlap).  Any other site keeps the common kernels.
+
+        vector<int> clusterVsite(max(1, numSettle), -1);
+        vector<mm_float4> clusterVsiteWeights(max(1, numSettle), mm_float4(0, 0, 0, 0));
+        bool foldVsites = (numVsites > 0 && numVsites == numThreeParticleAverageSites && numSettle > 0);
+        if (foldVsites) {
+            vector<int> clusterOfAtom(numAtoms, -1);
+            for (int i = 0; i < numSettle; i++)
+                clusterOfAtom[settleClusters[i].x] = clusterOfAtom[settleClusters[i].y] = clusterOfAtom[settleClusters[i].z] = i;
+            vector<mm_int4> sites;
+            vector<mm_float4> weights;
+            vsite3AvgAtoms.download(sites);
+            vsite3AvgWeights.download(weights);
+            for (int i = 0; i < numVsites && foldVsites; i++) {
+                int site = sites[i].x;
+                int cluster = clusterOfAtom[sites[i].y];
+                if (cluster == -1 || clusterOfAtom[sites[i].z] != cluster || clusterOfAtom[sites[i].w] != cluster ||
+                        clusterVsite[cluster] != -1 || isConstrained[site] || clusterOfAtom[site] != -1) {
+                    foldVsites = false;
+                    break;
+                }
+                // The cluster's atoms may come in another order than the site's particles.
+                int siteParticles[3] = {sites[i].y, sites[i].z, sites[i].w};
+                float siteWeights[3] = {weights[i].x, weights[i].y, weights[i].z};
+                int clusterAtoms[3] = {settleClusters[cluster].x, settleClusters[cluster].y, settleClusters[cluster].z};
+                float ordered[3];
+                for (int j = 0; j < 3; j++) {
+                    int k = 0;
+                    while (k < 3 && siteParticles[k] != clusterAtoms[j])
+                        k++;
+                    if (k == 3)
+                        foldVsites = false;
+                    else
+                        ordered[j] = siteWeights[k];
+                }
+                clusterVsite[cluster] = site;
+                clusterVsiteWeights[cluster] = mm_float4(ordered[0], ordered[1], ordered[2], 0);
+            }
+        }
+        if (foldVsites) {
+            for (int site : clusterVsite)
+                if (site != -1)
+                    isConstrained[site] = true;
+            settleVsites.initialize<int>(context, clusterVsite.size(), "settleVsites");
+            settleVsites.upload(clusterVsite);
+            settleVsiteWeights.initialize<mm_float4>(context, clusterVsiteWeights.size(), "settleVsiteWeights");
+            settleVsiteWeights.upload(clusterVsiteWeights);
+            foldsVsites = true;
         }
         if (shakeAtoms.isInitialized()) {
             vector<mm_int4> atoms;
@@ -250,6 +334,8 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        if (foldsVsites)
+            fusedDefines["FOLD_VSITES"] = "1";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
@@ -283,6 +369,11 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         for (int i = 0; i < MaxClearedBuffers; i++)
             langevinMiddleKernel->addArg(nullptr);
         langevinMiddleKernel->addArg(mm_int4(0, 0, 0, 0));
+        if (foldsVsites) {
+            langevinMiddleKernel->addArg(settleVsites);
+            langevinMiddleKernel->addArg(settleVsiteWeights);
+            langevinMiddleKernel->addArg(0); // Whether the kick adds the sites' forces: set just before it is executed.
+        }
     }
     bool clearBuffers = bindAutoclearBuffers();
     if (context.getUseMixedPrecision())
@@ -295,6 +386,12 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
     langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
     if (pendingCMVelocity != NULL)
         langevinMiddleKernel->setArg(19, *pendingCMVelocity);
+    if (foldsVsites) {
+        // A getState(Forces) since the force pass has already distributed the sites' forces into the buffer.
+        langevinMiddleKernel->setArg(VsiteShareArgument, vsiteForcesDistributed ? 0 : 1);
+        vsiteForcesDistributed = true;
+        vsitesPlacedByStep = true;
+    }
     langevinMiddleKernel->execute(max(numLangevinMiddleThreads, numClearThreads));
     if (clearBuffers)
         dynamic_cast<MetalContext&>(context).markAutoclearBuffersCleared();

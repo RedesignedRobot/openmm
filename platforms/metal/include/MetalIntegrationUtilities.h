@@ -64,9 +64,16 @@ public:
      */
     void computeVirtualSites();
     /**
-     * Distribute forces from virtual sites to the atoms they are based on.
+     * Distribute forces from virtual sites to the atoms they are based on.  When the fused LangevinMiddle kernel has
+     * folded the sites into their SETTLE clusters, this only notes that the force buffer holds undistributed forces:
+     * the next step adds each site's force to its atoms as it kicks them.
      */
     void distributeForcesFromVirtualSites();
+    /**
+     * Distribute the virtual sites' forces now if distributeForcesFromVirtualSites() left them in the buffer.  A
+     * download of the forces calls this first, so it sees the same forces as without the fold.
+     */
+    void ensureVirtualSiteForcesDistributed();
     /**
      * Update the positions and velocities for one LangevinMiddleIntegrator step and enforce the constraints, all in one
      * kernel.  This does nothing and returns false if CCMA enforces any of the constraints, or in double precision.
@@ -128,6 +135,7 @@ public:
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     bool bindAutoclearBuffers();
+    void runVsiteForceKernels();
     int* ccmaConvergedMemory;
     metalDeviceptr_t ccmaConvergedDeviceMemory;
     ComputeEvent ccmaEvent;
@@ -140,6 +148,9 @@ private:
     ComputeArray* pendingCMVelocity;
     bool prefetchesKineticEnergy, kineticEnergyQueued;
     long long kineticEnergyWorkCount;
+    ComputeArray settleVsites, settleVsiteWeights;
+    int numThreeParticleAverageSites;
+    bool foldsVsites, vsiteForcesDistributed, vsitesPlacedByStep;
 };
 
 } // namespace OpenMM
