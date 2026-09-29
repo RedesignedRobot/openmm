@@ -474,6 +474,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const bool forceInclude = b & 1;
                 const int block2 = b >> 1;
                 int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#ifdef ROLE_ORDER
+                // An atom is listed only for the x atoms it shares a role with.  The role regions are contiguous, so
+                // a block of LJ-only atoms against a block of charge-only atoms (water O against H/H/M) has no pair to
+                // test, and one ballot skips its atom test.  On tip4pew that was a third of the candidate blocks.
+                const int role2 = atomRoles[y*TILE_SIZE+indexInTile];
+                const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
+                if (BALLOT(roleFlags != 0) == 0)
+                    continue;
+#endif
 
                 #pragma unroll 1
                 for (int k = indexInTile; k < numExclusions; k += TILE_SIZE)
@@ -490,10 +499,6 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 }
 #endif
                 pos2.w = 0.5f * (pos2.x * pos2.x + pos2.y * pos2.y + pos2.z * pos2.z);
-#ifdef ROLE_ORDER
-                const int role2 = atomRoles[atom2];
-                const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
-#endif
                 real4 blockCenterY = sortedBlockCenter[block2];
                 real3 atomDelta = trimTo3(pos1)-trimTo3(blockCenterY);
 #ifdef USE_PERIODIC
