@@ -830,6 +830,7 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         encoder->setBytes(packed.data(), packed.size(), 0);
     }
     encoder->setThreadgroupMemoryLength((sharedSize+15)/16*16, 0);
+    queue.beforeDispatch();
     if (indirect != NULL)
         encoder->dispatchThreadgroups(indirect, indirectOffset, MTL::Size(blockSize, 1, 1));
     else

@@ -134,7 +134,7 @@ void MetalFFT3D::execFFT(ArrayInterface& in, ArrayInterface& out, bool forward) 
     MetalQueue& queue = context.getCurrentStream();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     VkFFTLaunchParams params = {};
-    params.commandEncoder = queue.getEncoder();
+    params.commandEncoder = queue.getSerialEncoder();
     VkFFTResult fftResult = VkFFTAppend(app, forward ? -1 : 1, &params);
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing VkFFTAppend: "+context.intToString(fftResult));

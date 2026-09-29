@@ -64,10 +64,21 @@ public:
         return lock;
     }
     MTL::ComputeCommandEncoder* getEncoder();
+    /**
+     * Get an encoder whose dispatches run in order, for code that encodes several dependent dispatches
+     * without calling beforeDispatch() (VkFFT).
+     */
+    MTL::ComputeCommandEncoder* getSerialEncoder();
+    /**
+     * Call right before each dispatch on the encoder getEncoder() returned.  In one-pass mode it encodes the
+     * barrier that a serial pass or a pass boundary would have given.
+     */
+    void beforeDispatch();
     MTL::CommandBuffer* getCommandBuffer();
     /**
      * Choose whether getEncoder() opens compute passes whose dispatches may run at the same time.  Changing
-     * it ends the current pass.
+     * it ends the current pass, except in one-pass mode, where serial and concurrent dispatches share one
+     * concurrent pass and barriers order them.
      */
     void setConcurrentDispatch(bool concurrent);
     /**
@@ -109,13 +120,14 @@ public:
         workCount++;
     }
 private:
+    void openEncoder(bool concurrent);
     void endEncoding();
     void submit();
     void runIdleCommits();
     metalStream_t stream;
     MTL::CommandBuffer* openBuffer;
     MTL::ComputeCommandEncoder* encoder;
-    bool concurrentDispatch;
+    bool concurrentDispatch, onePass, encoderConcurrent, encoderHasDispatch, lastDispatchConcurrent;
     std::deque<MTL::CommandBuffer*> pending;
     std::vector<MTL::HandlerFunction> completedHandlers;
     std::atomic<long long> commitCount;

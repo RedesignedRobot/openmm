@@ -25,6 +25,7 @@
 #include "MetalQueue.h"
 #include "MetalContext.h"
 #include "openmm/OpenMMException.h"
+#include <cstdlib>
 
 using namespace OpenMM;
 using namespace std;
@@ -35,7 +36,16 @@ static const int MaxBuffersInFlight = 8;
 
 atomic<long long> MetalQueue::workCount(0);
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false) {
+// Probe, screen only: OPENMM_METAL_ONE_PASS=1 encodes every compute dispatch of a command buffer into one
+// concurrent pass, with a buffer barrier wherever a serial pass or a pass boundary used to order them.
+static bool onePassRequested() {
+    const char* value = getenv("OPENMM_METAL_ONE_PASS");
+    return value != NULL && string(value) == "1";
+}
+
+MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false),
+        onePass(onePassRequested()), encoderConcurrent(false), encoderHasDispatch(false), lastDispatchConcurrent(false),
+        commitCount(0), stopCommitter(false) {
 }
 
 MetalQueue::~MetalQueue() {
@@ -57,13 +67,41 @@ MetalQueue::~MetalQueue() {
 
 MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
     workCount++;
-    if (encoder == NULL) {
-        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-        MTL::DispatchType type = (concurrentDispatch ? MTL::DispatchTypeConcurrent : MTL::DispatchTypeSerial);
-        encoder = getCommandBuffer()->computeCommandEncoder(type)->retain();
-        pool->release();
-    }
+    bool concurrent = (onePass || concurrentDispatch);
+    if (encoder != NULL && encoderConcurrent != concurrent)
+        endEncoding();
+    if (encoder == NULL)
+        openEncoder(concurrent);
     return encoder;
+}
+
+MTL::ComputeCommandEncoder* MetalQueue::getSerialEncoder() {
+    if (!onePass)
+        return getEncoder();
+    workCount++;
+    if (encoder != NULL && encoderConcurrent)
+        endEncoding();
+    if (encoder == NULL)
+        openEncoder(false);
+    return encoder;
+}
+
+void MetalQueue::openEncoder(bool concurrent) {
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::DispatchType type = (concurrent ? MTL::DispatchTypeConcurrent : MTL::DispatchTypeSerial);
+    encoder = getCommandBuffer()->computeCommandEncoder(type)->retain();
+    pool->release();
+    encoderConcurrent = concurrent;
+    encoderHasDispatch = false;
+}
+
+void MetalQueue::beforeDispatch() {
+    if (!onePass)
+        return;
+    if (encoderHasDispatch && !(concurrentDispatch && lastDispatchConcurrent))
+        encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+    encoderHasDispatch = true;
+    lastDispatchConcurrent = concurrentDispatch;
 }
 
 MTL::CommandBuffer* MetalQueue::getCommandBuffer() {
@@ -83,7 +121,8 @@ void MetalQueue::setConcurrentDispatch(bool concurrent) {
     lock_guard<recursive_mutex> guard(lock);
     if (concurrent == concurrentDispatch)
         return;
-    endEncoding();
+    if (!onePass)
+        endEncoding();
     concurrentDispatch = concurrent;
 }
 
