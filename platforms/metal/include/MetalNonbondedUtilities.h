@@ -169,6 +169,12 @@ public:
      */
     void checkRoleOrder(const NonbondedForce& force) const;
     /**
+     * In role order the nonbonded kernel accumulates into orderedForces, contiguous in nonbonded order, so its
+     * atomics do not interleave with the bonded kernel's on the context force buffer.  After the force pass this
+     * adds them into the context force buffer in a fixed order and clears them.  A no-op otherwise.
+     */
+    void scatterRoleForces();
+    /**
      * Given a nonbonded cutoff, get the padded cutoff distance used in computing
      * the neighbor list.
      */
@@ -355,7 +361,9 @@ private:
     // and orderedPosq holds the positions in nonbonded order for the neighbor list kernels.
     bool useRoleOrder = false;
     int numInteractions = 0;
-    MetalArray atomOrder, atomRoles, orderedPosq;
+    MetalArray atomOrder, atomRoles, orderedPosq, orderedForces;
+    bool roleForcesPending = false;
+    metalFunction_t scatterOrderedForcesKernel = NULL;
     std::vector<int> contextRoles;
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;

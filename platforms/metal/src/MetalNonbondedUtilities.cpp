@@ -358,7 +358,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     // Record arguments for kernels.
 
     MetalArray& listPosq = (useRoleOrder ? orderedPosq : context.unwrap(context.getPosq()));
-    forceArgs.push_back(&context.unwrap(context.getLongForceBuffer()).getDevicePointer());
+    forceArgs.push_back(useRoleOrder ? &orderedForces.getDevicePointer() : &context.unwrap(context.getLongForceBuffer()).getDevicePointer());
     forceArgs.push_back(&context.unwrap(context.getEnergyBuffer()).getDevicePointer());
     forceArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
     forceArgs.push_back(&exclusions.getDevicePointer());
@@ -557,9 +557,19 @@ bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
     atomOrder.initialize<int>(context, paddedNumAtoms, "atomOrder");
     atomRoles.initialize<int>(context, paddedNumAtoms, "atomRoles");
     orderedPosq.initialize(context, paddedNumAtoms, context.getPosq().getElementSize(), "orderedPosq");
+    orderedForces.initialize<unsigned long long>(context, 3*paddedNumAtoms, "orderedForces");
+    orderedForces.upload(vector<unsigned long long>(3*paddedNumAtoms, 0));
     atomOrder.upload(order);
     atomRoles.upload(orderedRoles);
     return true;
+}
+
+void MetalNonbondedUtilities::scatterRoleForces() {
+    if (!roleForcesPending)
+        return;
+    roleForcesPending = false;
+    void* args[] = {&orderedForces.getDevicePointer(), &atomOrder.getDevicePointer(), &context.unwrap(context.getLongForceBuffer()).getDevicePointer()};
+    context.executeKernelFlat(scatterOrderedForcesKernel, args, context.getPaddedNumAtoms(), 64);
 }
 
 double MetalNonbondedUtilities::getMaxCutoffDistance() {
@@ -662,6 +672,8 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         if (!hasInitializedParams)
             initParamArgs();
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        if (useRoleOrder && includeForces)
+            roleForcesPending = true;
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
@@ -867,8 +879,10 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
         kernels.copyInteractionCountsKernel = context.getKernel(interactingBlocksProgram, "copyInteractionCounts");
-        if (useRoleOrder)
+        if (useRoleOrder) {
             kernels.gatherOrderedPositionsKernel = context.getKernel(interactingBlocksProgram, "gatherOrderedPositions");
+            scatterOrderedForcesKernel = context.getKernel(interactingBlocksProgram, "scatterOrderedForces");
+        }
     }
     groupKernels[groups] = kernels;
 }

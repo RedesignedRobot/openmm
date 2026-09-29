@@ -849,4 +849,21 @@ extern "C" __global__ void gatherOrderedPositions(const real4* __restrict__ posq
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x)
         orderedPosq[i] = posq[atomOrder[i]];
 }
+
+/**
+ * Add the forces the nonbonded kernel accumulated in nonbonded order into the context force buffer, and clear them
+ * for the next step.  Runs after the force pass, so a plain add in a fixed order is exact.
+ */
+extern "C" __global__ void scatterOrderedForces(unsigned long long* __restrict__ orderedForces, const int* __restrict__ atomOrder,
+        unsigned long long* __restrict__ forceBuffers) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x) {
+        const int atom = atomOrder[i];
+        forceBuffers[atom] += orderedForces[i];
+        forceBuffers[atom+PADDED_NUM_ATOMS] += orderedForces[i+PADDED_NUM_ATOMS];
+        forceBuffers[atom+2*PADDED_NUM_ATOMS] += orderedForces[i+2*PADDED_NUM_ATOMS];
+        orderedForces[i] = 0;
+        orderedForces[i+PADDED_NUM_ATOMS] = 0;
+        orderedForces[i+2*PADDED_NUM_ATOMS] = 0;
+    }
+}
 #endif
