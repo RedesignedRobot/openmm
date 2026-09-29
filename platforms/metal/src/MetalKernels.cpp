@@ -49,6 +49,7 @@
 #include <iterator>
 #include <memory>
 #include <sstream>
+#include <typeinfo>
 #include <set>
 #include <assert.h>
 
@@ -214,10 +215,17 @@ void MetalIntegrateCustomStepKernel::initialize(const System& system, const Cust
 
 /**
  * Get whether a force leaves the velocities alone in updateContextState() and calcForcesAndEnergy().  Unknown forces,
- * thermostats, barostats and forces that evaluate an inner Context count as touching them.
+ * thermostats, other barostats and forces that evaluate an inner Context count as touching them.
+ *
+ * MonteCarloBarostat counts as leaving them alone.  Its trial reads only potential energies (the kinetic energy that
+ * getState() adds is dropped), and a rejected trial restores velm whole, so the velocities the integrator sees are the
+ * same whether the center of mass motion comes off before the trial or inside the integrator.  openmm.app adds the
+ * barostat after CMMotionRemover, so without this every system with one pays two extra dispatches per step.  The
+ * anisotropic, flexible and membrane barostats stay out: some of them read the kinetic energy inside a trial.
  */
 static bool ignoresVelocities(const Force& force) {
-    return dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
+    return typeid(force) == typeid(MonteCarloBarostat) ||
+           dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
            dynamic_cast<const PeriodicTorsionForce*>(&force) != NULL || dynamic_cast<const RBTorsionForce*>(&force) != NULL ||
            dynamic_cast<const CMAPTorsionForce*>(&force) != NULL || dynamic_cast<const NonbondedForce*>(&force) != NULL ||
            dynamic_cast<const GBSAOBCForce*>(&force) != NULL || dynamic_cast<const CustomBondForce*>(&force) != NULL ||
