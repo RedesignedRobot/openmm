@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unistd.h>
 #include <map>
@@ -316,6 +317,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             maxSinglePairs = maxPossiblePairs;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
         numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
+        if (getenv("OPENMM_METAL_TIB") != NULL)  // scratch ablation (r3-explicit)
+            numTilesInBatch = atoi(getenv("OPENMM_METAL_TIB"));
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
