@@ -97,7 +97,6 @@ void MetalBondedUtilities::initialize(const System& system) {
         if (planSize*sizeof(unsigned int) > maxPlanBytes)
             continue;
         vector<unsigned int> terms(numEvaluations);
-        vector<vector<int> > evaluationAtoms(numEvaluations);
         vector<unsigned int> next(blockStart.begin(), blockStart.end()-1);
         for (int term = 0; term < numTerms; term++) {
             int home = atoms[term][0]/blockSize;
@@ -105,14 +104,12 @@ void MetalBondedUtilities::initialize(const System& system) {
                 int block = termBlocks[i];
                 int position = next[block]++;
                 terms[position] = term | (block == home ? 0 : NotHomeBit);
-                evaluationAtoms[position] = atoms[term];
             }
         }
         blockStartOffset[force] = planData.size();
         planData.insert(planData.end(), blockStart.begin(), blockStart.end());
         termOffset[force] = planData.size();
         planData.insert(planData.end(), terms.begin(), terms.end());
-        forceAtoms[force] = evaluationAtoms;
         lastBlockForce = force;
     }
     if (lastBlockForce != -1) {
@@ -177,12 +174,13 @@ string MetalBondedUtilities::createBlockSource(int forceIndex, int numAtoms, int
     s<<"    for (unsigned int position = "<<planArgument<<"["<<blockStartOffset[forceIndex]<<"+block]+LOCAL_ID; position < "<<planArgument<<"["<<blockStartOffset[forceIndex]<<"+block+1]; position += LOCAL_SIZE) {\n";
     s<<"    unsigned int term = "<<planArgument<<"["<<termOffset[forceIndex]<<"+position];\n";
     s<<"    unsigned int index = term & "<<(~NotHomeBit)<<"u;\n";
+    // Atoms load by term, like the parameters, so the index arrays hold one entry per term, not per evaluation.
     int startAtom = 0;
     for (int i = 0; i < (int) atomIndices[forceIndex].size(); i++) {
         int indexWidth = atomIndices[forceIndex][i].getElementSize()/4;
         string* suffix = (indexWidth == 1 ? suffix1 : suffix4);
         string indexType = (indexWidth == 1 ? "unsigned int" : "uint"+context.intToString(indexWidth));
-        s<<"    "<<indexType<<" atoms"<<i<<" = atomIndices"<<forceIndex<<"_"<<i<<"[position];\n";
+        s<<"    "<<indexType<<" atoms"<<i<<" = atomIndices"<<forceIndex<<"_"<<i<<"[index];\n";
         int atomsToLoad = min(indexWidth, numAtoms-startAtom);
         for (int j = 0; j < atomsToLoad; j++) {
             s<<"    unsigned int atom"<<(startAtom+j+1)<<" = atoms"<<i<<suffix[j]<<";\n";
