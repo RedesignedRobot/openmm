@@ -101,6 +101,9 @@ public:
     MTL::ComputeCommandEncoder* getOpenEncoder() {
         return encoder;
     }
+    bool isConcurrentDispatch() const {
+        return concurrentDispatch;
+    }
     void endEncoding();
 private:
     void submit();

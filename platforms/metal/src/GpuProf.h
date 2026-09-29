@@ -7,8 +7,10 @@
 //             written as "e <name> <grid> <block> <gpu tick start> <gpu tick end>". Blits are sampled too.
 //             "c <cpu tick> <gpu tick>" pairs from sampleTimestamps map GPU ticks onto mach ticks.
 //             A command buffer that reaches MaxEncoders sampled encoders is committed early, so no sample is lost.
-//   split:    as buffers, with one encoder per dispatch but no samples, to price the split alone. The split also
-//             removes the overlap of a concurrent pass (MetalQueue::setConcurrentDispatch), so its price includes that.
+//   split:    as buffers, with one encoder per dispatch but no samples, to price the split alone.
+//   A concurrent pass (MetalQueue::setConcurrentDispatch, D3's bonded plus nonbonded) stays one encoder in counters
+//   and split modes, recorded as "e first+second 0 0 ...", so its dispatches still overlap. GPUPROF_SPLIT_CONCURRENT
+//   splits it too, to price each of its kernels alone; the split price then includes the lost overlap.
 //   kernels:  every dispatch is committed and waited on by itself: "k <name> <grid> <block> <seconds>".
 #pragma once
 #include <Metal/Metal.hpp>
@@ -31,6 +33,7 @@ struct Samples {
     MTL::CounterSampleBuffer* buffer = NULL;
     std::vector<std::string> names;
     int dispatches = 0, blits = 0, overflow = 0;
+    bool passOpen = false;  // the last sampled encoder is a concurrent pass still taking dispatches
 };
 
 // 2048 timestamps are 16 KB, under the 32 KB limit of one counter sample buffer.
@@ -225,6 +228,7 @@ template <class Queue>
 inline void timeDispatch(Queue& queue, const std::string& name, int grid, int block) {
     if (batched()) {
         MTL::CommandBuffer* buffer = queue.getOpenBuffer();
+        bool keepPass = (state().mode != Buffers && queue.isConcurrentDispatch() && getenv("GPUPROF_SPLIT_CONCURRENT") == NULL);
         {
             std::lock_guard<std::mutex> guard(state().lock);
             if (state().first.empty())
@@ -232,10 +236,16 @@ inline void timeDispatch(Queue& queue, const std::string& name, int grid, int bl
             state().last = name;
             Samples& s = samplesFor(buffer);
             s.dispatches++;
-            if (state().mode == Counters && !s.names.empty() && s.names.back() == "unlabeled")
-                s.names.back() = name+" "+std::to_string(grid)+" "+std::to_string(block);
+            if (state().mode == Counters && !s.names.empty()) {
+                std::string& label = s.names.back();
+                if (label == "unlabeled")
+                    label = name+" "+std::to_string(grid)+" "+std::to_string(block);
+                else if (s.passOpen)
+                    label = label.substr(0, label.find(' '))+"+"+name+" 0 0";
+            }
+            s.passOpen = keepPass;
         }
-        if (state().mode != Buffers) {
+        if (state().mode != Buffers && !keepPass) {
             if (queue.getOpenEncoder() != NULL) {
                 NS::String* label = NS::String::alloc()->init(name.c_str(), NS::UTF8StringEncoding);
                 queue.getOpenEncoder()->setLabel(label);
