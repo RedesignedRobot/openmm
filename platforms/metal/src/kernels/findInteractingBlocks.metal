@@ -661,9 +661,9 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
         unsigned int* __restrict__ dispatch) {
 #ifndef SORT_BLOCKS_BY_BINS
+    __shared__ unsigned char blockBin[NUM_BLOCKS];
     __shared__ unsigned int simdCounts[32*NUM_SIZE_BINS];
     __shared__ unsigned int binStart[NUM_SIZE_BINS];
-    __shared__ unsigned int binCount[NUM_SIZE_BINS];
 #endif
     __shared__ bool anyMoved;
     if (threadIdx.x == 0)
@@ -707,60 +707,78 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
     if (!rebuild)
         return;
 
-    // A stable counting sort over computeSortKeys' size bins, one block per thread per chunk.  The first pass
-    // counts each bin and the second places each block after the earlier blocks of its bin, so sortedBlocks
-    // holds computeSortKeys' keys in sorted order.  The rank sort this replaced compared every pair of keys,
-    // 23 us per rebuild at 921 blocks on an M3 Ultra.
+    // A stable counting sort over computeSortKeys' size bins, so sortedBlocks holds its keys in sorted order.
+    // Each SIMD group owns one contiguous run of blocks.  It counts its run per bin, one pass over the per-SIMD
+    // counts gives every run its offset inside each bin, and each SIMD group then places its run in order.
+    // Two barriers in all: one threadgroup runs on one core, so barriers and global loads set the time.
+    // The rank sort this replaced compared every pair of keys, 23 us per rebuild at 921 blocks on an M3 Ultra.
 
     const int lane = threadIdx.x%32;
     const int simd = threadIdx.x/32;
     const int numSimds = (blockDim.x+31)/32;
+    const unsigned int perSimd = (NUM_BLOCKS+numSimds-1)/numSimds;
+    const unsigned int first = min(simd*perSimd, (unsigned int) NUM_BLOCKS);
+    const unsigned int last = min(first+perSimd, (unsigned int) NUM_BLOCKS);
     real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
     real scale = NUM_SIZE_BINS/(sizeRange.y-sizeRange.x);
-    for (int pass = 0; pass < 2; pass++) {
-        if (threadIdx.x < NUM_SIZE_BINS)
-            binCount[threadIdx.x] = 0;
-        __syncthreads();
-        for (unsigned int base = 0; base < NUM_BLOCKS; base += blockDim.x) {
-            const unsigned int i = base+threadIdx.x;
-            int bin = -1;
-            if (i < NUM_BLOCKS) {
-                real4 box = blockBoundingBox[i];
-                real size = LOG(box.x+box.y+box.z);
-                bin = (size-sizeRange.x)*scale;
-                bin = max(0, min(bin, NUM_SIZE_BINS-1));
-            }
-            unsigned int rank = 0;
-            for (int b = 0; b < NUM_SIZE_BINS; b++) {
-                unsigned int bits = BALLOT(bin == b);
-                if (bin == b)
-                    rank = __popc(bits & ((1u<<lane)-1));
-                if (lane == 0)
-                    simdCounts[simd*NUM_SIZE_BINS+b] = __popc(bits);
-            }
-            __syncthreads();
-            if (pass == 1 && bin >= 0) {
-                rank += binStart[bin]+binCount[bin];
-                for (int w = 0; w < simd; w++)
-                    rank += simdCounts[w*NUM_SIZE_BINS+bin];
-                sortedBlocks[rank] = (((unsigned int) bin)<<BIN_SHIFT) + i;
-            }
-            __syncthreads();
-            if (threadIdx.x < NUM_SIZE_BINS) {
-                unsigned int count = 0;
-                for (int w = 0; w < numSimds; w++)
-                    count += simdCounts[w*NUM_SIZE_BINS+threadIdx.x];
-                binCount[threadIdx.x] += count;
-            }
-            __syncthreads();
+
+    // Lane b keeps bin b's count for this SIMD group's run.
+    unsigned int count = 0;
+    for (unsigned int base = first; base < last; base += 32) {
+        const unsigned int i = base+lane;
+        int bin = -1;
+        if (i < last) {
+            real4 box = blockBoundingBox[i];
+            real size = LOG(box.x+box.y+box.z);
+            bin = (size-sizeRange.x)*scale;
+            bin = max(0, min(bin, NUM_SIZE_BINS-1));
+            blockBin[i] = bin;
         }
-        if (pass == 0 && threadIdx.x < NUM_SIZE_BINS) {
-            unsigned int start = 0;
-            for (int b = 0; b < (int) threadIdx.x; b++)
-                start += binCount[b];
-            binStart[threadIdx.x] = start;
+        for (int b = 0; b < NUM_SIZE_BINS; b++) {
+            unsigned int n = __popc(BALLOT(bin == b));
+            if (lane == b)
+                count += n;
         }
-        __syncthreads();
+    }
+    if (lane < NUM_SIZE_BINS)
+        simdCounts[simd*NUM_SIZE_BINS+lane] = count;
+    __syncthreads();
+
+    // SIMD group 0, lane b: bin b's per-run counts become offsets inside the bin, and the bin totals become
+    // bin starts.  All 32 lanes take part in the prefix sum.
+    if (simd == 0) {
+        unsigned int total = 0;
+        if (lane < NUM_SIZE_BINS) {
+            for (int w = 0; w < numSimds; w++) {
+                unsigned int n = simdCounts[w*NUM_SIZE_BINS+lane];
+                simdCounts[w*NUM_SIZE_BINS+lane] = total;
+                total += n;
+            }
+        }
+        unsigned int start = simd_prefix_exclusive_sum(total);
+        if (lane < NUM_SIZE_BINS)
+            binStart[lane] = start;
+    }
+    __syncthreads();
+
+    // Lane b keeps the next free slot of bin b for this run.
+    unsigned int next = 0;
+    if (lane < NUM_SIZE_BINS)
+        next = binStart[lane]+simdCounts[simd*NUM_SIZE_BINS+lane];
+    for (unsigned int base = first; base < last; base += 32) {
+        const unsigned int i = base+lane;
+        const int bin = (i < last ? (int) blockBin[i] : -1);
+        unsigned int slot = 0;
+        for (int b = 0; b < NUM_SIZE_BINS; b++) {
+            unsigned int bits = BALLOT(bin == b);
+            unsigned int binNext = SHFL(next, (ushort) b);
+            if (bin == b)
+                slot = binNext+__popc(bits & ((1u<<lane)-1));
+            if (lane == b)
+                next += __popc(bits);
+        }
+        if (bin >= 0)
+            sortedBlocks[slot] = (((unsigned int) bin)<<BIN_SHIFT) + i;
     }
 #endif
 }
