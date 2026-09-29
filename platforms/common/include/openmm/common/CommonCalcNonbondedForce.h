@@ -122,6 +122,8 @@ private:
      * on energy steps), the inverse FFT and force interpolation.
      */
     void computeReciprocalFromGrid(bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
+    void interpolatePmeForces(const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
+    void addPmePhases(const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
     ComputeContext& cc;
     ForceInfo* info;
     bool hasInitializedKernel;
@@ -174,7 +176,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
+    bool usePmeQueue, deferPmeInterpolation, deferPmeSpread, usePmePhases, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;

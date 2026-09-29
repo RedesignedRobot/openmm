@@ -86,6 +86,21 @@ public:
             ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor) {
         return false;
     }
+    /**
+     * Run one of the three stages of execPmeConvolution(): 0 is the forward transform, 1 the convolution and 2 the
+     * inverse transform.  Each stage reads what the one before it wrote, so a caller that runs them apart must
+     * order them itself.  Returns false without doing anything where execPmeConvolution() would.
+     */
+    virtual bool execPmeConvolutionStage(int stage, ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX,
+            ArrayInterface& moduliY, ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor) {
+        return false;
+    }
+    /**
+     * Get whether execPmeConvolution() and execPmeConvolutionStage() run for this transform.
+     */
+    virtual bool getSupportsPmeConvolution() const {
+        return false;
+    }
 };
 
 typedef std::shared_ptr<FFT3DImpl> FFT3D;

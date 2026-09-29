@@ -83,6 +83,12 @@ void MetalQueue::setConcurrentDispatch(bool concurrent) {
     concurrentDispatch = concurrent;
 }
 
+void MetalQueue::memoryBarrier() {
+    lock_guard<recursive_mutex> guard(lock);
+    if (encoder != NULL && concurrentDispatch)
+        encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
 void MetalQueue::endEncoding() {
     if (encoder != NULL) {
         encoder->endEncoding();

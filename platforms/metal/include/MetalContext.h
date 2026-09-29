@@ -524,6 +524,33 @@ public:
         afterForcePass.push_back(work);
     }
     /**
+     * Add a phase to the next force pass.  The nonbonded kernel runs as one slice per phase plus a first slice, and
+     * each phase's work starts after a barrier, beside the next slice, in the order added.  A phase's work may read
+     * everything encoded before it, but the slices beside it must not read what it writes, and it may add to the
+     * force buffers only with integer atomics.  fraction is the share of nonbonded thread blocks in the phase's
+     * slice; the first slice gets the rest.
+     */
+    bool getSupportsForcePassPhases() const {
+        return getSupportsForcePassKernels();
+    }
+    void addForcePassPhase(std::function<void()> work, double fraction) {
+        forcePassPhases.push_back(ForcePassPhase{work, fraction});
+    }
+    /**
+     * Get the nonbonded kernel's share of thread blocks in each slice of the next force pass, first slice first.
+     * It is {1} when the pass has no phases.
+     */
+    std::vector<double> getForcePassSliceFractions() const;
+    /**
+     * Put a barrier in the pass and run the next phase given to addForcePassPhase(), if any is left.
+     */
+    void runNextForcePassPhase();
+    /**
+     * Run every phase not yet run, each after a barrier, and clear the list.  The force pass calls this after the
+     * nonbonded kernel, which may not have run.
+     */
+    void finishForcePassPhases();
+    /**
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
      */
     void executeForcePassKernels();
@@ -566,6 +593,12 @@ private:
     bool useBlockingSync, contextIsValid;
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
     std::vector<std::function<void()> > afterForcePass;
+    struct ForcePassPhase {
+        std::function<void()> work;
+        double fraction;
+    };
+    std::vector<ForcePassPhase> forcePassPhases;
+    int nextForcePassPhase = 0;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;

@@ -71,6 +71,11 @@ public:
      */
     void setConcurrentDispatch(bool concurrent);
     /**
+     * Make every dispatch encoded after this wait for every dispatch encoded before it in the open concurrent
+     * pass.  Serial passes already run their dispatches in order, so there it does nothing.
+     */
+    void memoryBarrier();
+    /**
      * Run a function when the next command buffer to be committed completes.  It is attached at commit time,
      * so callers never touch the open command buffer or its encoder.
      */

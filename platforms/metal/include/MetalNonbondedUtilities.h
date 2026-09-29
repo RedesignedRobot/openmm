@@ -358,6 +358,8 @@ private:
     bool useLJPME = false;
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
+    unsigned int forceBlockOffset = 0;
+    bool kernelTakesBlockOffset = false;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     int uncommittedSteps;
     long long numTiles, commitCountAfterLastStep;

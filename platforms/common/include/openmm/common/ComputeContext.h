@@ -644,6 +644,20 @@ public:
         work();
     }
     /**
+     * Get whether addForcePassPhase() is available.
+     */
+    virtual bool getSupportsForcePassPhases() const {
+        return false;
+    }
+    /**
+     * Run work inside the next pass that computes bonded and nonbonded forces, after a barrier, beside a slice of
+     * the nonbonded kernel that gets the given share of its thread blocks.  Phases run in the order added.  Only
+     * call this where getSupportsForcePassPhases() returns true.
+     */
+    virtual void addForcePassPhase(std::function<void()> work, double fraction) {
+        throw OpenMMException("addForcePassPhase() is not supported on this platform");
+    }
+    /**
      * Register a global parameter whose value should be stored in the array returned by
      * getGlobalParamValues().  This may safely be called multiple times with the same
      * parameter name, and it returns the same index each time.

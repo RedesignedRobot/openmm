@@ -89,6 +89,14 @@ public:
     bool execPmeConvolution(ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX, ArrayInterface& moduliY,
             ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor);
     /**
+     * Run one of execPmeConvolution()'s three kernels.  See FFT3DImpl::execPmeConvolutionStage().
+     */
+    bool execPmeConvolutionStage(int stage, ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX,
+            ArrayInterface& moduliY, ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor);
+    bool getSupportsPmeConvolution() const {
+        return usePmeConvolution;
+    }
+    /**
      * Get whether execPmeConvolution() can run for a real-to-complex transform of this size.
      */
     static bool canUsePmeConvolution(MetalContext& context, int xsize, int ysize, int zsize);

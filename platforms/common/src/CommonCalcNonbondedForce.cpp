@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <assert.h>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 
@@ -485,7 +487,13 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 bool forcePass = (!usePmeQueue && !doLJPME && cc.getSupportsForcePassKernels());
                 deferPmeSpread = (forcePass && !useFixedPointChargeSpreading);
                 deferPmeInterpolation = (forcePass && !deferPmeSpread);
-                if (deferPmeInterpolation)
+
+                // Where the platform can split the pass into phases and the FFT runs the convolution as three
+                // kernels, those kernels and interpolation go inside the pass too on steps without energy, each
+                // after a barrier and beside its own slice of the nonbonded kernel.
+
+                usePmePhases = (deferPmeSpread && cc.getSupportsForcePassPhases() && fft->getSupportsPmeConvolution());
+                if (deferPmeInterpolation || usePmePhases)
                     pmeDefines["ATOMIC_PME_FORCES"] = "1";
                 if (usePmeQueue) {
                     pmeDefines["USE_PME_STREAM"] = "1";
@@ -765,6 +773,10 @@ void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeEnerg
         pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
         fft->execFFT(pmeGrid2, pmeGrid1, false);
     }
+    interpolatePmeForces(recipBoxVectors, recipBoxVectorsFloat);
+}
+
+void CommonCalcNonbondedForceKernel::interpolatePmeForces(const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat) {
     setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
     if (cc.getUseDoublePrecision()) {
         pmeInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
@@ -782,6 +794,21 @@ void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeEnerg
         cc.addForcePassKernel(pmeInterpolateForceKernel, cc.getNumAtoms());
     else
         pmeInterpolateForceKernel->execute(cc.getNumAtoms());
+}
+
+void CommonCalcNonbondedForceKernel::addPmePhases(const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat) {
+    // PROBE ONLY: the nonbonded share beside each phase comes from R3PME_SLICES while the fractions are swept.
+    double fractions[4] = {0.15, 0.15, 0.15, 0.15};
+    if (const char* env = getenv("R3PME_SLICES"))
+        sscanf(env, "%lf,%lf,%lf,%lf", &fractions[0], &fractions[1], &fractions[2], &fractions[3]);
+    vector<mm_double4> box(recipBoxVectors, recipBoxVectors+3);
+    vector<mm_float4> boxFloat(recipBoxVectorsFloat, recipBoxVectorsFloat+3);
+    double recipExpFactor = M_PI*M_PI/(alpha*alpha);
+    for (int stage = 0; stage < 3; stage++)
+        cc.addForcePassPhase([=] () {
+            fft->execPmeConvolutionStage(stage, pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, box.data(), recipExpFactor);
+        }, fractions[stage]);
+    cc.addForcePassPhase([=] () { interpolatePmeForces(box.data(), boxFloat.data()); }, fractions[3]);
 }
 
 double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal) {
@@ -1061,7 +1088,10 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             }
             if (deferPmeSpread) {
                 cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
-                cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
+                if (usePmePhases && !includeEnergy)
+                    addPmePhases(recipBoxVectors, recipBoxVectorsFloat);
+                else
+                    cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
             }
             else {
                 pmeSpreadChargeKernel->execute(cc.getNumAtoms());

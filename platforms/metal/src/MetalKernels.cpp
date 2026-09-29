@@ -103,7 +103,8 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // pass kernels either write only a buffer no other pass kernel touches (PME charge spreading into its
     // grid) or add to the force buffer only with integer atomics (PME interpolation).  Work that reads what the
     // pass wrote (the rest of the PME chain after spreading) runs right after it, before the post computations
-    // and virtual site force distribution.
+    // and virtual site force distribution, or inside the pass as phases between barriers, each beside a slice of
+    // the nonbonded kernel (MetalContext::addForcePassPhase()).
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
@@ -112,6 +113,7 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+        cu.finishForcePassPhases();
     }
     cu.executeAfterForcePass();
     double sum = 0.0;

@@ -81,9 +81,12 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         const real4* __restrict__ blockSize, const unsigned int* __restrict__ interactingAtoms, unsigned int maxSinglePairs,
         const int2* __restrict__ singlePairs
 #endif
-        PARAMETER_ARGUMENTS) {
-    const unsigned int totalWarps = (blockDim.x*gridDim.x)/TILE_SIZE;
-    const unsigned int warp = blockIdx.x*(THREAD_BLOCK_SIZE/TILE_SIZE) + threadIdx.x/TILE_SIZE; // global warpIndex
+        PARAMETER_ARGUMENTS, unsigned int forceBlockOffset) {
+    // The kernel may run as several dispatches that each cover a range of NUM_FORCE_BLOCKS blocks, starting at
+    // forceBlockOffset, so the work split depends only on the block's index among all of them.
+    const unsigned int forceBlock = blockIdx.x+forceBlockOffset;
+    const unsigned int totalWarps = (THREAD_BLOCK_SIZE*NUM_FORCE_BLOCKS)/TILE_SIZE;
+    const unsigned int warp = forceBlock*(THREAD_BLOCK_SIZE/TILE_SIZE) + threadIdx.x/TILE_SIZE; // global warpIndex
     const unsigned int tgx = threadIdx.x & (TILE_SIZE-1); // index within the warp
     mixed energy = 0;
     INIT_DERIVATIVES
@@ -489,7 +492,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     const unsigned int numPairs = interactionCount[1];
     if (numPairs > maxSinglePairs)
         return; // There wasn't enough memory for the neighbor list.
-    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < numPairs; i += blockDim.x*gridDim.x) {
+    for (int i = forceBlock*blockDim.x+threadIdx.x; i < numPairs; i += blockDim.x*NUM_FORCE_BLOCKS) {
         int2 pair = singlePairs[i];
         int atom1 = pair.x;
         int atom2 = pair.y;
@@ -537,7 +540,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     }
 #endif
 #ifdef INCLUDE_ENERGY
-    energyBuffer[blockIdx.x*blockDim.x+threadIdx.x] += energy;
+    energyBuffer[forceBlock*blockDim.x+threadIdx.x] += energy;
 #endif
     SAVE_DERIVATIVES
 }

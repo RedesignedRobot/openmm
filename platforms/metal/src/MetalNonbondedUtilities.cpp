@@ -383,6 +383,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         forceArgs.push_back(NULL);
     if (energyParameterDerivatives.size() > 0)
         forceArgs.push_back(&context.unwrap(context.getEnergyParamDerivBuffer()).getDevicePointer());
+    forceArgs.push_back(&forceBlockOffset);
     if (useCutoff) {
         findBlockBoundsArgs.push_back(&numAtoms);
         findBlockBoundsArgs.push_back(context.getPeriodicBoxSizePointer());
@@ -548,7 +549,24 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         if (!hasInitializedParams)
             initParamArgs();
-        context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        // With force pass phases, the kernel runs as one slice per phase plus a first one, each phase between two
+        // slices.  Energy and energy parameter derivatives are summed per thread, so those steps run it whole.
+        vector<double> fractions = context.getForcePassSliceFractions();
+        if (includeEnergy || energyParameterDerivatives.size() > 0 || !kernelTakesBlockOffset)
+            fractions = {1.0};
+        int firstBlock = 0;
+        double cumulative = 0;
+        for (int slice = 0; slice < fractions.size(); slice++) {
+            cumulative += fractions[slice];
+            int endBlock = (slice == fractions.size()-1 ? numForceThreadBlocks : min(numForceThreadBlocks, (int) round(cumulative*numForceThreadBlocks)));
+            if (slice > 0)
+                context.runNextForcePassPhase();
+            if (endBlock > firstBlock) {
+                forceBlockOffset = firstBlock;
+                context.executeKernelFlat(kernel, &forceArgs[0], (endBlock-firstBlock)*forceThreadBlockSize, forceThreadBlockSize);
+            }
+            firstBlock = max(firstBlock, endBlock);
+        }
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
@@ -886,6 +904,7 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
     if (includeEnergy)
         defines["INCLUDE_ENERGY"] = "1";
     defines["THREAD_BLOCK_SIZE"] = context.intToString(forceThreadBlockSize);
+    defines["NUM_FORCE_BLOCKS"] = context.intToString(numForceThreadBlocks);
     double maxCutoff = 0.0;
     for (int i = 0; i < 32; i++) {
         if ((groups&(1<<i)) != 0) {
@@ -915,4 +934,6 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
 
 void MetalNonbondedUtilities::setKernelSource(const string& source) {
     kernelSource = source;
+    // Only the default source takes forceBlockOffset, so only it can run in slices.
+    kernelTakesBlockOffset = (source == MetalKernelSources::nonbonded);
 }

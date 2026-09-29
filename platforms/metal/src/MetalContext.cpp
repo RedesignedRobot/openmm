@@ -888,3 +888,26 @@ void MetalContext::executeAfterForcePass() {
         work();
     afterForcePass.clear();
 }
+
+vector<double> MetalContext::getForcePassSliceFractions() const {
+    vector<double> fractions = {1.0};
+    for (const ForcePassPhase& phase : forcePassPhases) {
+        fractions[0] -= phase.fraction;
+        fractions.push_back(phase.fraction);
+    }
+    return fractions;
+}
+
+void MetalContext::runNextForcePassPhase() {
+    if (nextForcePassPhase == forcePassPhases.size())
+        return;
+    getCurrentStream().memoryBarrier();
+    forcePassPhases[nextForcePassPhase++].work();
+}
+
+void MetalContext::finishForcePassPhases() {
+    while (nextForcePassPhase < forcePassPhases.size())
+        runNextForcePassPhase();
+    forcePassPhases.clear();
+    nextForcePassPhase = 0;
+}

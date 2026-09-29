@@ -218,29 +218,43 @@ static void executePerGroup(ComputeKernel& kernel, int groups) {
 
 bool MetalFFT3D::execPmeConvolution(ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX, ArrayInterface& moduliY,
         ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor) {
+    for (int stage = 0; stage < 3; stage++)
+        if (!execPmeConvolutionStage(stage, grid, scratch, moduliX, moduliY, moduliZ, recipBoxVectors, recipExpFactor))
+            return false;
+    return true;
+}
+
+bool MetalFFT3D::execPmeConvolutionStage(int stage, ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX,
+        ArrayInterface& moduliY, ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor) {
     if (!usePmeConvolution)
         return false;
     if (!planesForwardKernel)
         createPmeConvolution();
-    planesForwardKernel->setArg(0, grid);
-    planesForwardKernel->setArg(1, scratch);
-    planesForwardKernel->setArg(2, rootsY);
-    planesForwardKernel->setArg(3, rootsZ);
-    executePerGroup(planesForwardKernel, xsize);
-    convolveLinesKernel->setArg(0, scratch);
-    convolveLinesKernel->setArg(1, rootsX);
-    convolveLinesKernel->setArg(2, moduliX);
-    convolveLinesKernel->setArg(3, moduliY);
-    convolveLinesKernel->setArg(4, moduliZ);
-    for (int i = 0; i < 3; i++)
-        convolveLinesKernel->setArg(5+i, mm_float4((float) recipBoxVectors[i].x, (float) recipBoxVectors[i].y, (float) recipBoxVectors[i].z, 0));
-    convolveLinesKernel->setArg(8, (float) recipExpFactor);
-    executePerGroup(convolveLinesKernel, ysize);
-    planesInverseKernel->setArg(0, scratch);
-    planesInverseKernel->setArg(1, grid);
-    planesInverseKernel->setArg(2, rootsY);
-    planesInverseKernel->setArg(3, rootsZ);
-    executePerGroup(planesInverseKernel, xsize);
+    if (stage == 0) {
+        planesForwardKernel->setArg(0, grid);
+        planesForwardKernel->setArg(1, scratch);
+        planesForwardKernel->setArg(2, rootsY);
+        planesForwardKernel->setArg(3, rootsZ);
+        executePerGroup(planesForwardKernel, xsize);
+    }
+    else if (stage == 1) {
+        convolveLinesKernel->setArg(0, scratch);
+        convolveLinesKernel->setArg(1, rootsX);
+        convolveLinesKernel->setArg(2, moduliX);
+        convolveLinesKernel->setArg(3, moduliY);
+        convolveLinesKernel->setArg(4, moduliZ);
+        for (int i = 0; i < 3; i++)
+            convolveLinesKernel->setArg(5+i, mm_float4((float) recipBoxVectors[i].x, (float) recipBoxVectors[i].y, (float) recipBoxVectors[i].z, 0));
+        convolveLinesKernel->setArg(8, (float) recipExpFactor);
+        executePerGroup(convolveLinesKernel, ysize);
+    }
+    else {
+        planesInverseKernel->setArg(0, scratch);
+        planesInverseKernel->setArg(1, grid);
+        planesInverseKernel->setArg(2, rootsY);
+        planesInverseKernel->setArg(3, rootsZ);
+        executePerGroup(planesInverseKernel, xsize);
+    }
     return true;
 }
 
