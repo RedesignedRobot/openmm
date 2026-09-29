@@ -337,7 +337,7 @@ private:
     MetalArray largeBlockBoundingBox;
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
-    MetalArray displacementFlags, rebuildDispatch;
+    MetalArray blockDisplacement, listCheck, rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
     ComputeSort blockSorter;
@@ -356,6 +356,8 @@ private:
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams, waitForCount;
     bool useLJPME = false;
+    // The box at the last step, since verifyList compares distances at the build in the current box.
+    mm_double4 lastBoxSize = mm_double4(0, 0, 0, 0);
     int startTileIndex, startBlockIndex, numBlocks, numTilesInBatch, maxExclusions;
     int numForceThreadBlocks, forceThreadBlockSize, findInteractingBlocksThreadBlockSize, numAtoms, groupFlags, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
@@ -373,7 +375,7 @@ public:
     bool hasForces;
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
-    metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
+    metalFunction_t findBlockBoundsKernel, verifyListKernel, prepareRebuildDispatchKernel;
     metalFunction_t countBlockBinsKernel, sumBlockBinsKernel, scatterBlocksKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;
