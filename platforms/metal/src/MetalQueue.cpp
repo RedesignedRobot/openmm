@@ -24,6 +24,7 @@
 
 #include "MetalQueue.h"
 #include "MetalContext.h"
+#include "GpuProf.h"
 #include "openmm/OpenMMException.h"
 
 using namespace OpenMM;
@@ -57,7 +58,7 @@ MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
     if (encoder == NULL) {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         MTL::DispatchType type = (concurrentDispatch ? MTL::DispatchTypeConcurrent : MTL::DispatchTypeSerial);
-        encoder = getCommandBuffer()->computeCommandEncoder(type)->retain();
+        encoder = gpuprof::newEncoder(getCommandBuffer(), type);
         pool->release();
     }
     return encoder;
@@ -99,8 +100,10 @@ void MetalQueue::addCompletedHandler(const MTL::HandlerFunction& handler) {
 void MetalQueue::commit() {
     lock_guard<recursive_mutex> guard(lock);
     submit();
-    if ((int) pending.size() > MaxBuffersInFlight)
+    if ((int) pending.size() > MaxBuffersInFlight) {
+        gpuprof::Wait w("inflight");
         pending.front()->waitUntilCompleted();
+    }
     while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
         MTL::CommandBuffer* buffer = pending.front();
         pending.pop_front();
@@ -116,6 +119,7 @@ void MetalQueue::submit() {
         for (const MTL::HandlerFunction& handler : completedHandlers)
             openBuffer->addCompletedHandler(handler);
         completedHandlers.clear();
+        gpuprof::watch(openBuffer);
         openBuffer->commit();
         pending.push_back(openBuffer);
         openBuffer = NULL;
@@ -126,8 +130,11 @@ void MetalQueue::submit() {
 void MetalQueue::finish() {
     lock_guard<recursive_mutex> guard(lock);
     commit();
-    for (MTL::CommandBuffer* buffer : pending)
-        buffer->waitUntilCompleted();
+    {
+        gpuprof::Wait w("finish");
+        for (MTL::CommandBuffer* buffer : pending)
+            buffer->waitUntilCompleted();
+    }
     commit();
 }
 

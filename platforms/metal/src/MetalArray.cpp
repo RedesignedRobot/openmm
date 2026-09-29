@@ -25,6 +25,7 @@
 
 #include "MetalArray.h"
 #include "MetalContext.h"
+#include "GpuProf.h"
 #include "openmm/common/ContextSelector.h"
 #include <cmath>
 #include <iostream>
@@ -127,7 +128,7 @@ void MetalArray::copyTo(ArrayInterface& dest) const {
     MetalQueue& queue = context->getCurrentStream();
     std::lock_guard<std::recursive_mutex> guard(queue.getLock());
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    MTL::BlitCommandEncoder* blit = queue.getCommandBuffer()->blitCommandEncoder();
+    MTL::BlitCommandEncoder* blit = gpuprof::newBlit(queue.getCommandBuffer());
     blit->copyFromBuffer(pointer, 0, cuDest.getDevicePointer(), 0, size*elementSize);
     blit->endEncoding();
     pool->release();

@@ -29,6 +29,7 @@
 #include "MetalFFT3D.h"
 #include "MetalContext.h"
 #include "MetalKernelSources.h"
+#include "GpuProf.h"
 #include <algorithm>
 #include <cmath>
 
@@ -139,6 +140,7 @@ void MetalFFT3D::execFFT(ArrayInterface& in, ArrayInterface& out, bool forward) 
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing VkFFTAppend: "+context.intToString(fftResult));
     }
+    gpuprof::timeDispatch(queue, forward ? "vkFFTforward" : "vkFFTbackward", 0, 0);
 }
 
 static string joinRadices(const vector<int>& radices) {

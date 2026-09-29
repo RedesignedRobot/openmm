@@ -94,8 +94,15 @@ public:
     long long getCommitCount() const {
         return commitCount;
     }
-private:
+    // Lab-only accessors for GpuProf.h. Callers hold the lock.
+    MTL::CommandBuffer* getOpenBuffer() {
+        return openBuffer;
+    }
+    MTL::ComputeCommandEncoder* getOpenEncoder() {
+        return encoder;
+    }
     void endEncoding();
+private:
     void submit();
     void runIdleCommits();
     metalStream_t stream;

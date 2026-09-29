@@ -24,6 +24,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "MetalEvent.h"
+#include "GpuProf.h"
 #include "openmm/OpenMMException.h"
 #include <atomic>
 #include <unistd.h>
@@ -60,6 +61,7 @@ void MetalEvent::wait() {
     // Waiting on the command buffer instead of the event delays the start of the next command buffer
     // by about 40 us on the M3 Ultra.  The status check returns if the buffer fails before the signal.
     if (buffer != NULL) {
+        gpuprof::Wait w("event");
         while (!event->waitUntilSignaledValue(value, 100) && buffer->status() < MTL::CommandBufferStatusCompleted)
             ;
         checkBufferStatus();
@@ -70,6 +72,7 @@ void MetalEvent::poll() {
     // On the M3 Ultra, waitUntilSignaledValue() wakes the host 90 to 110 us after the signal, and a 10 us
     // poll within about 22 us.  The fence orders the host's reads of GPU results after the signal.
     if (buffer != NULL) {
+        gpuprof::Wait w("poll");
         while (event->signaledValue() < value && buffer->status() < MTL::CommandBufferStatusCompleted)
             usleep(10);
         checkBufferStatus();

@@ -27,6 +27,7 @@
   #define _USE_MATH_DEFINES // Needed to get M_PI
 #endif
 #include "MetalContext.h"
+#include "GpuProf.h"
 #include "MetalArray.h"
 #include "MetalBondedUtilities.h"
 #include "MetalEvent.h"
@@ -629,7 +630,9 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     bool packed = (packedModules.find(module) != packedModules.end());
     bool typeInfo = (packed || useMixedPrecision);
     MTL::PipelineOption reflectionOptions = (typeInfo ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
-    metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, reflectionOptions, &reflection, NULL));
+    metalFunction_t kernel = (function == NULL ? NULL : gpuprof::newPipeline(device, function, name, reflectionOptions, &reflection));
+    if (kernel != NULL)
+        gpuprof::setName(kernel, name);
     KernelArguments args;
     MTL::BufferBinding* argsBinding = NULL;
     vector<BufferLayout> bindingLayouts;
@@ -833,6 +836,7 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         encoder->dispatchThreadgroups(indirect, indirectOffset, MTL::Size(blockSize, 1, 1));
     else
         encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
+    gpuprof::timeDispatch(queue, gpuprof::getName(kernel), indirect != NULL ? 0 : gridSize, blockSize);
 }
 
 int MetalContext::computeThreadBlockSize(double memory) const {
