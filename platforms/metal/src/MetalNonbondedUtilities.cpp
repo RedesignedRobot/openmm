@@ -25,6 +25,8 @@
 
 #include "openmm/OpenMMException.h"
 #include "MetalNonbondedUtilities.h"
+#include <cstdlib>
+#include <cstring>
 #include "MetalArray.h"
 #include "MetalContext.h"
 #include "MetalSort.h"
@@ -360,7 +362,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     MetalArray& listPosq = (useRoleOrder ? orderedPosq : context.unwrap(context.getPosq()));
     forceArgs.push_back(&context.unwrap(context.getLongForceBuffer()).getDevicePointer());
     forceArgs.push_back(&context.unwrap(context.getEnergyBuffer()).getDevicePointer());
-    forceArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+    const char* nbProbe = getenv("OPENMM_METAL_NB_PROBE");
+    const bool probePosDirect = (useRoleOrder && nbProbe != NULL && strchr(nbProbe, 'p') != NULL);
+    forceArgs.push_back(probePosDirect ? &orderedPosq.getDevicePointer() : &context.unwrap(context.getPosq()).getDevicePointer());
     forceArgs.push_back(&exclusions.getDevicePointer());
     forceArgs.push_back(&exclusionTiles.getDevicePointer());
     forceArgs.push_back(&startTileIndex);
@@ -999,6 +1003,12 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_NEIGHBOR_LIST"] = "1";
     if (useRoleOrder)
         defines["ROLE_ORDER"] = "1";
+    if (useRoleOrder && getenv("OPENMM_METAL_NB_PROBE") != NULL) {
+        if (strchr(getenv("OPENMM_METAL_NB_PROBE"), 'p') != NULL)
+            defines["NB_POS_DIRECT"] = "1";
+        if (strchr(getenv("OPENMM_METAL_NB_PROBE"), 'f') != NULL)
+            defines["NB_FORCE_DIRECT"] = "1";
+    }
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
