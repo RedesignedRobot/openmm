@@ -33,6 +33,8 @@ using namespace std;
 // ahead of the GPU.
 static const int MaxBuffersInFlight = 8;
 
+atomic<long long> MetalQueue::workCount(0);
+
 MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false) {
 }
 
@@ -54,6 +56,7 @@ MetalQueue::~MetalQueue() {
 }
 
 MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
+    workCount++;
     if (encoder == NULL) {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         MTL::DispatchType type = (concurrentDispatch ? MTL::DispatchTypeConcurrent : MTL::DispatchTypeSerial);
@@ -64,6 +67,7 @@ MTL::ComputeCommandEncoder* MetalQueue::getEncoder() {
 }
 
 MTL::CommandBuffer* MetalQueue::getCommandBuffer() {
+    workCount++;
     endEncoding();
     if (openBuffer == NULL) {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();

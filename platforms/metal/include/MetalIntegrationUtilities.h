@@ -91,14 +91,22 @@ public:
      * reads the velocities and writes only its own output, so it can share a concurrent pass with the force kernels.
      */
     void calcPendingCenterOfMassMomentum();
+    /**
+     * Refill the random number pool now if the fused LangevinMiddle kernel runs and the pool is used up.  The next
+     * prepareRandomNumbers() would refill it anyway and return index 0, so this draws the same numbers in the same
+     * order.  It writes only the pool and its seeds, so it can share a concurrent pass with the force kernels.
+     */
+    void refillExhaustedRandomNumbers();
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
+    bool bindAutoclearBuffers();
     int* ccmaConvergedMemory;
     metalDeviceptr_t ccmaConvergedDeviceMemory;
     ComputeEvent ccmaEvent;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
-    int numLangevinMiddleThreads;
+    int numLangevinMiddleThreads, numClearThreads, numBoundAutoclearBuffers;
+    bool clearsAutoclearBuffers;
     ComputeKernel pendingCMCalc;
     int pendingCMBlockSize;
     ComputeArray* pendingCMVelocity;

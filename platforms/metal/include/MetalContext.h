@@ -512,6 +512,22 @@ public:
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
      */
     void executeForcePassKernels();
+    /**
+     * Get the buffers that clearAutoclearBuffers() zeroes.
+     */
+    const std::vector<ArrayInterface*>& getAutoclearBuffers() const {
+        return autoclearBuffers;
+    }
+    /**
+     * Record that the kernel just encoded zeroes every autoclear buffer when it runs.  The next
+     * clearAutoclearBuffersIfNeeded() then skips its dispatch, unless any work was encoded or any array written
+     * in between, or a buffer was added.
+     */
+    void markAutoclearBuffersCleared();
+    /**
+     * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
+     */
+    void clearAutoclearBuffersIfNeeded();
 private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
@@ -546,6 +562,8 @@ private:
     bool supportsHardwareFloatGlobalAtomicAdd;
     bool useBlockingSync, contextIsValid;
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
+    long long autoclearWorkCount;
+    int autoclearBufferCount;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;

@@ -52,6 +52,43 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
 }
 
 /**
+ * Zero an atom's force once the kick has read it.  This is the next step's clear of the force buffer, done by the only
+ * thread that reads the atom, so no thread can read a zero it wasn't meant to.
+ */
+inline void clearAtomForce(GLOBAL mm_long* RESTRICT force, int atom, int paddedNumAtoms) {
+    force[atom] = 0;
+    force[atom+paddedNumAtoms] = 0;
+    force[atom+paddedNumAtoms*2] = 0;
+}
+
+/**
+ * Zero the first numWords 32 bit words of a buffer with a grid-stride loop, four words per store.
+ */
+inline void clearWords(GLOBAL int* buffer, int numWords, int id, int size) {
+    GLOBAL int4* buffer4 = (GLOBAL int4*) buffer;
+    for (int i = id; i < numWords/4; i += size)
+        buffer4[i] = make_int4(0);
+    int tail = 4*(numWords/4)+id;
+    if (tail < numWords)
+        buffer[tail] = 0;
+}
+
+/**
+ * The rest of the next step's clear of the autoclear buffers: the force buffer's padding atoms, which no unit reads,
+ * and up to four other buffers.  The host passes 0 words for unused slots.
+ */
+inline void clearOtherBuffers(GLOBAL mm_long* RESTRICT force, int numAtoms, int paddedNumAtoms, GLOBAL int* clear0,
+        GLOBAL int* clear1, GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4, int id, int size) {
+    int numPadding = paddedNumAtoms-numAtoms;
+    for (int i = id; i < 3*numPadding; i += size)
+        force[numAtoms+i%numPadding+(i/numPadding)*paddedNumAtoms] = 0;
+    clearWords(clear0, clearWords4.x, id, size);
+    clearWords(clear1, clearWords4.y, id, size);
+    clearWords(clear2, clearWords4.z, id, size);
+    clearWords(clear3, clearWords4.w, id, size);
+}
+
+/**
  * Take one LangevinMiddleIntegrator step.  Each thread owns a unit: a SETTLE cluster, a SHAKE cluster, or an atom in
  * neither, taken in that order.  It runs the velocity step, the velocity constraints, the position update with the heat
  * bath, the position constraints and the final velocity correction on its atoms in registers, so the displacements
@@ -60,14 +97,19 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
  * When removeCM is nonzero, it also does removeCenterOfMassMomentum's work: it subtracts the
  * center of mass velocity that calcCenterOfMassVelocity wrote to cmVelocity[0] from every atom as it loads it.  That
  * saves removeCenterOfMassMomentum's dispatch and its pass over velm.
+ *
+ * When clearBuffers is nonzero, it also does the next step's clearAutoclearBuffers(): each thread zeroes the forces it
+ * read, and the grid clears the other autoclear buffers, which nothing reads after the force pass.  That saves the
+ * clear's dispatch and the boundary between it and this kernel.
  */
 KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
         GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT velm,
-        GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
+        GLOBAL mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
-        GLOBAL const float4* RESTRICT cmVelocity) {
+        GLOBAL const float4* RESTRICT cmVelocity, int clearBuffers, int numAtoms, GLOBAL int* clear0, GLOBAL int* clear1,
+        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4) {
     float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
@@ -92,8 +134,11 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             vel[i] = make_mixed4(0);
             delta[i] = make_mixed4(0);
             oldDelta[i] = make_mixed4(0);
-            if (atoms[i] != -1)
+            if (atoms[i] != -1) {
                 kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos[i], vel[i]);
+                if (clearBuffers)
+                    clearAtomForce(force, atoms[i], paddedNumAtoms);
+            }
         }
         if (isSettle)
             applySettleToClusterVelocities(pos, vel);
@@ -109,7 +154,8 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         for (int i = 0; i < 4; i++)
             if (atoms[i] != -1 && vel[i].w != 0.0)
                 finishAtom(atoms[i], posq, posqCorrection, velm, invDt, pos[i], vel[i], delta[i], oldDelta[i]);
-    }
+    }    if (clearBuffers)
+        clearOtherBuffers(force, numAtoms, paddedNumAtoms, clear0, clear1, clear2, clear3, clearWords4, GLOBAL_ID, GLOBAL_SIZE);
 }
 
 #ifdef USE_MIXED_PRECISION
@@ -133,11 +179,12 @@ inline mixed4 laneElement(PRIVATE const mixed4* values, int lane) {
  */
 KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
         GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT velm,
-        GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
+        GLOBAL mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
-        GLOBAL const float4* RESTRICT cmVelocity) {
+        GLOBAL const float4* RESTRICT cmVelocity, int clearBuffers, int numAtoms, GLOBAL int* clear0, GLOBAL int* clear1,
+        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4) {
     float4 cm = (removeCM ? cmVelocity[0] : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
@@ -165,8 +212,11 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         mixed4 vel = make_mixed4(0);
         mixed4 delta = make_mixed4(0);
         mixed4 oldDelta = make_mixed4(0);
-        if (atom != -1)
+        if (atom != -1) {
             kickAtom(atom, posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos, vel);
+            if (clearBuffers)
+                clearAtomForce(force, atom, paddedNumAtoms);
+        }
         mixed4 clusterPos[4], clusterVel[4];
         if (isSettle || isShake) {
             for (int i = 0; i < 4; i++) {
@@ -193,5 +243,6 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         }
         if (atom != -1 && vel.w != 0.0)
             finishAtom(atom, posq, posqCorrection, velm, invDt, pos, vel, delta, oldDelta);
-    }
+    }    if (clearBuffers)
+        clearOtherBuffers(force, numAtoms, paddedNumAtoms, clear0, clear1, clear2, clear3, clearWords4, GLOBAL_ID, GLOBAL_SIZE);
 }

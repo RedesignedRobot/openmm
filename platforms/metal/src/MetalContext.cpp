@@ -206,7 +206,8 @@ static string rewriteDeviceSignatures(const string& source) {
 MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
-        useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false) {
+        useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false), autoclearWorkCount(-1),
+        autoclearBufferCount(0) {
     if (precision == "single") {
         useDoublePrecision = false;
         useMixedPrecision = false;
@@ -879,4 +880,16 @@ void MetalContext::executeForcePassKernels() {
     for (auto& kernel : forcePassKernels)
         kernel.first->execute(kernel.second);
     forcePassKernels.clear();
+}
+
+void MetalContext::markAutoclearBuffersCleared() {
+    autoclearWorkCount = MetalQueue::getWorkCount();
+    autoclearBufferCount = autoclearBuffers.size();
+}
+
+void MetalContext::clearAutoclearBuffersIfNeeded() {
+    bool cleared = (autoclearWorkCount == MetalQueue::getWorkCount() && autoclearBufferCount == autoclearBuffers.size());
+    autoclearWorkCount = -1;
+    if (!cleared)
+        clearAutoclearBuffers();
 }

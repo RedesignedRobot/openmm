@@ -78,7 +78,7 @@ void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
-    cu.clearAutoclearBuffers();
+    cu.clearAutoclearBuffersIfNeeded();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
         computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
@@ -101,12 +101,14 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
     // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.  Force
     // pass kernels (PME interpolation) also add to the force buffer only with integer atomics and write
-    // nothing else.
+    // nothing else.  A refill of the random number pool joins too: it writes only the pool and its seeds,
+    // which only the integrator reads, after the pass.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
         cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
+        cu.getIntegrationUtilities().refillExhaustedRandomNumbers();
         cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
