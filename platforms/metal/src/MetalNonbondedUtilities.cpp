@@ -383,7 +383,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         forceArgs.push_back(NULL);
     if (energyParameterDerivatives.size() > 0)
         forceArgs.push_back(&context.unwrap(context.getEnergyParamDerivBuffer()).getDevicePointer());
-    forceArgs.push_back(&forceBlockOffset);
+    forceArgs.push_back(&sliceBegin);
+    forceArgs.push_back(&sliceEnd);
     if (useCutoff) {
         findBlockBoundsArgs.push_back(&numAtoms);
         findBlockBoundsArgs.push_back(context.getPeriodicBoxSizePointer());
@@ -554,18 +555,19 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         vector<double> fractions = context.getForcePassSliceFractions();
         if (includeEnergy || energyParameterDerivatives.size() > 0 || !kernelTakesBlockOffset)
             fractions = {1.0};
-        int firstBlock = 0;
+        unsigned int begin = 0;
         double cumulative = 0;
         for (int slice = 0; slice < fractions.size(); slice++) {
             cumulative += fractions[slice];
-            int endBlock = (slice == fractions.size()-1 ? numForceThreadBlocks : min(numForceThreadBlocks, (int) round(cumulative*numForceThreadBlocks)));
+            unsigned int endUnits = (slice == fractions.size()-1 ? 65536 : min(65536u, (unsigned int) round(cumulative*65536)));
             if (slice > 0)
                 context.runNextForcePassPhase();
-            if (endBlock > firstBlock) {
-                forceBlockOffset = firstBlock;
-                context.executeKernelFlat(kernel, &forceArgs[0], (endBlock-firstBlock)*forceThreadBlockSize, forceThreadBlockSize);
+            if (endUnits > begin || endUnits == 65536) {
+                sliceBegin = begin;
+                sliceEnd = endUnits;
+                context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
             }
-            firstBlock = max(firstBlock, endBlock);
+            begin = max(begin, endUnits);
         }
     }
     if (useNeighborList && numTiles > 0) {

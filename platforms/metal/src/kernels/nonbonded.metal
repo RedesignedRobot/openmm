@@ -81,10 +81,10 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         const real4* __restrict__ blockSize, const unsigned int* __restrict__ interactingAtoms, unsigned int maxSinglePairs,
         const int2* __restrict__ singlePairs
 #endif
-        PARAMETER_ARGUMENTS, unsigned int forceBlockOffset) {
-    // The kernel may run as several dispatches that each cover a range of NUM_FORCE_BLOCKS blocks, starting at
-    // forceBlockOffset, so the work split depends only on the block's index among all of them.
-    const unsigned int forceBlock = blockIdx.x+forceBlockOffset;
+        PARAMETER_ARGUMENTS, unsigned int sliceBegin, unsigned int sliceEnd) {
+    // PROBE: the kernel may run as several full-width dispatches; each warp takes the part of its own tiles between
+    // sliceBegin/65536 and sliceEnd/65536 of the way through them.
+    const unsigned int forceBlock = blockIdx.x;
     const unsigned int totalWarps = (THREAD_BLOCK_SIZE*NUM_FORCE_BLOCKS)/TILE_SIZE;
     const unsigned int warp = forceBlock*(THREAD_BLOCK_SIZE/TILE_SIZE) + threadIdx.x/TILE_SIZE; // global warpIndex
     const unsigned int tgx = threadIdx.x & (TILE_SIZE-1); // index within the warp
@@ -93,7 +93,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 
     // First loop: process tiles that contain exclusions.
 
-    for (int pos = FIRST_EXCLUSION_TILE+warp; pos < LAST_EXCLUSION_TILE; pos+=totalWarps) {
+    const unsigned int numExclusionSteps = (FIRST_EXCLUSION_TILE+warp < LAST_EXCLUSION_TILE ? (LAST_EXCLUSION_TILE-FIRST_EXCLUSION_TILE-warp+totalWarps-1)/totalWarps : 0);
+    const int lastExclusionPos = FIRST_EXCLUSION_TILE+warp+(int) ((((ulong) numExclusionSteps)*sliceEnd)>>16)*totalWarps;
+    for (int pos = FIRST_EXCLUSION_TILE+warp+(int) ((((ulong) numExclusionSteps)*sliceBegin)>>16)*totalWarps; pos < lastExclusionPos; pos+=totalWarps) {
         const int2 tileIndices = exclusionTiles[pos];
         const unsigned int x = tileIndices.x;
         const unsigned int y = tileIndices.y;
@@ -262,8 +264,10 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // adds per tile. They are summed in fixed point, because which tiles share a write varies from one neighbor list
     // build to the next, and the forces must not.
     mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
-    const unsigned int end = firstNeighborListTile(numTiles, warp+1, totalWarps);
-    for (unsigned int pos = firstNeighborListTile(numTiles, warp, totalWarps); pos < end; pos++) {
+    const unsigned int warpFirst = firstNeighborListTile(numTiles, warp, totalWarps);
+    const unsigned int warpTiles = firstNeighborListTile(numTiles, warp+1, totalWarps)-warpFirst;
+    const unsigned int end = warpFirst+(unsigned int) ((((ulong) warpTiles)*sliceEnd)>>16);
+    for (unsigned int pos = warpFirst+(unsigned int) ((((ulong) warpTiles)*sliceBegin)>>16); pos < end; pos++) {
 #else
     int pos = (int) (startTileIndex+warp*numTileIndices/totalWarps);
     int end = (int) (startTileIndex+(warp+1)*numTileIndices/totalWarps);
@@ -489,7 +493,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     // Third loop: single pairs that aren't part of a tile.
 
 #if USE_NEIGHBOR_LIST
-    const unsigned int numPairs = interactionCount[1];
+    const unsigned int numPairs = (sliceEnd == 65536 ? interactionCount[1] : 0);
     if (numPairs > maxSinglePairs)
         return; // There wasn't enough memory for the neighbor list.
     for (int i = forceBlock*blockDim.x+threadIdx.x; i < numPairs; i += blockDim.x*NUM_FORCE_BLOCKS) {
