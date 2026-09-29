@@ -112,6 +112,10 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // list.  We guess based on system size which will be faster.
 
     useLargeBlocks = (context.getNumAtoms() > 90000);
+    const char* probe = getenv("OPENMM_METAL_FB_PROBE");
+    fbProbe = (probe == NULL ? "" : probe);
+    if (fbProbe.find('L') != string::npos)
+        useLargeBlocks = true;
     setKernelSource(MetalKernelSources::nonbonded);
 }
 
@@ -462,6 +466,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
         if (useRoleOrder)
             findInteractingBlocksArgs.push_back(&atomRoles.getDevicePointer());
+        if (fbProbe.find('c') != string::npos) {
+            fbCounters.initialize<unsigned int>(context, 8, "fbCounters");
+            fbCounters.upload(vector<unsigned int>(8, 0));
+            findInteractingBlocksArgs.push_back(&fbCounters.getDevicePointer());
+        }
         copyInteractionCountsArgs.push_back(&interactionCount.getDevicePointer());
         copyInteractionCountsArgs.push_back(&pinnedCountDeviceMemory);
     }
@@ -648,6 +657,13 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     }
     forceRebuildNeighborList = false;
+    if (fbCounters.isInitialized() && ++fbDispatches % 200 == 0) {
+        vector<unsigned int> c;
+        fbCounters.download(c);
+        fprintf(stderr, "fbprobe dispatches=%d rebuilds=%u chunks=%u largeSkip=%u centerSkip=%u cand=%u roleSkip=%u atomTests=%u\n",
+                fbDispatches, c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+        fbCounters.upload(vector<unsigned int>(8, 0));
+    }
     // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
     // which is all a step without the wait needs.
     bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
@@ -863,6 +879,12 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
         if (useRoleOrder)
             defines["ROLE_ORDER"] = "1";
+        if (fbProbe.find('c') != string::npos)
+            defines["FB_PROBE_COUNT"] = "1";
+        if (fbProbe.find('b') != string::npos)
+            defines["FB_PROBE_BBOX2"] = "1";
+        if (fbProbe.find('a') != string::npos)
+            defines["FB_PROBE_ATOM2"] = "1";
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);

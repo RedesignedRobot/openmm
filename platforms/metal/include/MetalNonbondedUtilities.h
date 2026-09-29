@@ -366,6 +366,11 @@ private:
     MetalArray atomOrder, atomRoles, orderedPosq, orderedForces;
     bool roleForcesPending = false;
     metalFunction_t scatterOrderedForcesKernel = NULL;
+    // Scratch probe (OPENMM_METAL_FB_PROBE letters): L large blocks below 90k atoms, c per-rebuild counters,
+    // b doubled bounding-box scan, a doubled atom test.
+    std::string fbProbe;
+    MetalArray fbCounters;
+    int fbDispatches = 0;
     std::vector<int> contextRoles;
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;

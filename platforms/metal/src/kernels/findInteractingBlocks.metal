@@ -297,10 +297,22 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 #ifdef ROLE_ORDER
         , const int* __restrict__ atomRoles
 #endif
+#ifdef FB_PROBE_COUNT
+        , unsigned int* __restrict__ fbCounters
+#endif
         ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
+#ifdef FB_PROBE_COUNT
+    // Scratch probe: per-warp counts, added once at the end.  All increments sit at warp-uniform points.
+    unsigned int cChunks = 0, cLargeSkip = 0, cCenterSkip = 0, cCand = 0, cRoleSkip = 0, cAtomTests = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        atomicAdd(&fbCounters[0], 1u);
+#endif
+#if defined(FB_PROBE_BBOX2) || defined(FB_PROBE_ATOM2)
+    unsigned int fbDummy = 0;
+#endif
 
     // Starting from ROCm 7 warpSize is no longer constexpr. Redefine as a local value for using it
     // in sizes of __shared__ arrays:
@@ -379,6 +391,61 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         // units are idle at the end of the kernel (the kernel works on the upper triangle of
         // the NUM_BLOCKS x NUM_BLOCKS matrix).
 
+#ifdef FB_PROBE_BBOX2
+        // Scratch probe: the bounding-box scan a second time, results discarded.  The delta per call is the scan's cost.
+        {
+#ifdef USE_LARGE_BLOCKS
+            warpflags largeBlockFlags = 0;
+            int loadedLargeBlocks = 0;
+#endif
+            for (int block2Base = ((block1+1)/warpSize + warpIndex%NUM_TILES_IN_BATCH)*warpSize; block2Base < NUM_BLOCKS; block2Base += warpSize*NUM_TILES_IN_BATCH) {
+                const bool lastIteration = block2Base + warpSize*NUM_TILES_IN_BATCH >= NUM_BLOCKS;
+#ifdef USE_LARGE_BLOCKS
+                if (loadedLargeBlocks == 0) {
+                    int largeBlockIndex = block2Base + warpSize*NUM_TILES_IN_BATCH*indexInWarp;
+                    bool includeLargeBlock = false;
+                    if (largeBlockIndex < NUM_BLOCKS) {
+                        real4 largeCenter = largeBlockCenter[largeBlockIndex];
+                        real3 largeSize = largeBlockBoundingBox[largeBlockIndex].toReal3();
+                        real4 blockDelta = blockCenterX-largeCenter;
+#ifdef USE_PERIODIC
+                        APPLY_PERIODIC_TO_DELTA(blockDelta)
+#endif
+                        blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-largeSize.x);
+                        blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-largeSize.y);
+                        blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-largeSize.z);
+                        includeLargeBlock = (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED*1.0001f);
+                    }
+                    largeBlockFlags = __ballot(includeLargeBlock);
+                    loadedLargeBlocks = warpSize;
+                }
+                loadedLargeBlocks--;
+                if ((largeBlockFlags&1) == 0 && !lastIteration) {
+                    largeBlockFlags >>= 1;
+                    continue;
+                }
+                largeBlockFlags >>= 1;
+#endif
+                int block2 = block2Base+indexInWarp;
+                bool includeBlock2 = (block1 < block2 && block2 < NUM_BLOCKS);
+                block2 = includeBlock2 ? block2 : block1;
+                real4 blockCenterY = sortedBlockCenter[block2];
+                real4 blockDelta = blockCenterX-blockCenterY;
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_DELTA(blockDelta)
+#endif
+                includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < (PADDED_CUTOFF*1.0001f+blockCenterX.w+blockCenterY.w)*(PADDED_CUTOFF*1.0001f+blockCenterX.w+blockCenterY.w));
+                if (!lastIteration && __ballot(includeBlock2) == 0)
+                    continue;
+                real3 blockSizeY = sortedBlockBoundingBox[block2].toReal3();
+                blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-blockSizeY.x);
+                blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-blockSizeY.y);
+                blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-blockSizeY.z);
+                includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED*1.0001f);
+                fbDummy += warpPopc(__ballot(includeBlock2));
+            }
+        }
+#endif
 #ifdef USE_LARGE_BLOCKS
         warpflags largeBlockFlags = 0;
         int loadedLargeBlocks = 0;
@@ -422,9 +489,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 // None of the next warpSize blocks interact with block 1.
 
                 largeBlockFlags >>= 1;
+#ifdef FB_PROBE_COUNT
+                cLargeSkip++;
+#endif
                 continue;
             }
             largeBlockFlags >>= 1;
+#endif
+#ifdef FB_PROBE_COUNT
+            cChunks++;
 #endif
             int block2 = block2Base+indexInWarp;
             bool includeBlock2 = (block1 < block2 && block2 < NUM_BLOCKS);
@@ -437,8 +510,12 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 #endif
             includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < (PADDED_CUTOFF+blockCenterX.w+blockCenterY.w)*(PADDED_CUTOFF+blockCenterX.w+blockCenterY.w));
 #ifndef TRICLINIC
-            if (!lastIteration && __ballot(includeBlock2) == 0)
+            if (!lastIteration && __ballot(includeBlock2) == 0) {
+#ifdef FB_PROBE_COUNT
+                cCenterSkip++;
+#endif
                 continue;
+            }
 #endif
             real3 blockSizeY = sortedBlockBoundingBox[block2].toReal3();
             blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-blockSizeY.x);
@@ -461,6 +538,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 block2Buffer[index] = (block2 << 1) | (forceInclude ? 1 : 0);
             }
             block2Count += warpPopc(includeBlockFlags);
+#ifdef FB_PROBE_COUNT
+            cCand += warpPopc(includeBlockFlags);
+#endif
             SYNC_WARPS;
 
             // Loop over the collected candidates (each warp processes 2 blocks on CDNA or 1 block on RDNA).
@@ -480,8 +560,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 // test, and one ballot skips its atom test.  On tip4pew that was a third of the candidate blocks.
                 const int role2 = atomRoles[y*TILE_SIZE+indexInTile];
                 const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
-                if (BALLOT(roleFlags != 0) == 0)
+                if (BALLOT(roleFlags != 0) == 0) {
+#ifdef FB_PROBE_COUNT
+                    cRoleSkip++;
+#endif
                     continue;
+                }
+#endif
+#ifdef FB_PROBE_COUNT
+                cAtomTests++;
 #endif
 
                 #pragma unroll 1
@@ -568,6 +655,43 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                     }
 #endif
 #ifdef USE_PERIODIC
+                }
+#endif
+#ifdef FB_PROBE_ATOM2
+                // Scratch probe: the 32x32 atom test a second time with a slightly wider cutoff, result discarded.
+#ifdef USE_PERIODIC
+                if (singlePeriodicCopy) {
+#else
+                {
+#endif
+                    tileflags atomFlags2 = BALLOT(forceInclude || atomDelta.x*atomDelta.x+atomDelta.y*atomDelta.y+atomDelta.z*atomDelta.z < (PADDED_CUTOFF*1.0001f+blockCenterY.w)*(PADDED_CUTOFF*1.0001f+blockCenterY.w));
+                    tileflags interacts2 = 0;
+                    const real lim2 = 0.5f * PADDED_CUTOFF_SQUARED * 1.0001f - pos2.w;
+                    if (__popc(atomFlags2) >= MIN_ATOMS_TO_UNROLL) {
+                        #pragma unroll
+                        for (int j = 0; j < TILE_SIZE; j++) {
+                            real4 posj = posBuffer[j];
+                            real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim2)));
+                            interacts2 |= (__float_as_uint(d) >> 31) << j;
+                        }
+#ifdef ROLE_ORDER
+                        interacts2 &= atomFlags2 & roleFlags;
+#else
+                        interacts2 &= atomFlags2;
+#endif
+                        atomFlags2 = 0;
+                    }
+                    while (atomFlags2) {
+                        int j = __ffs(atomFlags2)-1;
+                        atomFlags2 = atomFlags2 ^ (static_cast<tileflags>(1) << j);
+                        real4 posj = posBuffer[j];
+                        real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim2)));
+#ifdef ROLE_ORDER
+                        d = ((roleFlags >> j) & 1) ? d : 1.0f;
+#endif
+                        collectInteractions(interacts2, d, j);
+                    }
+                    fbDummy += interacts2;
                 }
 #endif
                 if (atom2 >= NUM_ATOMS || !includeBlock2) {
@@ -658,6 +782,21 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 }
             }
         }
+#ifdef FB_PROBE_COUNT
+        if (indexInWarp == 0) {
+            atomicAdd(&fbCounters[1], cChunks);
+            atomicAdd(&fbCounters[2], cLargeSkip);
+            atomicAdd(&fbCounters[3], cCenterSkip);
+            atomicAdd(&fbCounters[4], cCand);
+            atomicAdd(&fbCounters[5], cRoleSkip);
+            atomicAdd(&fbCounters[6], cAtomTests);
+        }
+#endif
+#if defined(FB_PROBE_BBOX2) || defined(FB_PROBE_ATOM2)
+        // Sink the probe's results so the compiler keeps the work.  numBlocks never reaches this value.
+        if (fbDummy == 0xffffffffu && numBlocks == 0xffffffffu)
+            interactionCount[1] = fbDummy;
+#endif
     }
 
     // Record the positions the neighbor list is based on.
