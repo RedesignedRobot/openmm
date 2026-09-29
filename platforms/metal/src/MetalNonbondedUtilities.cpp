@@ -889,8 +889,12 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
             defines["FB_PROBE_ATOM2_INDEP"] = "1";
         if (fbProbe.find('e') != string::npos)
             defines["FB_PROBE_NOTEST"] = "1";
-        if (fbProbe.find('h') != string::npos)
+        if (fbProbe.find('h') != string::npos || fbProbe.find('H') != string::npos)
             defines["FB_PROBE_HALF"] = "1";
+        if (fbProbe.find('H') != string::npos)
+            defines["FB_PROBE_HALFMATH"] = "1";
+        if (fbProbe.find('P') != string::npos)
+            defines["FB_PROBE_PREFETCH"] = "1";
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);

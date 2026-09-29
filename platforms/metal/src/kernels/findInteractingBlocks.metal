@@ -571,17 +571,55 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
             // the last iteration of the for-block2Base loop when the left-over must be processed).
 
             const int block2ToProcess = lastIteration ? block2Count : block2Count/tilesPerWarp*tilesPerWarp;
+#ifdef FB_PROBE_PREFETCH
+            // Scratch probe: the next candidate's block index, roles and positions are loaded one iteration ahead,
+            // so the current candidate's 32x32 test covers their latency.
+            int bNext = 0, yNext = 0;
+            real4 pos2Next = make_real4(0);
+#ifdef ROLE_ORDER
+            int role2Next = 0;
+#endif
+            if (block2ToProcess > 0) {
+                bNext = block2Buffer[min(tileInWarp, block2Count - 1)];
+                yNext = sortedBlocks[bNext >> 1] & BLOCK_INDEX_MASK;
+                pos2Next = posq[yNext*TILE_SIZE+indexInTile];
+#ifdef ROLE_ORDER
+                role2Next = atomRoles[yNext*TILE_SIZE+indexInTile];
+#endif
+            }
+#endif
             for (int block2Index = 0; block2Index < block2ToProcess; block2Index += tilesPerWarp) {
                 bool includeBlock2 = block2Index + tileInWarp < block2Count;
+#ifdef FB_PROBE_PREFETCH
+                const int b = bNext;
+                const bool forceInclude = b & 1;
+                const int block2 = b >> 1;
+                int y = yNext;
+                real4 pos2 = pos2Next;
+#ifdef ROLE_ORDER
+                const int role2 = role2Next;
+#endif
+                if (block2Index + tilesPerWarp < block2ToProcess) {
+                    bNext = block2Buffer[min(block2Index + tilesPerWarp + tileInWarp, block2Count - 1)];
+                    yNext = sortedBlocks[bNext >> 1] & BLOCK_INDEX_MASK;
+                    pos2Next = posq[yNext*TILE_SIZE+indexInTile];
+#ifdef ROLE_ORDER
+                    role2Next = atomRoles[yNext*TILE_SIZE+indexInTile];
+#endif
+                }
+#else
                 const int b = block2Buffer[min(block2Index + tileInWarp, block2Count - 1)];
                 const bool forceInclude = b & 1;
                 const int block2 = b >> 1;
                 int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#endif
 #ifdef ROLE_ORDER
                 // An atom is listed only for the x atoms it shares a role with.  The role regions are contiguous, so
                 // a block of LJ-only atoms against a block of charge-only atoms (water O against H/H/M) has no pair to
                 // test, and one ballot skips its atom test.  On tip4pew that was a third of the candidate blocks.
+#ifndef FB_PROBE_PREFETCH
                 const int role2 = atomRoles[y*TILE_SIZE+indexInTile];
+#endif
                 const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
                 if (BALLOT(roleFlags != 0) == 0) {
 #ifdef FB_PROBE_COUNT
@@ -602,7 +640,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 // Check each atom in block Y for interactions.
 
                 int atom2 = y*TILE_SIZE+indexInTile;
+#ifndef FB_PROBE_PREFETCH
                 real4 pos2 = posq[atom2];
+#endif
 #ifdef USE_PERIODIC
                 if (singlePeriodicCopy) {
                     APPLY_PERIODIC_TO_POS_WITH_CENTER(pos2, blockCenterX)
@@ -649,6 +689,18 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 #ifdef FB_PROBE_HALF
                     if (__popc(atomFlags) >= MIN_ATOMS_TO_UNROLL) {
                         const real3 p2r = trimTo3(pos2)-trimTo3(blockCenterX);
+#ifdef FB_PROBE_HALFMATH
+                        // Half arithmetic too: rounding in the three fmas and the y position is under 4e-3 nm in the
+                        // distance at |p| < 1.5 nm, covered by widening the padded cutoff 0.01 nm.
+                        const half3 p2h = half3(p2r);
+                        const half limh = (half) (0.5f*(PADDED_CUTOFF+0.01f)*(PADDED_CUTOFF+0.01f) - 0.5f*(p2r.x*p2r.x+p2r.y*p2r.y+p2r.z*p2r.z));
+                        #pragma unroll
+                        for (int j = 0; j < TILE_SIZE; j++) {
+                            half4 pj = posBufferH[j];
+                            half d = fma(-pj.x, p2h.x, fma(-pj.y, p2h.y, fma(-pj.z, p2h.z, pj.w - limh)));
+                            interacts |= ((unsigned int) (as_type<ushort>(d) >> 15)) << j;
+                        }
+#else
                         const real limH = 0.5f*(PADDED_CUTOFF+0.001f)*(PADDED_CUTOFF+0.001f) - 0.5f*(p2r.x*p2r.x+p2r.y*p2r.y+p2r.z*p2r.z);
                         #pragma unroll
                         for (int j = 0; j < TILE_SIZE; j++) {
@@ -656,6 +708,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                             real d = fma(-pj.x, p2r.x, fma(-pj.y, p2r.y, fma(-pj.z, p2r.z, pj.w - limH)));
                             interacts |= (__float_as_uint(d) >> 31) << j;
                         }
+#endif
 #ifdef ROLE_ORDER
                         interacts &= atomFlags & roleFlags;
 #else
