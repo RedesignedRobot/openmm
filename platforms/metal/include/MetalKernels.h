@@ -149,6 +149,25 @@ private:
 };
 
 /**
+ * Changing the periodic box moves every atom a reorder has wrapped back to its unwrapped position first, so that its
+ * position stays the same.  The common kernel does that on the host with a download and an upload of all positions,
+ * and MonteCarloBarostat changes the box on every trial: 0.6 ms of a 2.4 ms trial on a 29,451-atom unit.  This one
+ * uploads the cell offsets and shifts the wrapped atoms on the device.
+ */
+class MetalUpdateStateDataKernel : public CommonUpdateStateDataKernel {
+public:
+    MetalUpdateStateDataKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonUpdateStateDataKernel(name, platform, cu), cu(cu) {
+    }
+    void initialize(const System& system);
+    void setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c);
+private:
+    MetalContext& cu;
+    ComputeArray cellOffsets, boxVectors;
+    ComputeKernel unwrapKernel;
+};
+
+/**
  * This kernel is invoked by LangevinMiddleIntegrator to take one time step.
  */
 class MetalIntegrateLangevinMiddleStepKernel : public CommonIntegrateLangevinMiddleStepKernel {
