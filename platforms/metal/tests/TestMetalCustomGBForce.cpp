@@ -93,6 +93,8 @@ void testAppOBC2Route(CustomGBForce::NonbondedMethod method, bool ace) {
     obc->setNonbondedMethod((GBSAOBCForce::NonbondedMethod) method);
     obc->setCutoffDistance(cutoff);
     obc->setSurfaceAreaEnergy(ace ? 28.3919551/(4*M_PI) : 0.0);
+    obc->setSolventDielectric(78.5);  // the template's; GBSAOBCForce defaults to 78.3
+    obc->setSoluteDielectric(1.0);
     vector<Vec3> positions;
     for (int i = 0; i < numParticles; i++) {
         for (System* system : {&customSystem, &obcSystem, &variantSystem}) {
