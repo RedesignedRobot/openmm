@@ -60,10 +60,10 @@ static const int StepsPerCommandBuffer = 8;
 // size range per threadgroup instead of per block.
 static const int FindBlockBoundsThreadBlockSize = 256;
 
-// prepareRebuildDispatch sorts up to this many blocks in its one threadgroup.  Larger systems sort in
-// three dispatches of BinSortThreadBlockSize threads (at most 256, since a block's rank inside its
-// threadgroup takes 8 bits).
-static const int MaxBlocksSortedInOneGroup = 1024;
+// prepareRebuildDispatch sorts up to this many blocks in its one threadgroup, one chunk of blocks per pass
+// over its threads.  Larger systems sort in three dispatches of BinSortThreadBlockSize threads (at most 256,
+// since a block's rank inside its threadgroup takes 8 bits), which beat a long serial chunk loop.
+static const int MaxBlocksSortedInOneGroup = 4096;
 static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
@@ -728,10 +728,10 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
+        defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);
-            defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
         }
         defines["FIND_BLOCK_BOUNDS_GROUP"] = context.intToString(FindBlockBoundsThreadBlockSize);
         int binShift = 1;
