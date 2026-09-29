@@ -107,6 +107,12 @@ public:
      */
     void setPrefetchKineticEnergy(bool prefetch);
     /**
+     * Get whether setPrefetchKineticEnergy() turned prefetchKineticEnergy() on.
+     */
+    bool getPrefetchKineticEnergy() const {
+        return prefetchesKineticEnergy;
+    }
+    /**
      * Queue the kinetic energy kernel in a force computation that includes energy, ahead of the energy readback.
      * Context::getState() asks for the kinetic energy right after the potential energy, and the kernel alone in a
      * command buffer of its own costs a second round trip to the GPU: 0.2-0.3 ms on an idle M3 Ultra, twice per

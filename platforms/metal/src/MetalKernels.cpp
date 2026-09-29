@@ -112,6 +112,13 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         cu.getIntegrationUtilities().refillExhaustedRandomNumbers();
         cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
+        // The kinetic energy kernel reads only the velocities and writes only its own result, so in a pass with
+        // energy it runs beside the nonbonded kernel.  Its single thread group goes first, as above.
+        MetalIntegrationUtilities& integration = cu.getIntegrationUtilities();
+        if (includeEnergy && integration.getPrefetchKineticEnergy()) {
+            cu.getCurrentStream().setConcurrentDispatch(true);
+            integration.prefetchKineticEnergy();
+        }
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
     double sum = 0.0;
@@ -119,7 +126,6 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
     if (includeEnergy) {
-        cu.getIntegrationUtilities().prefetchKineticEnergy();
         sum += cu.reduceEnergy();
         cu.getIntegrationUtilities().finishKineticEnergyPrefetch();
     }
