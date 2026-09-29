@@ -98,9 +98,34 @@ void MetalArray::uploadSubArray(const void* data, int offset, int elements, bool
         throw OpenMMException("MetalArray has not been initialized");
     if (offset < 0 || offset+elements > getSize())
         throw OpenMMException("uploadSubArray: data exceeds range of array");
-    context->getCurrentStream().finish();
+    MetalQueue& queue = context->getCurrentStream();
+    size_t bytes = (size_t) elements*elementSize, destOffset = (size_t) offset*elementSize;
+    if (bytes == 0)
+        return;
+    std::lock_guard<std::recursive_mutex> guard(queue.getLock());
+    // While the GPU still has work, a host write could race kernels encoded before this upload, and waiting for them
+    // leaves the GPU idle for a full round trip (about 250 us per upload on the M3 Ultra; CustomIntegrator steps
+    // upload their globals several times per step).  So stage the data and copy it in order on the queue instead.
+    if (!queue.isDrained() && bytes%4 == 0 && destOffset%4 == 0) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::Buffer* staging = context->getDevice()->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        if (staging == 0)
+            throw OpenMMException("uploadSubArray: can't allocate a staging buffer for "+name);
+        if (pairStorage)
+            doublesToPairs((const double*) data, (float*) staging->contents(), elements*4);
+        else
+            memcpy(staging->contents(), data, bytes);
+        MTL::BlitCommandEncoder* blit = queue.getCommandBuffer()->blitCommandEncoder();
+        blit->copyFromBuffer(staging, 0, pointer, destOffset, bytes);
+        blit->endEncoding();
+        MetalQueue::noteWork();
+        staging->release();   // the command buffer retains it until the copy completes
+        pool->release();
+        return;
+    }
+    queue.finish();
     MetalQueue::noteWork();
-    char* dest = reinterpret_cast<char*>(pointer->contents())+offset*elementSize;
+    char* dest = reinterpret_cast<char*>(pointer->contents())+destOffset;
     if (pairStorage)
         doublesToPairs((const double*) data, (float*) dest, elements*4);
     else
