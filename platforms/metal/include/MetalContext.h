@@ -556,11 +556,23 @@ public:
      * Run the work given to addAfterForcePass() since the last call, in order.
      */
     void executeAfterForcePass();
+    int getMaxDeferredEnergies() const {
+        return MaxDeferredEnergies;
+    }
+    void setDeferredEnergySlot(int slot) {
+        deferredEnergySlot = slot;
+    }
+    void downloadDeferredEnergies(int count, std::vector<double>& energies);
 private:
     friend class MetalSort;
     void releaseResources();
     void releaseModule(metalModule_t module);
     void releaseKernel(metalFunction_t kernel);
+    /**
+     * A round trip to the GPU costs about 170 us on the M3 Ultra, so a CustomIntegrator that reads the energy
+     * twice per step (FAH's nonequilibrium switching) waits for up to this many energies before it downloads them.
+     */
+    static const int MaxDeferredEnergies = 128;
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
      * each buffer.  When the kernel has too many arguments for separate bindings, offsets holds where
@@ -606,7 +618,8 @@ private:
     std::map<metalFunction_t, KernelArguments> kernelArguments;
     metalDevice_t device;
     void* pinnedBuffer;
-    MetalArray energyBuffer;
+    MetalArray energyBuffer, deferredEnergies;
+    int deferredEnergySlot = -1;
     MetalIntegrationUtilities* integration;
     MetalExpressionUtilities* expression;
     MetalBondedUtilities* bonded;

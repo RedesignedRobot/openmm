@@ -675,6 +675,25 @@ public:
         work();
     }
     /**
+     * Get how many potential energies setDeferredEnergySlot() can keep on the device.  0 means the platform can't,
+     * and every force evaluation returns the whole energy.
+     */
+    virtual int getMaxDeferredEnergies() const {
+        return 0;
+    }
+    /**
+     * Make the force evaluations that follow leave the device part of the potential energy in a slot on the device
+     * instead of downloading it, so the host doesn't wait for the device.  They return only the part computed on the
+     * host.  Pass -1 to download energies again.
+     */
+    virtual void setDeferredEnergySlot(int slot) {
+    }
+    /**
+     * Download the device parts of the energies in slots 0 to count-1.  This waits for the device.
+     */
+    virtual void downloadDeferredEnergies(int count, std::vector<double>& energies) {
+    }
+    /**
      * Register a global parameter whose value should be stored in the array returned by
      * getGlobalParamValues().  This may safely be called multiple times with the same
      * parameter name, and it returns the same index each time.

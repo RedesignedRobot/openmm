@@ -908,6 +908,19 @@ double MetalContext::reduceEnergy() {
     reduceEnergyKernel->setArg(2, energyBuffer.getSize());
     reduceEnergyKernel->setArg(3, workGroupSize);
     reduceEnergyKernel->execute(workGroupSize*energySum.getSize(), workGroupSize);
+    if (deferredEnergySlot >= 0) {
+        if (!deferredEnergies.isInitialized())
+            deferredEnergies.initialize(*this, MaxDeferredEnergies*energySum.getSize(), energySum.getElementSize(), "deferredEnergies");
+        size_t bytes = energySum.getSize()*energySum.getElementSize();
+        MetalQueue& queue = getCurrentStream();
+        lock_guard<recursive_mutex> guard(queue.getLock());
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::BlitCommandEncoder* blit = queue.getCommandBuffer()->blitCommandEncoder();
+        blit->copyFromBuffer(unwrap(energySum).getDevicePointer(), 0, deferredEnergies.getDevicePointer(), deferredEnergySlot*bytes, bytes);
+        blit->endEncoding();
+        pool->release();
+        return 0;
+    }
     energySum.download(pinnedBuffer);
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
@@ -919,6 +932,25 @@ double MetalContext::reduceEnergy() {
             result += ((float*) pinnedBuffer)[i];
     }
     return result;
+}
+
+void MetalContext::downloadDeferredEnergies(int count, vector<double>& energies) {
+    energies.resize(count);
+    if (count == 0)
+        return;
+    int n = energySum.getSize();
+    vector<char> values(deferredEnergies.getSize()*deferredEnergies.getElementSize());
+    deferredEnergies.download(values.data());
+    for (int slot = 0; slot < count; slot++) {
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            if (getUseDoublePrecision() || getUseMixedPrecision())
+                sum += ((double*) values.data())[slot*n+i];
+            else
+                sum += ((float*) values.data())[slot*n+i];
+        }
+        energies[slot] = sum;
+    }
 }
 
 void MetalContext::flushQueue() {

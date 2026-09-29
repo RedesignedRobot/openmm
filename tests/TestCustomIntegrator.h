@@ -1374,6 +1374,59 @@ void testRelatedPowers() {
     }
 }
 
+/**
+ * Test an integrator that records the energy into globals twice per step and reads them only on the host, the way
+ * nonequilibrium switching accumulates protocol work.  A platform may keep those energies on the device and compute
+ * the globals later.  The work must match an integrator that reads it on the device every step, across mid-run
+ * reads and a mid-run reset.
+ */
+void testDeferredEnergy() {
+    System system;
+    for (int i = 0; i < 3; i++)
+        system.addParticle(1.0+i);
+    CustomBondForce* switched = new CustomBondForce("lambda*k*(r-r0)^2");
+    switched->addGlobalParameter("lambda", 0.0);
+    switched->addPerBondParameter("k");
+    switched->addPerBondParameter("r0");
+    switched->addBond(0, 1, {100.0, 1.0});
+    switched->addBond(1, 2, {50.0, 1.5});
+    system.addForce(switched);
+    HarmonicBondForce* fixed = new HarmonicBondForce();
+    fixed->addBond(0, 2, 2.0, 20.0);
+    system.addForce(fixed);
+    vector<Vec3> positions = {Vec3(0, 0, 0), Vec3(1.2, 0, 0), Vec3(1.2, 1.3, 0.1)};
+    vector<vector<double> > work(2);
+    for (int readOnDevice = 0; readOnDevice < 2; readOnDevice++) {
+        CustomIntegrator integrator(0.001);
+        integrator.addGlobalVariable("work", 0);
+        integrator.addGlobalVariable("Eold", 0);
+        integrator.addGlobalVariable("Enew", 0);
+        integrator.addGlobalVariable("n", 0);
+        integrator.addPerDofVariable("seen", 0);
+        integrator.addComputePerDof("v", "v+0.5*dt*f/m");
+        integrator.addComputePerDof("x", "x+dt*v");
+        integrator.addComputeGlobal("Eold", "energy");
+        integrator.addComputeGlobal("lambda", "0.5*(1-cos(0.02*n))");
+        integrator.addComputeGlobal("Enew", "energy");
+        integrator.addComputeGlobal("work", "work+Enew-Eold");
+        integrator.addComputeGlobal("n", "n+1");
+        integrator.addComputePerDof("v", "v+0.5*dt*f/m");
+        if (readOnDevice)
+            integrator.addComputePerDof("seen", "work");
+        Context context(system, integrator, platform);
+        context.setPositions(positions);
+        for (int i = 0; i < 20; i++) {
+            integrator.step(i == 7 ? 150 : 13);
+            work[readOnDevice].push_back(integrator.getGlobalVariableByName("work"));
+            if (i == 11)
+                integrator.setGlobalVariableByName("work", 0.0);
+        }
+    }
+    ASSERT(work[0][19] != 0.0);
+    for (int i = 0; i < 20; i++)
+        ASSERT_EQUAL_TOL(work[1][i], work[0][i], 1e-5);
+}
+
 void runPlatformTests();
 
 int main(int argc, char* argv[]) {
@@ -1407,6 +1460,7 @@ int main(int argc, char* argv[]) {
         testAnalyzeComputations();
         testMergedRandoms();
         testRelatedPowers();
+        testDeferredEnergy();
         runPlatformTests();
     }
     catch(const exception& e) {
