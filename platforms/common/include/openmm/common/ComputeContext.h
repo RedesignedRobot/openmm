@@ -635,23 +635,18 @@ public:
     virtual void addForcePassKernel(ComputeKernel kernel, int workUnits) {
     }
     /**
-     * Get how many potential energies setDeferredEnergySlot() can keep on the device.  0 means the platform can't,
-     * and every force evaluation returns the whole energy.
+     * Get how many partial sums setDeferredEnergy() stores per energy, or 0 if the platform can't leave the energy on
+     * the device.  The partial sums are doubles in double and mixed precision and floats in single.
      */
-    virtual int getMaxDeferredEnergies() const {
+    virtual int getNumEnergyPartialSums() const {
         return 0;
     }
     /**
-     * Make the force evaluations that follow leave the device part of the potential energy in a slot on the device
-     * instead of downloading it, so the host doesn't wait for the device.  They return only the part computed on the
-     * host.  Pass -1 to download energies again.
+     * Make the force evaluations that follow copy the partial sums of the device part of the potential energy into
+     * dest, starting at element index*getNumEnergyPartialSums(), instead of downloading them, so the host doesn't wait
+     * for the device.  They return only the part computed on the host.  Pass NULL to download energies again.
      */
-    virtual void setDeferredEnergySlot(int slot) {
-    }
-    /**
-     * Download the device parts of the energies in slots 0 to count-1.  This waits for the device.
-     */
-    virtual void downloadDeferredEnergies(int count, std::vector<double>& energies) {
+    virtual void setDeferredEnergy(ArrayInterface* dest, int index) {
     }
     /**
      * Register a global parameter whose value should be stored in the array returned by

@@ -512,19 +512,14 @@ public:
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
      */
     void executeForcePassKernels();
-    int getMaxDeferredEnergies() const {
-        return MaxDeferredEnergies;
+    int getNumEnergyPartialSums() const {
+        return energySum.getSize();
     }
-    void setDeferredEnergySlot(int slot) {
-        deferredEnergySlot = slot;
+    void setDeferredEnergy(ArrayInterface* dest, int index) {
+        deferredEnergy = dest;
+        deferredEnergyIndex = index;
     }
-    void downloadDeferredEnergies(int count, std::vector<double>& energies);
 private:
-    /**
-     * A round trip to the GPU costs about 170 us on the M3 Ultra, so a CustomIntegrator that reads the energy
-     * twice per step (FAH's nonequilibrium switching) waits for up to this many energies before it downloads them.
-     */
-    static const int MaxDeferredEnergies = 128;
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
      * each buffer.  When the kernel has too many arguments for separate bindings, offsets holds where
@@ -567,8 +562,9 @@ private:
     std::map<metalFunction_t, KernelArguments> kernelArguments;
     metalDevice_t device;
     void* pinnedBuffer;
-    MetalArray energyBuffer, deferredEnergies;
-    int deferredEnergySlot = -1;
+    MetalArray energyBuffer;
+    ArrayInterface* deferredEnergy = NULL;
+    int deferredEnergyIndex = 0;
     MetalIntegrationUtilities* integration;
     MetalExpressionUtilities* expression;
     MetalBondedUtilities* bonded;

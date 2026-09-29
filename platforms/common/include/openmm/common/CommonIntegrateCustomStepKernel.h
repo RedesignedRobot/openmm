@@ -135,6 +135,12 @@ private:
     bool readsDeferredValue(int step) const;
     void deferGlobal(int step, double uniform, double gaussian);
     void resolveDeferredGlobals();
+    /**
+     * A round trip to the GPU costs about 170 us on the M3 Ultra, so a CustomIntegrator that reads the energy
+     * twice per step (FAH's nonequilibrium switching) keeps up to this many energies on the device before it
+     * downloads them.
+     */
+    static const int MaxDeferredEnergies = 128;
     ComputeContext& cc;
     double energy;
     int energySlot, numDeferredEnergies;
@@ -148,7 +154,7 @@ private:
     std::vector<bool> deviceValuesAreCurrent;
     mutable std::vector<bool> localValuesAreCurrent;
     ComputeArray globalValues, sumBuffer, summedValue;
-    ComputeArray uniformRandoms, randomSeed, perDofEnergyParamDerivs;
+    ComputeArray uniformRandoms, randomSeed, perDofEnergyParamDerivs, deferredEnergies;
     std::vector<ComputeArray> tabulatedFunctions, perDofValues;
     std::map<int, double> savedEnergy;
     std::map<int, ComputeArray> savedForces;
