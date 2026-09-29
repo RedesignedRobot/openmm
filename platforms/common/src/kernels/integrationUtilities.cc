@@ -142,6 +142,10 @@ inline DEVICE void storeShakeCluster(int4 atoms, GLOBAL mixed4s* RESTRICT values
  * Enforce constraints on one SHAKE cluster.  clusterPos holds the positions of its atoms at the start of the step, and
  * delta their displacements, which this updates.
  */
+#ifndef SHAKE_MAX_ITER
+#define SHAKE_MAX_ITER 15
+#endif
+
 DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE const mixed4* clusterPos, PRIVATE mixed4* delta) {
     mixed4 pos = clusterPos[0], pos1 = clusterPos[1], pos2 = clusterPos[2], pos3 = clusterPos[3];
     mixed4 xpi = delta[0], xpj1 = delta[1], xpj2 = delta[2], xpj3 = delta[3];
@@ -172,7 +176,7 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
 
     bool converged = false;
     int iteration = 0;
-    while (iteration < 15 && !converged) {
+    while (iteration < SHAKE_MAX_ITER && !converged) {
         converged = true;
         mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
         mixed rpsqij = rpij.x*rpij.x + rpij.y*rpij.y + rpij.z*rpij.z;
@@ -308,7 +312,7 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
 
     bool converged = false;
     int iteration = 0;
-    while (iteration < 15 && !converged) {
+    while (iteration < SHAKE_MAX_ITER && !converged) {
         converged = true;
         mixed3 rpij = make_mixed3(xpi.x-xpj1.x, xpi.y-xpj1.y, xpi.z-xpj1.z);
         mixed rrpr = rpij.x*rij1.x + rpij.y*rij1.y + rpij.z*rij1.z;

@@ -95,12 +95,29 @@ struct alignas(8) df64 {
     threadgroup df64& operator=(df64 v) threadgroup { hi = v.hi; lo = v.lo; return *this; }
     volatile threadgroup df64& operator=(df64 v) volatile threadgroup { hi = v.hi; lo = v.lo; return *this; }
 
+#ifdef DIAG_Q
+    // Diag only: a truncating IEEE load and store, the lower bound on what any cheaper device df64 format can cost.
+    df64(const device df64& o) {
+        const device uint* w = reinterpret_cast<const device uint*>(&o);
+        uint b = w[1];
+        uint e = (b >> 20) & 0x7FFu;
+        hi = e == 0 ? 0.0f : as_type<float>((b & 0x80000000u) | ((e - 896u) << 23) | ((b & 0xFFFFFu) << 3) | (w[0] >> 29));
+        lo = 0.0f;
+    }
+#else
     df64(const device df64& o) : df64(df64_load_ieee(reinterpret_cast<const device uint*>(&o))) {}
+#endif
     df64(const device df64s& o);
     thread df64& operator=(const device df64s& o) thread { return *this = df64(o); }
     df64(const constant df64& o) : df64(df64_load_ieee(reinterpret_cast<const constant uint*>(&o))) {}
     device df64& operator=(df64 v) device {
+#ifdef DIAG_Q
+        uint h = as_type<uint>(v.hi + v.lo);
+        uint e = (h >> 23) & 0xFFu;
+        uint2 b = e == 0 ? uint2(0u, h & 0x80000000u) : uint2(h << 29, (h & 0x80000000u) | ((e + 896u) << 20) | ((h & 0x7FFFFFu) >> 3));
+#else
         uint2 b = df64_to_ieee(v);
+#endif
         device uint* w = reinterpret_cast<device uint*>(this);
         w[0] = b.x;
         w[1] = b.y;

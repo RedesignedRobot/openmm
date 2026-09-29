@@ -266,6 +266,14 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_METAL"] = "1";
+    // Diag only (r2-mixed gbsa Step 0): off, q, shake0 or shake1.
+    const char* gbdiag = getenv("OPENMM_METAL_GBDIAG");
+    if (gbdiag != NULL && string(gbdiag) == "q")
+        compilationDefines["DIAG_Q"] = "1";
+    if (gbdiag != NULL && string(gbdiag) == "shake0")
+        compilationDefines["SHAKE_MAX_ITER"] = "0";
+    if (gbdiag != NULL && string(gbdiag) == "shake1")
+        compilationDefines["SHAKE_MAX_ITER"] = "1";
 
     // PME spreading with float atomics sums spans of up to 16 consecutive atoms in a threadgroup slab
     // per SIMD group and issues one device atomic per grid point a span touches (pme.cc).  1024
