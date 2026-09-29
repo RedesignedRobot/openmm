@@ -833,6 +833,7 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         encoder->dispatchThreadgroups(indirect, indirectOffset, MTL::Size(blockSize, 1, 1));
     else
         encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
+    queue.commitIfDrained();
 }
 
 int MetalContext::computeThreadBlockSize(double memory) const {
