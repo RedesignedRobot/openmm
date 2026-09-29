@@ -57,6 +57,7 @@
 #include <set>
 #include <sstream>
 #include <stack>
+#include <mutex>
 #include <thread>
 #include <typeinfo>
 #include <sys/stat.h>
@@ -65,6 +66,33 @@
 
 using namespace OpenMM;
 using namespace std;
+
+// Scratch instrument, never merged (r3-explicit). OPENMM_METAL_KCLOCK=<file> commits every kernel in its own command
+// buffer and sums GPUEndTime-GPUStartTime per kernel name. Kernels before step OPENMM_METAL_KCLOCK_SKIP (default 50)
+// still commit alone but aren't counted. The context's destructor appends the table to <file>.
+namespace {
+struct KernelClock {
+    mutex lock;
+    map<string, pair<long long, double> > totals;
+    map<metalFunction_t, string> names;
+    string path;
+    long long skip = 50, firstStep = -1, lastStep = -1;
+};
+
+KernelClock* kernelClock() {
+    static KernelClock* clock = []() {
+        const char* path = getenv("OPENMM_METAL_KCLOCK");
+        if (path == NULL)
+            return (KernelClock*) NULL;
+        KernelClock* c = new KernelClock();
+        c->path = path;
+        if (getenv("OPENMM_METAL_KCLOCK_SKIP") != NULL)
+            c->skip = atoll(getenv("OPENMM_METAL_KCLOCK_SKIP"));
+        return c;
+    }();
+    return clock;
+}
+}
 
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
@@ -396,6 +424,18 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
 
 MetalContext::~MetalContext() {
     pushAsCurrent();
+    KernelClock* clock = kernelClock();
+    if (clock != NULL && currentQueue.get() != NULL) {
+        getCurrentStream().finish();
+        lock_guard<mutex> guard(clock->lock);
+        ofstream out(clock->path, ios::app);
+        out << "steps " << (clock->lastStep-clock->firstStep) << " atoms " << getNumAtoms() << endl;
+        for (auto& t : clock->totals)
+            out << t.first << " " << t.second.first << " " << setprecision(9) << t.second.second*1e6 << endl;
+        out << "end" << endl;
+        clock->totals.clear();
+        clock->firstStep = clock->lastStep = -1;
+    }
     for (auto force : forces)
         delete force;
     for (auto listener : reorderListeners)
@@ -630,6 +670,10 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     bool typeInfo = (packed || useMixedPrecision);
     MTL::PipelineOption reflectionOptions = (typeInfo ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
     metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, reflectionOptions, &reflection, NULL));
+    if (kernelClock() != NULL && kernel != NULL) {
+        lock_guard<mutex> guard(kernelClock()->lock);
+        kernelClock()->names[kernel] = name;
+    }
     KernelArguments args;
     MTL::BufferBinding* argsBinding = NULL;
     vector<BufferLayout> bindingLayouts;
@@ -833,6 +877,27 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         encoder->dispatchThreadgroups(indirect, indirectOffset, MTL::Size(blockSize, 1, 1));
     else
         encoder->dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
+    KernelClock* clock = kernelClock();
+    if (clock == NULL)
+        return;
+    long long step = getStepCount();
+    if (step >= clock->skip) {
+        string name;
+        {
+            lock_guard<mutex> lock(clock->lock);
+            name = clock->names[kernel];
+            if (clock->firstStep < 0)
+                clock->firstStep = step;
+            clock->lastStep = step;
+        }
+        queue.addCompletedHandler([clock, name](MTL::CommandBuffer* buffer) {
+            double t = buffer->GPUEndTime()-buffer->GPUStartTime();
+            lock_guard<mutex> lock(clock->lock);
+            clock->totals[name].first++;
+            clock->totals[name].second += t;
+        });
+    }
+    queue.commit();
 }
 
 int MetalContext::computeThreadBlockSize(double memory) const {
