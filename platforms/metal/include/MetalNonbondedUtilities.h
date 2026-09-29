@@ -312,6 +312,11 @@ private:
      * Wait until copyInteractionCounts has written this step's counts to pinned memory.
      */
     void waitForCountCopy();
+    /**
+     * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
+     * atomOrder, atomRoles and the exclusions in that order.  See initialize().
+     */
+    bool chooseRoleOrder(const System& system);
     class KernelSet;
     struct CountAudit;
     class BlockSortTrait;
@@ -340,6 +345,11 @@ private:
     MetalArray displacementFlags, rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
+    // Role order: atomOrder maps a nonbonded index to a context index, atomRoles holds 1 for LJ and 2 for charge,
+    // and orderedPosq holds the positions in nonbonded order for the neighbor list kernels.
+    bool useRoleOrder = false;
+    int numInteractions = 0;
+    MetalArray atomOrder, atomRoles, orderedPosq;
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
@@ -379,6 +389,7 @@ public:
     metalFunction_t sortBoxDataKernel;
     metalFunction_t findInteractingBlocksKernel;
     metalFunction_t copyInteractionCountsKernel;
+    metalFunction_t gatherOrderedPositionsKernel;
 };
 
 } // namespace OpenMM

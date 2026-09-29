@@ -72,6 +72,14 @@ __device__ inline unsigned int firstNeighborListTile(unsigned int numTiles, unsi
     return belowInAllTiles-belowInExclusionTiles;
 }
 
+// In role order (MetalNonbondedUtilities::chooseRoleOrder) tiles, lists and exclusions use nonbonded indices, and
+// NB_ATOM maps one to the context index for positions, parameters and forces.
+#ifdef ROLE_ORDER
+#define NB_ATOM(i) atomOrder[i]
+#else
+#define NB_ATOM(i) (i)
+#endif
+
 extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded(
         unsigned long long* __restrict__ forceBuffers, mixed* __restrict__ energyBuffer, const real4* __restrict__ posq, const tileflags* __restrict__ exclusions,
         const int2* __restrict__ exclusionTiles, unsigned int startTileIndex, unsigned long long numTileIndices
@@ -80,6 +88,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, unsigned int maxTiles, const real4* __restrict__ blockCenter,
         const real4* __restrict__ blockSize, const unsigned int* __restrict__ interactingAtoms, unsigned int maxSinglePairs,
         const int2* __restrict__ singlePairs
+#ifdef ROLE_ORDER
+        , const int* __restrict__ atomOrder
+#endif
 #endif
         PARAMETER_ARGUMENTS) {
     const unsigned int totalWarps = (blockDim.x*gridDim.x)/TILE_SIZE;
@@ -96,7 +107,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         const unsigned int y = tileIndices.y;
         real3 force = make_real3(0);
         unsigned int atom1 = x*TILE_SIZE + tgx;
-        real4 posq1 = posq[atom1];
+        real4 posq1 = posq[NB_ATOM(atom1)];
         LOAD_ATOM1_PARAMETERS
 #ifdef USE_EXCLUSIONS
         tileflags excl = exclusions[pos*TILE_SIZE+tgx];
@@ -163,7 +174,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             // This is an off-diagonal tile.
             unsigned int j = y*TILE_SIZE + tgx;
             int atomIndex = j;
-            real4 shflPosq = posq[j];
+            real4 shflPosq = posq[NB_ATOM(j)];
             real3 shflForce;
             shflForce.x = 0.0f;
             shflForce.y = 0.0f;
@@ -232,14 +243,14 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             const unsigned int offset = atomIndex;
             // write results for off diagonal tiles
 #ifdef INCLUDE_FORCES
-            atomicAdd(&forceBuffers[offset], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
-            atomicAdd(&forceBuffers[offset+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.y)));
-            atomicAdd(&forceBuffers[offset+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.z)));
+            atomicAdd(&forceBuffers[NB_ATOM(offset)], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
+            atomicAdd(&forceBuffers[NB_ATOM(offset)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.y)));
+            atomicAdd(&forceBuffers[NB_ATOM(offset)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.z)));
 #endif
         }
         // Write results for on and off diagonal tiles
 #ifdef INCLUDE_FORCES
-        const unsigned int offset = x*TILE_SIZE + tgx;
+        const unsigned int offset = NB_ATOM(x*TILE_SIZE + tgx);
         atomicAdd(&forceBuffers[offset], static_cast<unsigned long long>(realToFixedPoint(force.x)));
         atomicAdd(&forceBuffers[offset+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
         atomicAdd(&forceBuffers[offset+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
@@ -304,7 +315,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         if (includeTile) {
             unsigned int atom1 = x*TILE_SIZE + tgx;
             // Load atom data for this tile.
-            real4 posq1 = posq[atom1];
+            real4 posq1 = posq[NB_ATOM(atom1)];
             LOAD_ATOM1_PARAMETERS
 #ifdef USE_NEIGHBOR_LIST
             unsigned int j = interactingAtoms[pos*TILE_SIZE+tgx];
@@ -320,7 +331,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             shflForce.z = 0.0f;
             if (j < PADDED_NUM_ATOMS) {
                 // Load position of atom j from from global memory
-                shflPosq = posq[j];
+                shflPosq = posq[NB_ATOM(j)];
                 LOAD_LOCAL_PARAMETERS_FROM_GLOBAL
             }
             else {
@@ -463,21 +474,21 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             xForceY += realToFixedPoint(force.y);
             xForceZ += realToFixedPoint(force.z);
             if (pos+1 == end || tiles[pos+1] != x) {
-                atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(xForceX));
-                atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
-                atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
+                atomicAdd(&forceBuffers[NB_ATOM(atom1)], static_cast<unsigned long long>(xForceX));
+                atomicAdd(&forceBuffers[NB_ATOM(atom1)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceY));
+                atomicAdd(&forceBuffers[NB_ATOM(atom1)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(xForceZ));
                 xForceX = xForceY = xForceZ = 0;
             }
 #else
-            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(force.x)));
-            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
-            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)], static_cast<unsigned long long>(realToFixedPoint(force.x)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.y)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(force.z)));
 #endif
             unsigned int atom2 = atomIndex;
             if (atom2 < PADDED_NUM_ATOMS) {
-                atomicAdd(&forceBuffers[atom2], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
-                atomicAdd(&forceBuffers[atom2+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.y)));
-                atomicAdd(&forceBuffers[atom2+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.z)));
+                atomicAdd(&forceBuffers[NB_ATOM(atom2)], static_cast<unsigned long long>(realToFixedPoint(shflForce.x)));
+                atomicAdd(&forceBuffers[NB_ATOM(atom2)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.y)));
+                atomicAdd(&forceBuffers[NB_ATOM(atom2)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(shflForce.z)));
             }
 #endif
         }
@@ -493,8 +504,8 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
         int2 pair = singlePairs[i];
         int atom1 = pair.x;
         int atom2 = pair.y;
-        real4 posq1 = posq[atom1];
-        real4 posq2 = posq[atom2];
+        real4 posq1 = posq[NB_ATOM(atom1)];
+        real4 posq2 = posq[NB_ATOM(atom2)];
         real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
 #ifdef USE_PERIODIC
         APPLY_PERIODIC_TO_DELTA(delta)
@@ -526,12 +537,12 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             real3 dEdR1 = delta*dEdR;
             real3 dEdR2 = -dEdR1;
 #endif
-            atomicAdd(&forceBuffers[atom1], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.x)));
-            atomicAdd(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.y)));
-            atomicAdd(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.z)));
-            atomicAdd(&forceBuffers[atom2], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.x)));
-            atomicAdd(&forceBuffers[atom2+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.y)));
-            atomicAdd(&forceBuffers[atom2+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.z)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.x)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.y)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom1)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR1.z)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom2)], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.x)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom2)+PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.y)));
+            atomicAdd(&forceBuffers[NB_ATOM(atom2)+2*PADDED_NUM_ATOMS], static_cast<unsigned long long>(realToFixedPoint(-dEdR2.z)));
 #endif
         }
     }
