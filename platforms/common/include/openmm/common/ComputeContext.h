@@ -643,6 +643,9 @@ public:
     virtual void addAfterForcePass(std::function<void()> work) {
         work();
     }
+    // PRICE PROBE ONLY.
+    virtual void addForcePassWork(std::function<void()> work) {
+    }
     /**
      * Register a global parameter whose value should be stored in the array returned by
      * getGlobalParamValues().  This may safely be called multiple times with the same

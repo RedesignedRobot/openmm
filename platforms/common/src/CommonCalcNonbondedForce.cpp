@@ -448,6 +448,11 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 }
                 pmeGrid1.initialize(cc, gridElements, 2*elementSize, "pmeGrid1");
                 pmeGrid2.initialize(cc, gridElements, 2*elementSize, "pmeGrid2");
+                probeGrid1.initialize(cc, gridElements, 2*elementSize, "probeGrid1");
+                probeGrid2.initialize(cc, gridElements, 2*elementSize, "probeGrid2");
+                probeForces.initialize(cc, cc.getLongForceBuffer().getSize(), sizeof(long long), "probeForces");
+                cc.clearBuffer(probeGrid1);
+                cc.clearBuffer(probeGrid2);
                 if (useFixedPointChargeSpreading)
                     cc.addAutoclearBuffer(pmeGrid2);
                 else
@@ -485,7 +490,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 bool forcePass = (!usePmeQueue && !doLJPME && cc.getSupportsForcePassKernels());
                 deferPmeSpread = (forcePass && !useFixedPointChargeSpreading);
                 deferPmeInterpolation = (forcePass && !deferPmeSpread);
-                if (deferPmeInterpolation)
+                if (deferPmeInterpolation || deferPmeSpread)
                     pmeDefines["ATOMIC_PME_FORCES"] = "1";
                 if (usePmeQueue) {
                     pmeDefines["USE_PME_STREAM"] = "1";
@@ -1062,6 +1067,20 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             if (deferPmeSpread) {
                 cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
                 cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
+                // PRICE PROBE ONLY: a second FFT chain and interpolation on dummy buffers, inside the pass.
+                if (!includeEnergy)
+                    cc.addForcePassWork([=] () {
+                        fft->execPmeConvolution(probeGrid1, probeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha));
+                        setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
+                        pmeInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
+                        pmeInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
+                        pmeInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
+                        pmeInterpolateForceKernel->setArg(1, probeForces);
+                        pmeInterpolateForceKernel->setArg(2, probeGrid1);
+                        pmeInterpolateForceKernel->execute(cc.getNumAtoms());
+                        pmeInterpolateForceKernel->setArg(1, cc.getLongForceBuffer());
+                        pmeInterpolateForceKernel->setArg(2, pmeGrid1);
+                    });
             }
             else {
                 pmeSpreadChargeKernel->execute(cc.getNumAtoms());

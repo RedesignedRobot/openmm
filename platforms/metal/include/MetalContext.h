@@ -523,6 +523,11 @@ public:
     void addAfterForcePass(std::function<void()> work) {
         afterForcePass.push_back(work);
     }
+    // PRICE PROBE ONLY: work encoded inside the force pass after the pass kernels.
+    void addForcePassWork(std::function<void()> work) {
+        forcePassWork.push_back(work);
+    }
+    std::vector<std::function<void()> > forcePassWork;
     /**
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
      */

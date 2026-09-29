@@ -139,6 +139,7 @@ private:
     ComputeArray cosSinSums;
     ComputeArray pmeGrid1;
     ComputeArray pmeGrid2;
+    ComputeArray probeGrid1, probeGrid2, probeForces;
     ComputeArray pmeBsplineModuliX;
     ComputeArray pmeBsplineModuliY;
     ComputeArray pmeBsplineModuliZ;
