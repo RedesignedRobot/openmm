@@ -82,7 +82,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), countCopies(0), countAudit(make_shared<CountAudit>()), missedCountReads(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        pinnedCountBuffer(NULL), countCopies(0), countAudit(make_shared<CountAudit>()), missedCountReads(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), mergeBatchTiles(false), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
@@ -316,6 +316,12 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             maxSinglePairs = maxPossiblePairs;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
         numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
+        // On Apple9 GPUs the SIMD groups that search one atom block share a threadgroup and pack their last partial
+        // tiles together.  On an M3 Ultra that leaves apoa1rf with 52,578 tiles instead of 56,660 for
+        // computeNonbonded.
+        mergeBatchTiles = (numTilesInBatch > 1 && context.getDevice()->supportsFamily(MTL::GPUFamilyApple9));
+        if (mergeBatchTiles)
+            findInteractingBlocksThreadBlockSize = context.getSIMDWidth()*numTilesInBatch;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
@@ -726,6 +732,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["MAX_BITS_FOR_PAIRS"] = context.intToString(getMaxBitsForPairs());
         defines["NUM_TILES_IN_BATCH"] = context.intToString(numTilesInBatch);
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
+        if (mergeBatchTiles)
+            defines["MERGE_BATCH_TILES"] = "1";
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
         if (sortBlocksByBins) {
