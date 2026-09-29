@@ -145,8 +145,7 @@ private:
     bool createOwnedKernels();
     MetalContext& cu;
     bool hasCheckedOwned = false, useOwned = false;
-    ComputeArray partialForce;
-    ComputeKernel ownedBornSumKernel, ownedForce1Kernel, ownedReduceBornForceKernel;
+    ComputeKernel ownedBornSumKernel, ownedForce1Kernel;
 };
 
 /**

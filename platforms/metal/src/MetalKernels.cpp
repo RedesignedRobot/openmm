@@ -279,17 +279,15 @@ void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
         CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
 }
 
-// Lanes that share one atom in reduceBornForceOwned.
-static const int REDUCE_LANES = 8;
-
 // Threads per threadgroup in the pair kernels, which launch one SIMD group per block pair.
 static const int PAIR_GROUP_SIZE = 256;
 
 // The block-pair kernels win when the half-list launch leaves the GPU short of work, so that its tail after the last
-// atomics is exposed, and lose when the launch already fills the GPU, since they read and write one partial per atom
-// per block.  gbsa (78 blocks) has 1.27 block pairs per SIMD group of the launch on the M3 Ultra (60 cores), where
-// they gain, and 7.6 on the M2 (10 cores), where they cost 12-14%.  The count per SIMD group comes from the core
-// count, so this picks the path per device and system.
+// atomics is exposed, and lose when the launch already fills the GPU.  gbsa (78 blocks) has 1.27 block pairs per SIMD
+// group of the launch on the M3 Ultra (60 cores), where they gain, and 7.6 on the M2 (10 cores), where they cost
+// 12-14%.  The count per SIMD group comes from the core count, so this picks the path per device and system.  Those
+// numbers predate Force1 adding with atomics, which gained another 3.7% single and 4.5% mixed on gbsa on the M3 Ultra
+// by removing the kernel that reduced its per-block partials; the M2 side wasn't measured again.
 static const double MAX_OWNED_BLOCK_PAIRS_PER_WARP = 2.0;
 
 bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
@@ -297,18 +295,12 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     if (!nb.getUseCutoff() || cu.getUseDoublePrecision())
         return false;
 
-    // The partial force buffer holds one slot per atom per block.  Keep it inside 1% of the working set.
-
     int numBlocks = cu.getNumAtomBlocks();
     int paddedAtoms = cu.getPaddedNumAtoms();
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
     int numWarps = threads/32;
     if ((double) numBlocks*numBlocks > MAX_OWNED_BLOCK_PAIRS_PER_WARP*numWarps)
         return false;
-    long long partialBytes = (long long) numBlocks*paddedAtoms*sizeof(mm_float4);
-    if (partialBytes > cu.getDevice()->recommendedMaxWorkingSetSize()/100)
-        return false;
-    partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
     map<string, string> defines;
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
@@ -321,7 +313,6 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     defines["NUM_BLOCKS"] = cu.intToString(numBlocks);
     defines["NUM_BLOCK_PAIRS"] = cu.intToString(numBlocks*(numBlocks+1)/2);
     defines["TILE_SIZE"] = "32";
-    defines["REDUCE_LANES"] = cu.intToString(REDUCE_LANES);
     defines["DIELECTRIC_OFFSET"] = "0.009f";
     defines["OBC_ALPHA"] = "1.0f";
     defines["OBC_BETA"] = "0.8f";
@@ -337,28 +328,18 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
-    ownedForce1Kernel->addArg(partialForce);
+    ownedForce1Kernel->addArg(cu.getLongForceBuffer());
+    ownedForce1Kernel->addArg(bornForce);
     ownedForce1Kernel->addArg(cu.getEnergyBuffer());
     ownedForce1Kernel->addArg(cu.getPosq());
     ownedForce1Kernel->addArg(bornSum);
     ownedForce1Kernel->addArg(params);
     ownedForce1Kernel->addArg(charges);
-    ownedForce1Kernel->addArg(bornRadii);
-    ownedForce1Kernel->addArg(obcChain);
     ownedForce1Kernel->addArg(); // Whether to include energy.
     for (int i = 0; i < 5; i++)
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
-    ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
-    ownedReduceBornForceKernel->addArg(partialForce);
-    ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
-    ownedReduceBornForceKernel->addArg(bornForce);
-    ownedReduceBornForceKernel->addArg(cu.getEnergyBuffer());
-    ownedReduceBornForceKernel->addArg(params);
-    ownedReduceBornForceKernel->addArg(bornRadii);
-    ownedReduceBornForceKernel->addArg(obcChain);
-    ownedReduceBornForceKernel->addArg(); // Whether to include energy.
     return true;
 }
 
@@ -375,12 +356,10 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
     int numBlocks = cu.getNumAtomBlocks();
     int pairThreads = min(threads, (numBlocks*(numBlocks+1)/2*32+PAIR_GROUP_SIZE-1)/PAIR_GROUP_SIZE*PAIR_GROUP_SIZE);
-    ownedForce1Kernel->setArg(8, (int) includeEnergy);
-    ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
+    ownedForce1Kernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
-    setPeriodicBoxArgs(cu, ownedForce1Kernel, 9);
+    setPeriodicBoxArgs(cu, ownedForce1Kernel, 8);
     ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     return 0.0;
 }
