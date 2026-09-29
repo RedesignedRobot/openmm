@@ -32,12 +32,14 @@ using namespace OpenMM;
 
 MetalEvent::MetalEvent(MetalContext& context) : context(context), buffer(NULL), value(0) {
     event = context.getDevice()->newSharedEvent();
+    deviceEvent = context.getDevice()->newEvent();
 }
 
 MetalEvent::~MetalEvent() {
     if (buffer != NULL)
         buffer->release();
     event->release();
+    deviceEvent->release();
 }
 
 void MetalEvent::enqueue() {
@@ -53,7 +55,11 @@ void MetalEvent::signal() {
     if (buffer != NULL)
         buffer->release();
     buffer = queue.getCommandBuffer()->retain();
-    buffer->encodeSignalEvent(event, ++value);
+    // Both events are signaled: the shared one for host waits, the device one for queue waits.  A queue wait
+    // on a MTLSharedEvent starts the waiting buffer 85 to 150 us after the signal on the M3 Ultra, a wait on a
+    // MTLEvent within 8 us, and the second signal costs the signaling buffer nothing (r3-pme flagmb arm 8).
+    buffer->encodeSignalEvent(deviceEvent, ++value);
+    buffer->encodeSignalEvent(event, value);
 }
 
 void MetalEvent::wait() {
@@ -86,5 +92,5 @@ void MetalEvent::checkBufferStatus() {
 void MetalEvent::queueWait(ComputeQueue queue) {
     MetalQueue& metalQueue = *dynamic_cast<MetalQueue*>(queue.get());
     std::lock_guard<std::recursive_mutex> guard(metalQueue.getLock());
-    metalQueue.getCommandBuffer()->encodeWait(event, value);
+    metalQueue.getCommandBuffer()->encodeWait(deviceEvent, value);
 }
