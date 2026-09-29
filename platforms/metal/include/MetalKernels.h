@@ -99,6 +99,10 @@ public:
      * @param force      the NonbondedForce this kernel will be used for
      */
     void initialize(const System& system, const NonbondedForce& force);
+    /**
+     * Copy changed parameters over to a context, after checking them against the neighbor list's role order.
+     */
+    void copyParametersToContext(ContextImpl& context, const NonbondedForce& force, int firstParticle, int lastParticle, int firstException, int lastException);
 private:
     MetalContext& cu;
 };

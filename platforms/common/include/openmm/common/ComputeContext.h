@@ -68,6 +68,8 @@ public:
     class WorkTask;
     class WorkThread;
     class ReorderListener;
+    class DeviceReorder;
+    struct MoleculeGroup;
     class ForcePreComputation;
     class ForcePostComputation;
     static const int ThreadBlockSize;
@@ -318,6 +320,30 @@ public:
      */
     void forceReorder();
     /**
+     * Install an object that reorders atoms on the device.  The context does not take ownership, and
+     * the object must outlive every later call to reorderAtoms().  Pass NULL to remove it.
+     */
+    void setDeviceReorder(DeviceReorder* reorder) {
+        deviceReorder = reorder;
+    }
+    /**
+     * Tell the installed DeviceReorder that the host copies of the atom index or cell offsets have
+     * changed, so they are the ones to use.  Call this after writing them from outside the context.
+     */
+    void atomOrderChangedOnHost();
+    /**
+     * Get the groups of identical molecules that reordering may exchange.
+     */
+    const std::vector<MoleculeGroup>& getMoleculeGroups() const {
+        return moleculeGroups;
+    }
+    /**
+     * Get a number that changes whenever the molecule groups are rebuilt.
+     */
+    int getMoleculeGroupsVersion() const {
+        return moleculeGroupsVersion;
+    }
+    /**
      * Add a listener that should be called whenever atoms get reordered.  The OpenCLContext
      * assumes ownership of the object, and deletes it when the context itself is deleted.
      */
@@ -456,6 +482,7 @@ public:
      * Get the host-side vector which contains the index of each atom.
      */
     const std::vector<int>& getAtomIndex() const {
+        syncAtomOrder();
         return atomIndex;
     }
     /**
@@ -472,13 +499,17 @@ public:
      * Get the number of cells by which the positions are offset.
      */
     std::vector<mm_int4>& getPosCellOffsets() {
+        syncAtomOrder();
+        atomOrderChangedOnHost();
         return posCellOffsets;
     }
     /**
      * Set the number of cells by which the positions are offset.
      */
     void setPosCellOffsets(std::vector<mm_int4>& offsets) {
+        syncAtomOrder();
         posCellOffsets = offsets;
+        atomOrderChangedOnHost();
     }
     /**
      * Replace all occurrences of a list of substrings.
@@ -665,10 +696,24 @@ public:
     void updateGlobalParamValues();
 protected:
     struct Molecule;
-    struct MoleculeGroup;
     class VirtualSiteInfo;
     void findMoleculeGroups();
     void resetAtomOrder();
+    /**
+     * Make the host copies of the atom index and cell offsets current, if a DeviceReorder has changed them.
+     */
+    void syncAtomOrder() const;
+    /**
+     * Compute a new atom order from positions without changing any state: newToOld[i] is the old index
+     * of the atom placed at i, and cells[i] is the number of box vectors that old atom i must be shifted
+     * by to move its molecule into the central box.
+     */
+    template <class Real, class Real4>
+    void findAtomOrder(const Real4* posq, std::vector<int>& newToOld, std::vector<mm_int4>& cells);
+    /**
+     * Update the host copies of the atom index and cell offsets for an order computed by findAtomOrder().
+     */
+    void updateAtomOrder(const std::vector<int>& newToOld, const std::vector<mm_int4>& cells);
     /**
      * Subclasses should invoke this from their constructors to initialize common kernels.
      */
@@ -700,6 +745,8 @@ protected:
     std::vector<int> atomIndex;
     std::vector<mm_int4> posCellOffsets;
     std::vector<ReorderListener*> reorderListeners;
+    DeviceReorder* deviceReorder = NULL;
+    int moleculeGroupsVersion = 0;
     std::vector<ForcePreComputation*> preComputations;
     std::vector<ForcePostComputation*> postComputations;
     std::vector<std::string> globalParamNames;
@@ -775,6 +822,38 @@ class OPENMM_EXPORT_COMMON ComputeContext::ReorderListener {
 public:
     virtual void execute() = 0;
     virtual ~ReorderListener() {
+    }
+};
+
+/**
+ * A platform can install a DeviceReorder to compute and apply scheduled atom orders on the device, so a
+ * reorder does not have to wait for the device to go idle.  After apply() the device holds an order the
+ * host copies of the atom index and cell offsets don't reflect yet; the context calls syncHost() before
+ * anything reads them.
+ */
+class OPENMM_EXPORT_COMMON ComputeContext::DeviceReorder {
+public:
+    virtual ~DeviceReorder() {
+    }
+    /**
+     * Queue a reorder from the current positions and return true, or return false to let the context
+     * reorder on the host.
+     */
+    virtual bool apply() = 0;
+    /**
+     * Bring the host copies of the atom index and cell offsets up to date, if apply() has changed them.
+     */
+    virtual void syncHost() = 0;
+    /**
+     * The host copies of the atom index or cell offsets have changed and must be used from now on.
+     */
+    virtual void hostChanged() = 0;
+protected:
+    static std::vector<int>& hostAtomIndex(ComputeContext& context) {
+        return context.atomIndex;
+    }
+    static std::vector<mm_int4>& hostCellOffsets(ComputeContext& context) {
+        return context.posCellOffsets;
     }
 };
 

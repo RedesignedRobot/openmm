@@ -293,7 +293,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         const real4* __restrict__ largeBlockCenter, const BoundingBox* __restrict__ largeBlockBoundingBox,
 #endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
-        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList
+#ifdef ROLE_ORDER
+        , const int* __restrict__ atomRoles
+#endif
+        ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
@@ -335,6 +339,13 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
         real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
         int neighborsInBuffer = 0;
         real4 pos1 = posq[x*TILE_SIZE+indexInTile];
+#ifdef ROLE_ORDER
+        // In role order an atom is listed only for the x atoms it shares a role with (1 LJ, 2 charge): any other
+        // pair contributes nothing.
+        const int role1 = atomRoles[x*TILE_SIZE+indexInTile];
+        const tileflags ljAtomsX = BALLOT((role1 & 1) != 0);
+        const tileflags chargedAtomsX = BALLOT((role1 & 2) != 0);
+#endif
 #ifdef USE_PERIODIC
         const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= PADDED_CUTOFF &&
                                          0.5f*periodicBoxSize.y-blockSizeX.y >= PADDED_CUTOFF &&
@@ -463,6 +474,15 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 const bool forceInclude = b & 1;
                 const int block2 = b >> 1;
                 int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#ifdef ROLE_ORDER
+                // An atom is listed only for the x atoms it shares a role with.  The role regions are contiguous, so
+                // a block of LJ-only atoms against a block of charge-only atoms (water O against H/H/M) has no pair to
+                // test, and one ballot skips its atom test.  On tip4pew that was a third of the candidate blocks.
+                const int role2 = atomRoles[y*TILE_SIZE+indexInTile];
+                const tileflags roleFlags = ((role2 & 1) ? ljAtomsX : 0) | ((role2 & 2) ? chargedAtomsX : 0);
+                if (BALLOT(roleFlags != 0) == 0)
+                    continue;
+#endif
 
                 #pragma unroll 1
                 for (int k = indexInTile; k < numExclusions; k += TILE_SIZE)
@@ -498,6 +518,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         real3 delta = trimTo3(pos2)-trimTo3(posBuffer[j]);
                         APPLY_PERIODIC_TO_DELTA(delta)
                         real d = delta.x*delta.x+delta.y*delta.y+delta.z*delta.z - PADDED_CUTOFF_SQUARED;
+#ifdef ROLE_ORDER
+                        d = ((roleFlags >> j) & 1) ? d : 1.0f;
+#endif
                         collectInteractions(interacts, d, j);
                     }
                 }
@@ -526,7 +549,11 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                             real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim)));
                             interacts |= (__float_as_uint(d) >> 31) << j;
                         }
+#ifdef ROLE_ORDER
+                        interacts &= atomFlags & roleFlags;
+#else
                         interacts &= atomFlags;
+#endif
                         atomFlags = 0;
                     }
                     while (atomFlags) {
@@ -534,6 +561,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                         atomFlags = atomFlags ^ (static_cast<tileflags>(1) << j);
                         real4 posj = posBuffer[j];
                         real d = fma(-posj.x, pos2.x, fma(-posj.y, pos2.y, fma(-posj.z, pos2.z, posj.w - lim)));
+#ifdef ROLE_ORDER
+                        d = ((roleFlags >> j) & 1) ? d : 1.0f;
+#endif
                         collectInteractions(interacts, d, j);
                     }
 #endif
@@ -651,9 +681,8 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
 // A separate dispatch supplies the device-wide ordering between the per-tile
 // displacement test and the decision.  It runs as one threadgroup, so on rebuild
 // steps it also computes the sort keys and sorts them, with only threadgroup
-// barriers.  Keys are unique, so ranking them gives sortShortList2's order.
-// Above 1024 blocks (SORT_BLOCKS_BY_BINS) the keys don't fit one threadgroup, and
-// it sizes the bin sort's three dispatches instead.
+// barriers, in sortShortList2's order.  Above MaxBlocksSortedInOneGroup blocks
+// (SORT_BLOCKS_BY_BINS) it sizes the bin sort's three dispatches instead.
 // It also does copyInteractionCounts' work for steps where the host doesn't wait
 // for the count, so those steps skip that dispatch.
 extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
@@ -662,7 +691,9 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
         unsigned int* __restrict__ dispatch) {
 #ifndef SORT_BLOCKS_BY_BINS
-    __shared__ unsigned int keys[NUM_BLOCKS];
+    __shared__ unsigned char blockBin[NUM_BLOCKS];
+    __shared__ unsigned int simdCounts[32*NUM_SIZE_BINS];
+    __shared__ unsigned int binStart[NUM_SIZE_BINS];
 #endif
     __shared__ bool anyMoved;
     if (threadIdx.x == 0)
@@ -706,25 +737,78 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
     if (!rebuild)
         return;
 
-    // The same keys as computeSortKeys.
+    // A stable counting sort over computeSortKeys' size bins, so sortedBlocks holds its keys in sorted order.
+    // Each SIMD group owns one contiguous run of blocks.  It counts its run per bin, one pass over the per-SIMD
+    // counts gives every run its offset inside each bin, and each SIMD group then places its run in order.
+    // Two barriers in all: one threadgroup runs on one core, so barriers and global loads set the time.
+    // The rank sort this replaced compared every pair of keys, 23 us per rebuild at 921 blocks on an M3 Ultra.
 
+    const int lane = threadIdx.x%32;
+    const int simd = threadIdx.x/32;
+    const int numSimds = (blockDim.x+31)/32;
+    const unsigned int perSimd = (NUM_BLOCKS+numSimds-1)/numSimds;
+    const unsigned int first = min(simd*perSimd, (unsigned int) NUM_BLOCKS);
+    const unsigned int last = min(first+perSimd, (unsigned int) NUM_BLOCKS);
     real2 sizeRange = make_real2(LOG(blockSizeRange->x), LOG(blockSizeRange->y));
-    int numSizeBins = 20;
-    real scale = numSizeBins/(sizeRange.y-sizeRange.x);
-    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
-        real4 box = blockBoundingBox[i];
-        real size = LOG(box.x+box.y+box.z);
-        int bin = (size-sizeRange.x)*scale;
-        bin = max(0, min(bin, numSizeBins-1));
-        keys[i] = (((unsigned int) bin)<<BIN_SHIFT) + i;
+    real scale = NUM_SIZE_BINS/(sizeRange.y-sizeRange.x);
+
+    // Lane b keeps bin b's count for this SIMD group's run.
+    unsigned int count = 0;
+    for (unsigned int base = first; base < last; base += 32) {
+        const unsigned int i = base+lane;
+        int bin = -1;
+        if (i < last) {
+            real4 box = blockBoundingBox[i];
+            real size = LOG(box.x+box.y+box.z);
+            bin = (size-sizeRange.x)*scale;
+            bin = max(0, min(bin, NUM_SIZE_BINS-1));
+            blockBin[i] = bin;
+        }
+        for (int b = 0; b < NUM_SIZE_BINS; b++) {
+            unsigned int n = __popc(BALLOT(bin == b));
+            if (lane == b)
+                count += n;
+        }
+    }
+    if (lane < NUM_SIZE_BINS)
+        simdCounts[simd*NUM_SIZE_BINS+lane] = count;
+    __syncthreads();
+
+    // SIMD group 0, lane b: bin b's per-run counts become offsets inside the bin, and the bin totals become
+    // bin starts.  All 32 lanes take part in the prefix sum.
+    if (simd == 0) {
+        unsigned int total = 0;
+        if (lane < NUM_SIZE_BINS) {
+            for (int w = 0; w < numSimds; w++) {
+                unsigned int n = simdCounts[w*NUM_SIZE_BINS+lane];
+                simdCounts[w*NUM_SIZE_BINS+lane] = total;
+                total += n;
+            }
+        }
+        unsigned int start = simd_prefix_exclusive_sum(total);
+        if (lane < NUM_SIZE_BINS)
+            binStart[lane] = start;
     }
     __syncthreads();
-    for (unsigned int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x) {
-        unsigned int key = keys[i];
-        unsigned int rank = 0;
-        for (unsigned int j = 0; j < NUM_BLOCKS; j++)
-            rank += (keys[j] < key);
-        sortedBlocks[rank] = key;
+
+    // Lane b keeps the next free slot of bin b for this run.
+    unsigned int next = 0;
+    if (lane < NUM_SIZE_BINS)
+        next = binStart[lane]+simdCounts[simd*NUM_SIZE_BINS+lane];
+    for (unsigned int base = first; base < last; base += 32) {
+        const unsigned int i = base+lane;
+        const int bin = (i < last ? (int) blockBin[i] : -1);
+        unsigned int slot = 0;
+        for (int b = 0; b < NUM_SIZE_BINS; b++) {
+            unsigned int bits = BALLOT(bin == b);
+            unsigned int binNext = SHFL(next, (ushort) b);
+            if (bin == b)
+                slot = binNext+__popc(bits & ((1u<<lane)-1));
+            if (lane == b)
+                next += __popc(bits);
+        }
+        if (bin >= 0)
+            sortedBlocks[slot] = (((unsigned int) bin)<<BIN_SHIFT) + i;
     }
 #endif
 }
@@ -807,4 +891,33 @@ extern "C" __global__ void scatterBlocks(const unsigned int* __restrict__ binRan
     }
 }
 #endif
+#endif
+
+#ifdef ROLE_ORDER
+/**
+ * Copy the positions into role order for the neighbor list kernels.  The nonbonded kernel reads posq through atomOrder
+ * itself, so it sees charges written after this runs.
+ */
+extern "C" __global__ void gatherOrderedPositions(const real4* __restrict__ posq, const int* __restrict__ atomOrder,
+        real4* __restrict__ orderedPosq) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x)
+        orderedPosq[i] = posq[atomOrder[i]];
+}
+
+/**
+ * Add the forces the nonbonded kernel accumulated in nonbonded order into the context force buffer, and clear them
+ * for the next step.  Runs after the force pass, so a plain add in a fixed order is exact.
+ */
+extern "C" __global__ void scatterOrderedForces(unsigned long long* __restrict__ orderedForces, const int* __restrict__ atomOrder,
+        unsigned long long* __restrict__ forceBuffers) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < PADDED_NUM_ATOMS; i += blockDim.x*gridDim.x) {
+        const int atom = atomOrder[i];
+        forceBuffers[atom] += orderedForces[i];
+        forceBuffers[atom+PADDED_NUM_ATOMS] += orderedForces[i+PADDED_NUM_ATOMS];
+        forceBuffers[atom+2*PADDED_NUM_ATOMS] += orderedForces[i+2*PADDED_NUM_ATOMS];
+        orderedForces[i] = 0;
+        orderedForces[i+PADDED_NUM_ATOMS] = 0;
+        orderedForces[i+2*PADDED_NUM_ATOMS] = 0;
+    }
+}
 #endif
