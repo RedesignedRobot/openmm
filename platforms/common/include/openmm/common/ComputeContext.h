@@ -67,6 +67,7 @@ public:
     class WorkTask;
     class WorkThread;
     class ReorderListener;
+    class ReorderPlanner;
     class ForcePreComputation;
     class ForcePostComputation;
     static const int ThreadBlockSize;
@@ -316,6 +317,30 @@ public:
      * perform reordering.
      */
     void forceReorder();
+    /**
+     * Install an object that prepares reorders ahead of time.  The context does not take ownership,
+     * and the planner must outlive every later call to reorderAtoms().  Pass NULL to remove it.
+     */
+    void setReorderPlanner(ReorderPlanner* planner) {
+        reorderPlanner = planner;
+    }
+    /**
+     * Discard any reorder prepared ahead of time, so the next reorder is computed from current
+     * positions.  Call this whenever positions are set from outside the simulation.
+     */
+    void cancelPreparedReorder();
+    /**
+     * Compute a new atom order from positions without changing any state: newToOld[i] is the old index
+     * of the atom placed at i, and cells[i] is the number of box vectors that old atom i must be shifted
+     * by to move its molecule into the central box.
+     */
+    template <class Real, class Real4>
+    void findAtomOrder(const Real4* posq, std::vector<int>& newToOld, std::vector<mm_int4>& cells);
+    /**
+     * Update the host copies of the atom index and cell offsets for an order computed by findAtomOrder().
+     * The caller moves the device arrays, including the device copy of the atom index.
+     */
+    void updateAtomOrder(const std::vector<int>& newToOld, const std::vector<mm_int4>& cells);
     /**
      * Add a listener that should be called whenever atoms get reordered.  The OpenCLContext
      * assumes ownership of the object, and deletes it when the context itself is deleted.
@@ -691,6 +716,7 @@ protected:
     std::vector<int> atomIndex;
     std::vector<mm_int4> posCellOffsets;
     std::vector<ReorderListener*> reorderListeners;
+    ReorderPlanner* reorderPlanner = NULL;
     std::vector<ForcePreComputation*> preComputations;
     std::vector<ForcePostComputation*> postComputations;
     std::vector<std::string> globalParamNames;
@@ -767,6 +793,29 @@ public:
     virtual void execute() = 0;
     virtual ~ReorderListener() {
     }
+};
+
+/**
+ * A platform can install a ReorderPlanner to compute the next atom order ahead of time from a
+ * snapshot of positions, so a scheduled reorder does not have to wait for the device to go idle.
+ */
+class OPENMM_EXPORT_COMMON ComputeContext::ReorderPlanner {
+public:
+    virtual ~ReorderPlanner() {
+    }
+    /**
+     * Called on every step that does not reorder, after the step counter has been incremented.
+     */
+    virtual void prepare() = 0;
+    /**
+     * Called when a scheduled reorder is due.  Apply a prepared order and return true, or return false
+     * to let the context reorder synchronously.
+     */
+    virtual bool apply() = 0;
+    /**
+     * Discard any prepared order.
+     */
+    virtual void cancel() = 0;
 };
 
 /**

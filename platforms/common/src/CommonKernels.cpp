@@ -223,6 +223,7 @@ void CommonUpdateStateDataKernel::setPositions(ContextImpl& context, const vecto
     }
     for (auto& offset : cc.getPosCellOffsets())
         offset = mm_int4(0, 0, 0, 0);
+    cc.cancelPreparedReorder();
     cc.reorderAtoms();
 }
 
@@ -361,6 +362,10 @@ void CommonUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream
     stream.write((char*) &time, sizeof(double));
     long long stepCount = cc.getStepCount();
     stream.write((char*) &stepCount, sizeof(long long));
+    // A reorder prepared ahead of time is not saved, so drop it here too.  Then the original
+    // and the restored simulation both compute their next reorder from the same positions.
+    for (auto ctx : cc.getAllContexts())
+        ctx->cancelPreparedReorder();
     int stepsSinceReorder = cc.getStepsSinceReorder();
     stream.write((char*) &stepsSinceReorder, sizeof(int));
     char* buffer = (char*) cc.getPinnedBuffer();
@@ -403,6 +408,7 @@ void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& 
         ctx->setTime(time);
         ctx->setStepCount(stepCount);
         ctx->setStepsSinceReorder(stepsSinceReorder);
+        ctx->cancelPreparedReorder();
     }
     char* buffer = (char*) cc.getPinnedBuffer();
     stream.read(buffer, cc.getPosq().getSize()*cc.getPosq().getElementSize());
