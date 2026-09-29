@@ -118,8 +118,11 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
-    if (includeEnergy)
+    if (includeEnergy) {
+        cu.getIntegrationUtilities().prefetchKineticEnergy();
         sum += cu.reduceEnergy();
+        cu.getIntegrationUtilities().finishKineticEnergyPrefetch();
+    }
     // Without a neighbor list nothing else inside step() commits, and the GPU would sit idle until the host
     // next waits for a result.
     if (!cu.getNonbondedUtilities().getUseNeighborList())
@@ -328,6 +331,12 @@ void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, con
             offset = mm_int4(0, 0, 0, 0);
     }
     CommonUpdateStateDataKernel::setPeriodicBoxVectors(context, a, b, c);
+}
+
+void MetalIntegrateLangevinMiddleStepKernel::initialize(const System& system, const LangevinMiddleIntegrator& integrator) {
+    CommonIntegrateLangevinMiddleStepKernel::initialize(system, integrator);
+    // Its kinetic energy is computeKineticEnergy(0), which a prefetch in the energy pass can answer.
+    cu.getIntegrationUtilities().setPrefetchKineticEnergy(true);
 }
 
 void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {

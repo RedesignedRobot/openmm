@@ -175,6 +175,7 @@ public:
     MetalIntegrateLangevinMiddleStepKernel(std::string name, const Platform& platform, MetalContext& cu) :
             CommonIntegrateLangevinMiddleStepKernel(name, platform, cu), cu(cu) {
     }
+    void initialize(const System& system, const LangevinMiddleIntegrator& integrator);
 private:
     void integrate(double tol);
     MetalContext& cu;

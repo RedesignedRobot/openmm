@@ -25,6 +25,7 @@
 
 #include "MetalIntegrationUtilities.h"
 #include "MetalContext.h"
+#include "MetalQueue.h"
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
@@ -40,7 +41,8 @@ static const int ClearArgument = 22;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
         ccmaConvergedMemory(NULL), numClearThreads(0), numBoundAutoclearBuffers(-1), clearsAutoclearBuffers(false),
-        pendingCMBlockSize(0), pendingCMVelocity(NULL) {
+        pendingCMBlockSize(0), pendingCMVelocity(NULL), prefetchesKineticEnergy(false), kineticEnergyQueued(false),
+        kineticEnergyWorkCount(-1) {
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -333,6 +335,38 @@ bool MetalIntegrationUtilities::bindAutoclearBuffers() {
     langevinMiddleKernel->setArg(ClearArgument-2, clearsAutoclearBuffers ? 1 : 0);
     langevinMiddleKernel->setArg(ClearArgument+MaxClearedBuffers, mm_int4(words[0], words[1], words[2], words[3]));
     return clearsAutoclearBuffers;
+}
+
+void MetalIntegrationUtilities::setPrefetchKineticEnergy(bool prefetch) {
+    prefetchesKineticEnergy = prefetch;
+}
+
+void MetalIntegrationUtilities::prefetchKineticEnergy() {
+    if (!prefetchesKineticEnergy)
+        return;
+    kineticEnergyKernel->execute(keWorkGroupSize, keWorkGroupSize);
+    kineticEnergyQueued = true;
+}
+
+void MetalIntegrationUtilities::finishKineticEnergyPrefetch() {
+    // The readback waited for everything queued, the kernel included.  Any later encoder or upload moves the count.
+    if (kineticEnergyQueued)
+        kineticEnergyWorkCount = MetalQueue::getWorkCount();
+    kineticEnergyQueued = false;
+}
+
+double MetalIntegrationUtilities::computeKineticEnergy(double timeShift) {
+    if (timeShift != 0 || kineticEnergyWorkCount != MetalQueue::getWorkCount())
+        return IntegrationUtilities::computeKineticEnergy(timeShift);
+    ContextSelector selector(context);
+    if (context.getUseMixedPrecision()) {
+        double energy;
+        kineticEnergy.download(&energy);
+        return energy;
+    }
+    float energy;
+    kineticEnergy.download(&energy);
+    return energy;
 }
 
 void MetalIntegrationUtilities::refillExhaustedRandomNumbers() {

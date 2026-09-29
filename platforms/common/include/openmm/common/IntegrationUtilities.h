@@ -127,7 +127,7 @@ public:
      * 
      * @param timeShift   the amount by which to shift the velocities in time
      */
-    double computeKineticEnergy(double timeShift);
+    virtual double computeKineticEnergy(double timeShift);
     /**
      * Compute the current velocities, shifting them in time to account for a leapfrog integrator.
      * 
