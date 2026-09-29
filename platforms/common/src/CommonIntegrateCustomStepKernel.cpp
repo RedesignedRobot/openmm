@@ -592,11 +592,21 @@ void CommonIntegrateCustomStepKernel::prepareForComputation(ContextImpl& context
         // replays it once something needs the value.  Energy parameter derivatives come with their own download,
         // so an integrator that uses them gains nothing.
 
+        int numPartialSums = cc.getNumEnergyPartialSums();
+        bool defersEnergy = false;
         canDeferEnergy.resize(numSteps, false);
-        for (int step = 0; step < numSteps; step++)
+        for (int step = 0; step < numSteps; step++) {
             canDeferEnergy[step] = (stepType[step] == CustomIntegrator::ComputeGlobal && stepTarget[step].type == VARIABLE &&
-                    cc.getMaxDeferredEnergies() > 0 && !needsEnergyParamDerivs);
+                    numPartialSums > 0 && !needsEnergyParamDerivs);
+            defersEnergy |= (canDeferEnergy[step] && needsEnergy[step]);
+        }
         deferredVariable.resize(expressionSet.getNumVariables(), false);
+        if (defersEnergy) {
+            if (cc.getUseDoublePrecision() || cc.getUseMixedPrecision())
+                deferredEnergies.initialize<double>(cc, MaxDeferredEnergies*numPartialSums, "deferredEnergies");
+            else
+                deferredEnergies.initialize<float>(cc, MaxDeferredEnergies*numPartialSums, "deferredEnergies");
+        }
 
         // Delete the custom functions.
 
@@ -716,21 +726,21 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
             else {
                 recordChangedParameters(context);
                 int slot = -1;
-                if (computeEnergy && canDeferEnergy[step]) {
-                    if (numDeferredEnergies == cc.getMaxDeferredEnergies())
+                if (computeEnergy && canDeferEnergy[step] && deferredEnergies.isInitialized()) {
+                    if (numDeferredEnergies == MaxDeferredEnergies)
                         resolveDeferredGlobals();
                     slot = numDeferredEnergies++;
-                    cc.setDeferredEnergySlot(slot);
+                    cc.setDeferredEnergy(&deferredEnergies, slot);
                 }
                 try {
                     ContextDeselector deselector(cc);
                     energy = context.calcForcesAndEnergy(computeForce, computeEnergy, forceGroups);
                 }
                 catch (...) {
-                    cc.setDeferredEnergySlot(-1);
+                    cc.setDeferredEnergy(NULL, 0);
                     throw;
                 }
-                cc.setDeferredEnergySlot(-1);
+                cc.setDeferredEnergy(NULL, 0);
                 savedEnergy[forceGroups] = energy;
                 savedEnergySlot[forceGroups] = slot;
                 if (needsEnergyParamDerivs) {
@@ -750,7 +760,7 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
         }
         bool deferStep = false;
         if (readsDeferredValue(step)) {
-            if (canDeferEnergy[step] && deferredGlobals.size() < 4*cc.getMaxDeferredEnergies())
+            if (canDeferEnergy[step] && deferredGlobals.size() < 4*MaxDeferredEnergies)
                 deferStep = true;
             else
                 resolveDeferredGlobals();
@@ -959,8 +969,24 @@ void CommonIntegrateCustomStepKernel::resolveDeferredGlobals() {
     if (deferredGlobals.empty() && numDeferredEnergies == 0)
         return;
     ContextSelector selector(cc);
-    vector<double> deviceEnergy;
-    cc.downloadDeferredEnergies(numDeferredEnergies, deviceEnergy);
+    vector<double> deviceEnergy(numDeferredEnergies, 0.0);
+    if (numDeferredEnergies > 0) {
+        int n = cc.getNumEnergyPartialSums();
+        if (deferredEnergies.getElementSize() == sizeof(double)) {
+            vector<double> sums;
+            deferredEnergies.download(sums);
+            for (int slot = 0; slot < numDeferredEnergies; slot++)
+                for (int i = 0; i < n; i++)
+                    deviceEnergy[slot] += sums[slot*n+i];
+        }
+        else {
+            vector<float> sums;
+            deferredEnergies.download(sums);
+            for (int slot = 0; slot < numDeferredEnergies; slot++)
+                for (int i = 0; i < n; i++)
+                    deviceEnergy[slot] += sums[slot*n+i];
+        }
+    }
 
     // Replay the deferred computations in order.  value holds each variable's latest deferred result.
 
