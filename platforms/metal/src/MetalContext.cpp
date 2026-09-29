@@ -880,3 +880,9 @@ void MetalContext::executeForcePassKernels() {
         kernel.first->execute(kernel.second);
     forcePassKernels.clear();
 }
+
+void MetalContext::executeAfterForcePass() {
+    for (auto& work : afterForcePass)
+        work();
+    afterForcePass.clear();
+}

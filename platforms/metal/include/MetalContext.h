@@ -27,6 +27,7 @@
  * -------------------------------------------------------------------------- */
 
 
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -503,15 +504,26 @@ public:
     bool getSupportsForcePassKernels() const;
     /**
      * Run a kernel at the start of the next force pass (MetalCalcForcesAndEnergyKernel::finishComputation).  It
-     * must add to the force buffers only with integer atomics.
+     * must not write any buffer the bonded or nonbonded kernels use, except to add to the force buffers with
+     * integer atomics.
      */
     void addForcePassKernel(ComputeKernel kernel, int workUnits) {
         forcePassKernels.push_back(std::make_pair(kernel, workUnits));
     }
     /**
+     * Run work right after the next force pass, before the post computations.
+     */
+    void addAfterForcePass(std::function<void()> work) {
+        afterForcePass.push_back(work);
+    }
+    /**
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
      */
     void executeForcePassKernels();
+    /**
+     * Run the work given to addAfterForcePass() since the last call, in order.
+     */
+    void executeAfterForcePass();
 private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
@@ -546,6 +558,7 @@ private:
     bool supportsHardwareFloatGlobalAtomicAdd;
     bool useBlockingSync, contextIsValid;
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
+    std::vector<std::function<void()> > afterForcePass;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;

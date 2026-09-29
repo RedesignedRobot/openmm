@@ -218,6 +218,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
         bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme, bool sortPmeAtoms) {
     this->usePmeQueue = false;
     this->deferPmeInterpolation = false;
+    this->deferPmeSpread = false;
     this->deviceIsCpu = deviceIsCpu;
     this->useFixedPointChargeSpreading = useFixedPointChargeSpreading;
     this->useCpuPme = useCpuPme;
@@ -475,10 +476,15 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                     dispersionFft = cc.createFFT(dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ, true);
                 this->usePmeQueue = usePmeQueue;
 
-                // Interpolation runs next to the bonded and nonbonded kernels where the platform allows it.  LJPME
-                // reuses pmeGrid1 for the dispersion grid before that pass, so it keeps interpolation in place.
+                // Where the platform allows it, one PME kernel runs next to the bonded and nonbonded kernels.  With
+                // float atomics that is charge spreading, a single kernel that needs only the positions, and the
+                // FFT, convolution and interpolation run right after the pass.  The fixed point path spreads with
+                // two kernels, so it keeps spreading in place and sends interpolation to the pass instead.  LJPME
+                // reuses pmeGrid1 for the dispersion grid before that pass, so it keeps everything in place.
 
-                deferPmeInterpolation = (!usePmeQueue && !doLJPME && cc.getSupportsForcePassKernels());
+                bool forcePass = (!usePmeQueue && !doLJPME && cc.getSupportsForcePassKernels());
+                deferPmeSpread = (forcePass && !useFixedPointChargeSpreading);
+                deferPmeInterpolation = (forcePass && !deferPmeSpread);
                 if (deferPmeInterpolation)
                     pmeDefines["ATOMIC_PME_FORCES"] = "1";
                 if (usePmeQueue) {
@@ -732,6 +738,50 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
     computePlasmaCorrectionKernel = program->createKernel("computePlasmaCorrection");
     info = new ForceInfo(force);
     cc.addForce(info);
+}
+
+void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat) {
+    // Energy steps take the separate kernels, since gridEvaluateEnergy needs the transformed grid.
+    if (includeEnergy || !fft->execPmeConvolution(pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha))) {
+        fft->execFFT(pmeGrid1, pmeGrid2, true);
+        if (cc.getUseDoublePrecision()) {
+            pmeConvolutionKernel->setArg<mm_double4>(4, recipBoxVectors[0]);
+            pmeConvolutionKernel->setArg<mm_double4>(5, recipBoxVectors[1]);
+            pmeConvolutionKernel->setArg<mm_double4>(6, recipBoxVectors[2]);
+            pmeEvalEnergyKernel->setArg<mm_double4>(5, recipBoxVectors[0]);
+            pmeEvalEnergyKernel->setArg<mm_double4>(6, recipBoxVectors[1]);
+            pmeEvalEnergyKernel->setArg<mm_double4>(7, recipBoxVectors[2]);
+        }
+        else {
+            pmeConvolutionKernel->setArg<mm_float4>(4, recipBoxVectorsFloat[0]);
+            pmeConvolutionKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[1]);
+            pmeConvolutionKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[2]);
+            pmeEvalEnergyKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[0]);
+            pmeEvalEnergyKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[1]);
+            pmeEvalEnergyKernel->setArg<mm_float4>(7, recipBoxVectorsFloat[2]);
+        }
+        if (includeEnergy)
+            pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+        pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+        fft->execFFT(pmeGrid2, pmeGrid1, false);
+    }
+    setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
+    if (cc.getUseDoublePrecision()) {
+        pmeInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
+        pmeInterpolateForceKernel->setArg(9, recipBoxVectors[1]);
+        pmeInterpolateForceKernel->setArg(10, recipBoxVectors[2]);
+    }
+    else {
+        pmeInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
+        pmeInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
+        pmeInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
+    }
+    if (deviceIsCpu)
+        pmeInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);
+    else if (deferPmeInterpolation)
+        cc.addForcePassKernel(pmeInterpolateForceKernel, cc.getNumAtoms());
+    else
+        pmeInterpolateForceKernel->execute(cc.getNumAtoms());
 }
 
 double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal) {
@@ -1009,50 +1059,16 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeSpreadChargeKernel->setArg(8, recipBoxVectorsFloat[1]);
                 pmeSpreadChargeKernel->setArg(9, recipBoxVectorsFloat[2]);
             }
-            pmeSpreadChargeKernel->execute(cc.getNumAtoms());
-            if (useFixedPointChargeSpreading)
-                pmeFinishSpreadChargeKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-            // Energy steps take the separate kernels, since gridEvaluateEnergy needs the transformed grid.
-            if (includeEnergy || !fft->execPmeConvolution(pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha))) {
-                fft->execFFT(pmeGrid1, pmeGrid2, true);
-                if (cc.getUseDoublePrecision()) {
-                    pmeConvolutionKernel->setArg<mm_double4>(4, recipBoxVectors[0]);
-                    pmeConvolutionKernel->setArg<mm_double4>(5, recipBoxVectors[1]);
-                    pmeConvolutionKernel->setArg<mm_double4>(6, recipBoxVectors[2]);
-                    pmeEvalEnergyKernel->setArg<mm_double4>(5, recipBoxVectors[0]);
-                    pmeEvalEnergyKernel->setArg<mm_double4>(6, recipBoxVectors[1]);
-                    pmeEvalEnergyKernel->setArg<mm_double4>(7, recipBoxVectors[2]);
-                }
-                else {
-                    pmeConvolutionKernel->setArg<mm_float4>(4, recipBoxVectorsFloat[0]);
-                    pmeConvolutionKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[1]);
-                    pmeConvolutionKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[2]);
-                    pmeEvalEnergyKernel->setArg<mm_float4>(5, recipBoxVectorsFloat[0]);
-                    pmeEvalEnergyKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[1]);
-                    pmeEvalEnergyKernel->setArg<mm_float4>(7, recipBoxVectorsFloat[2]);
-                }
-                if (includeEnergy)
-                    pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-                pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-                fft->execFFT(pmeGrid2, pmeGrid1, false);
-            }
-            setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
-            if (cc.getUseDoublePrecision()) {
-                pmeInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
-                pmeInterpolateForceKernel->setArg(9, recipBoxVectors[1]);
-                pmeInterpolateForceKernel->setArg(10, recipBoxVectors[2]);
+            if (deferPmeSpread) {
+                cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
+                cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
             }
             else {
-                pmeInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
-                pmeInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
-                pmeInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
+                pmeSpreadChargeKernel->execute(cc.getNumAtoms());
+                if (useFixedPointChargeSpreading)
+                    pmeFinishSpreadChargeKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+                computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
             }
-            if (deviceIsCpu)
-                pmeInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);
-            else if (deferPmeInterpolation)
-                cc.addForcePassKernel(pmeInterpolateForceKernel, cc.getNumAtoms());
-            else
-                pmeInterpolateForceKernel->execute(cc.getNumAtoms());
         }
 
         if (doLJPME && hasLJ) {
