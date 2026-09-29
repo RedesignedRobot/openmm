@@ -207,7 +207,11 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
         useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false), autoclearWorkCount(-1),
-        autoclearBufferCount(0) {
+        autoclearBufferCount(0), forceMemoEnabled(false), skippingForcePass(false), forceMemoWorkCount(-1), forcePassCount(0),
+        forcePassesSkipped(0), forceMemoGroups(0) {
+    const char* forceMemoEnv = getenv("OPENMM_METAL_FORCE_MEMO");
+    forceMemoAllowed = (forceMemoEnv == NULL || string(forceMemoEnv) != "0");
+    reportForceMemo = (forceMemoEnv != NULL && string(forceMemoEnv) == "stats");
     if (precision == "single") {
         useDoublePrecision = false;
         useMixedPrecision = false;
@@ -422,6 +426,8 @@ MetalContext::~MetalContext() {
     popAsCurrent();
     contextIsValid = false;
     device->release();
+    if (reportForceMemo)
+        fprintf(stderr, "OpenMM Metal: force memo skipped %lld of %lld force passes\n", forcePassesSkipped, forcePassCount);
 }
 
 void MetalContext::initialize() {
@@ -896,4 +902,44 @@ void MetalContext::clearAutoclearBuffersIfNeeded() {
     autoclearWorkCount = -1;
     if (!cleared)
         clearAutoclearBuffers();
+}
+
+void MetalContext::setForceMemoEnabled(bool enabled) {
+    forceMemoEnabled = (enabled && forceMemoAllowed);
+}
+
+void MetalContext::armForceMemo(int groups) {
+    forceMemoWorkCount = MetalQueue::getWorkCount();
+    forceMemoGroups = groups;
+    getPeriodicBoxVectors(forceMemoBox[0], forceMemoBox[1], forceMemoBox[2]);
+}
+
+bool MetalContext::getForceMemoCurrent() const {
+    return forceMemoWorkCount == MetalQueue::getWorkCount();
+}
+
+bool MetalContext::getForceMemoHolds(int groups) const {
+    if (!getForceMemoCurrent() || groups != forceMemoGroups)
+        return false;
+    Vec3 box[3];
+    getPeriodicBoxVectors(box[0], box[1], box[2]);
+    return box[0] == forceMemoBox[0] && box[1] == forceMemoBox[1] && box[2] == forceMemoBox[2];
+}
+
+void MetalContext::rearmForceMemo() {
+    armForceMemo(forceMemoGroups);
+}
+
+void MetalContext::disarmForceMemo() {
+    forceMemoWorkCount = -1;
+}
+
+void MetalContext::setSkippingForcePass(bool skipping) {
+    skippingForcePass = skipping;
+}
+
+void MetalContext::noteForcePass(bool skipped) {
+    forcePassCount++;
+    if (skipped)
+        forcePassesSkipped++;
 }

@@ -26,6 +26,10 @@
 #include "MetalKernels.h"
 #include "MetalForceInfo.h"
 #include "openmm/Context.h"
+#include "openmm/MonteCarloAnisotropicBarostat.h"
+#include "openmm/MonteCarloBarostat.h"
+#include "openmm/MonteCarloFlexibleBarostat.h"
+#include "openmm/MonteCarloMembraneBarostat.h"
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/NonbondedForceImpl.h"
 #include "openmm/common/ContextSelector.h"
@@ -74,11 +78,38 @@ struct ConcurrentDispatchScope {
 };
 
 void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
+    // The force memo (MetalContext::getForceMemoEnabled) needs every force to compute inside the pass, through
+    // the bonded and nonbonded utilities or force pass kernels, since a skipped pass still calls each force
+    // kernel's execute() and only the nonbonded kernel's Metal subclass returns early.  A barostat has to be
+    // there for the memo to pay: its trial computes the energy at the positions the step then needs forces for.
+    bool barostat = false, allInPass = true;
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const Force& force = system.getForce(i);
+        if (dynamic_cast<const MonteCarloBarostat*>(&force) != NULL || dynamic_cast<const MonteCarloAnisotropicBarostat*>(&force) != NULL ||
+                dynamic_cast<const MonteCarloMembraneBarostat*>(&force) != NULL || dynamic_cast<const MonteCarloFlexibleBarostat*>(&force) != NULL)
+            barostat = true;
+        else if (dynamic_cast<const NonbondedForce*>(&force) == NULL && dynamic_cast<const HarmonicBondForce*>(&force) == NULL &&
+                dynamic_cast<const HarmonicAngleForce*>(&force) == NULL && dynamic_cast<const PeriodicTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const RBTorsionForce*>(&force) == NULL && dynamic_cast<const CMAPTorsionForce*>(&force) == NULL &&
+                dynamic_cast<const CMMotionRemover*>(&force) == NULL && dynamic_cast<const AndersenThermostat*>(&force) == NULL)
+            allInPass = false;
+    }
+    cu.setForceMemoEnabled(barostat && allInPass);
 }
 
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
+    // A force pass is skipped when the memo says the buffers already hold its result.  A changed global
+    // parameter is uploaded first, which moves the work count and so ends the memo.
+    bool skip = (includeForces && !includeEnergy && cu.getForceMemoHolds(groups));
+    if (skip) {
+        cu.updateGlobalParamValues();
+        skip = cu.getForceMemoHolds(groups);
+    }
+    cu.setSkippingForcePass(skip);
+    if (skip)
+        return;
     cu.clearAutoclearBuffersIfNeeded();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
@@ -93,6 +124,18 @@ void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool
 
 double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups, bool& valid) {
     ContextSelector selector(cu);
+    if (cu.getSkippingForcePass()) {
+        // The buffers hold the forces already.  Only the work other kernels ordered into this pass runs.
+        cu.setSkippingForcePass(false);
+        cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
+        cu.getIntegrationUtilities().refillExhaustedRandomNumbers();
+        cu.noteForcePass(true);
+        if (!cu.getNonbondedUtilities().getUseNeighborList())
+            cu.getCurrentStream().commit();
+        return 0.0;
+    }
+    // With the memo on, an energy pass carries forces too, so the next force pass at the same positions can be skipped.
+    bool carryForces = (includeForces || (includeEnergy && cu.getForceMemoEnabled()));
 
     // The bonded and nonbonded kernels share no written buffer except the force buffer, and both only add
     // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
@@ -119,7 +162,7 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
             cu.getCurrentStream().setConcurrentDispatch(true);
             integration.prefetchKineticEnergy();
         }
-        cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+        cu.getNonbondedUtilities().computeInteractions(groups, carryForces, includeEnergy);
     }
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
@@ -135,7 +178,34 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         cu.getCurrentStream().commit();
     if (!cu.getForcesValid())
         valid = false;
+    bool memo = (carryForces && cu.getForceMemoEnabled() && valid && cu.getPreComputations().empty() && cu.getPostComputations().empty());
+    if (memo)
+        cu.armForceMemo(groups);
+    else
+        cu.disarmForceMemo();
+    cu.noteForcePass(false);
     return sum;
+}
+
+double MetalCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal) {
+    if (cu.getSkippingForcePass())
+        return 0.0;
+    return CommonCalcNonbondedForceKernel::execute(context, includeForces, includeEnergy, includeDirect, includeReciprocal);
+}
+
+void MetalApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context) {
+    // The trial's first energy pass ran just before this call, so a memo that is still current describes the
+    // forces the base class saves along with the positions.
+    savedForceMemo = cu.getForceMemoCurrent();
+    CommonApplyMonteCarloBarostatKernel::saveCoordinates(context);
+}
+
+void MetalApplyMonteCarloBarostatKernel::restoreCoordinates(ContextImpl& context) {
+    CommonApplyMonteCarloBarostatKernel::restoreCoordinates(context);
+    // The positions and forces are back, and the barostat set the box back before this call.
+    if (savedForceMemo)
+        cu.rearmForceMemo();
+    savedForceMemo = false;
 }
 
 void MetalCalcNonbondedForceKernel::initialize(const System& system, const NonbondedForce& force) {

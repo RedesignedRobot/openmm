@@ -126,7 +126,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == IntegrateNoseHooverStepKernel::Name())
         return new CommonIntegrateNoseHooverStepKernel(name, platform, cu);
     if (name == ApplyMonteCarloBarostatKernel::Name())
-        return new CommonApplyMonteCarloBarostatKernel(name, platform, cu);
+        return new MetalApplyMonteCarloBarostatKernel(name, platform, cu);
     if (name == RemoveCMMotionKernel::Name())
         return new MetalRemoveCMMotionKernel(name, platform, cu);
     if (name == CalcATMForceKernel::Name() )

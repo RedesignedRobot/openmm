@@ -99,8 +99,29 @@ public:
      * @param force      the NonbondedForce this kernel will be used for
      */
     void initialize(const System& system, const NonbondedForce& force);
+    /**
+     * Execute the kernel, unless the force pass is skipped (MetalContext::getSkippingForcePass).
+     */
+    double execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal);
 private:
     MetalContext& cu;
+};
+
+/**
+ * This kernel is invoked by MonteCarloBarostat to adjust the periodic box volume.  It keeps the force memo
+ * (MetalContext::getForceMemoEnabled) alive across a rejected trial, whose restore puts back the forces the
+ * base class saved with the positions.
+ */
+class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
+public:
+    MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu), savedForceMemo(false) {
+    }
+    void saveCoordinates(ContextImpl& context);
+    void restoreCoordinates(ContextImpl& context);
+private:
+    MetalContext& cu;
+    bool savedForceMemo;
 };
 
 /**

@@ -533,6 +533,46 @@ public:
      * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
      */
     void clearAutoclearBuffersIfNeeded();
+    /**
+     * Get whether a force pass may reuse the forces a previous pass left in the buffers (the force memo).
+     * MetalCalcForcesAndEnergyKernel turns it on for a System with a Monte Carlo barostat whose forces all
+     * compute inside the force pass.  The barostat's trial computes the energy twice, at the positions the
+     * step then needs forces for, so with the memo those energy passes carry forces and the step's pass is
+     * skipped.  OPENMM_METAL_FORCE_MEMO=0 turns it off; =stats prints the skipped pass count at exit.
+     */
+    bool getForceMemoEnabled() const {
+        return forceMemoEnabled;
+    }
+    void setForceMemoEnabled(bool enabled);
+    /**
+     * Record that the force buffers hold the forces for the current positions, box vectors and global
+     * parameters.  Any kernel, upload, box change or parameter change afterwards invalidates the memo.
+     */
+    void armForceMemo(int groups);
+    /**
+     * Get whether the memo still describes the force buffers: nothing was encoded or uploaded since, the box
+     * vectors are the same and the pass computes the same force groups.
+     */
+    bool getForceMemoHolds(int groups) const;
+    /**
+     * Get whether nothing was encoded or uploaded since armForceMemo().
+     */
+    bool getForceMemoCurrent() const;
+    /**
+     * Record that the positions, box vectors and force buffers a memo described were put back: the barostat
+     * kernel restores them together after a rejected trial.
+     */
+    void rearmForceMemo();
+    void disarmForceMemo();
+    /**
+     * Get whether the force pass in progress is skipped because the memo holds.  A force kernel that does its
+     * work in execute() instead of the pass must then return without doing anything.
+     */
+    bool getSkippingForcePass() const {
+        return skippingForcePass;
+    }
+    void setSkippingForcePass(bool skipping);
+    void noteForcePass(bool skipped);
 private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
@@ -569,6 +609,10 @@ private:
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
     long long autoclearWorkCount;
     int autoclearBufferCount;
+    bool forceMemoAllowed, forceMemoEnabled, reportForceMemo, skippingForcePass;
+    long long forceMemoWorkCount, forcePassCount, forcePassesSkipped;
+    int forceMemoGroups;
+    Vec3 forceMemoBox[3];
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
