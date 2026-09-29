@@ -337,7 +337,7 @@ private:
     MetalArray largeBlockBoundingBox;
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
-    MetalArray displacementFlags, rebuildDispatch;
+    MetalArray displacementFlags, rebuildDispatch, groupsDone;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
     ComputeSort blockSorter;
@@ -373,7 +373,7 @@ public:
     bool hasForces;
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
-    metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
+    metalFunction_t findBlockBoundsKernel;
     metalFunction_t countBlockBinsKernel, sumBlockBinsKernel, scatterBlocksKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;

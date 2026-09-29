@@ -60,7 +60,7 @@ static const int StepsPerCommandBuffer = 8;
 // size range per threadgroup instead of per block.
 static const int FindBlockBoundsThreadBlockSize = 256;
 
-// prepareRebuildDispatch sorts up to this many blocks in its one threadgroup.  Larger systems sort in
+// findBlockBounds' last threadgroup sorts up to this many blocks.  Larger systems sort in
 // three dispatches of BinSortThreadBlockSize threads (at most 256, since a block's rank inside its
 // threadgroup takes 8 bits).
 static const int MaxBlocksSortedInOneGroup = 1024;
@@ -334,6 +334,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         if (useIndirectRebuild) {
             displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
             rebuildDispatch.initialize<unsigned int>(context, 12, "rebuildDispatch");
+            groupsDone.initialize<unsigned int>(context, 1, "groupsDone");
+            groupsDone.upload(vector<unsigned int>(1, 0));
         }
         if (sortBlocksByBins) {
             int binSortGroups = (numAtomBlocks+BinSortThreadBlockSize-1)/BinSortThreadBlockSize;
@@ -399,6 +401,11 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
             findBlockBoundsArgs.push_back(&displacementFlags.getDevicePointer());
             findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
+            findBlockBoundsArgs.push_back(&interactionCount.getDevicePointer());
+            findBlockBoundsArgs.push_back(&pinnedCountDeviceMemory);
+            findBlockBoundsArgs.push_back(&sortedBlocks.getDevicePointer());
+            findBlockBoundsArgs.push_back(&rebuildDispatch.getDevicePointer());
+            findBlockBoundsArgs.push_back(&groupsDone.getDevicePointer());
         }
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
         computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
@@ -492,11 +499,6 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
 
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), FindBlockBoundsThreadBlockSize);
     if (useIndirectRebuild) {
-        void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
-                &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
-                &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
-        int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
-        context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
         MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
         if (sortBlocksByBins) {
             void* countArgs[] = {&blockBoundingBox.getDevicePointer(), &blockSizeRange.getDevicePointer(),
@@ -518,7 +520,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     }
     forceRebuildNeighborList = false;
-    // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
+    // With the indirect rebuild, findBlockBounds already copied a count, at most one list old,
     // which is all a step without the wait needs.
     bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
@@ -741,8 +743,6 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         metalModule_t interactingBlocksProgram = context.createModule(MetalKernelSources::vectorOps+MetalKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
-        if (useIndirectRebuild)
-            kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
         if (sortBlocksByBins) {
             kernels.countBlockBinsKernel = context.getKernel(interactingBlocksProgram, "countBlockBins");
             kernels.sumBlockBinsKernel = context.getKernel(interactingBlocksProgram, "sumBlockBins");
