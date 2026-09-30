@@ -844,7 +844,7 @@ extern "C" __global__ void sortBlocksInOneGroup(const real2* __restrict__ blockS
 }
 #endif
 
-#ifdef SORT_BLOCKS_BY_BINS
+#if defined(INDIRECT_REBUILD) && defined(SORT_BLOCKS_BY_BINS)
 /**
  * A stable counting sort over computeSortKeys' 20 size bins, for block counts too large for
  * sortBlocksInOneGroup.  Inside a bin, blocks stay in index order, which is the order of sorting
@@ -921,7 +921,6 @@ extern "C" __global__ void scatterBlocks(const unsigned int* __restrict__ binRan
         sortedBlocks[binOffsets[blockIdx.x*NUM_SIZE_BINS+bin]+rank] = (bin<<BIN_SHIFT) + index;
     }
 }
-#endif
 #endif
 
 #ifdef ROLE_ORDER
