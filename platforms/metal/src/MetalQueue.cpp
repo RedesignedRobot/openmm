@@ -25,6 +25,7 @@
 #include "MetalQueue.h"
 #include "MetalContext.h"
 #include "openmm/OpenMMException.h"
+#include <algorithm>
 #include <unistd.h>
 
 using namespace OpenMM;
@@ -34,9 +35,28 @@ using namespace std;
 // ahead of the GPU.
 static const int MaxBuffersInFlight = 8;
 
+// On the M3 Ultra a command buffer committed to a drained GPU starts 130 to 145 us after commit, against 35 to 45
+// us when the GPU is busy.  While finish() waits, keep-alive slices of about this many microseconds run on a second
+// command queue, at most this many in flight, so the GPU is still awake when the host commits the next real buffer.
+// Every slice is a finite loop; the host stops issuing them when the wait returns.
+static const double KeepAliveSliceSeconds = 100e-6;
+static const int KeepAliveSlicesInFlight = 2;
+static const unsigned int KeepAliveCalibrationIterations = 1<<15;
+static const char* KeepAliveSource =
+    "kernel void keepAlive(device unsigned int* out [[buffer(0)]], constant unsigned int& n [[buffer(1)]],\n"
+    "                      unsigned int id [[thread_position_in_grid]]) {\n"
+    "    unsigned int x = id+1;\n"
+    "    for (unsigned int i = 0; i < n; i++)\n"
+    "        x = x*1664525u+1013904223u;\n"
+    "    out[id] = x;\n"
+    "}\n";
+static const int KeepAliveThreads = 32;
+
 atomic<long long> MetalQueue::workCount(0);
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false), finishEvent(NULL), finishValue(0), finishedCommits(-1) {
+MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false), finishEvent(NULL), finishValue(0), finishedCommits(-1),
+        keepAliveQueue(NULL), keepAlivePipeline(NULL), keepAliveOut(NULL), keepAliveIterations(0) {
+    keepAliveEnabled = stream->device()->supportsFamily(MTL::GPUFamilyApple7);
 }
 
 MetalQueue::~MetalQueue() {
@@ -55,6 +75,16 @@ MetalQueue::~MetalQueue() {
         buffer->release();
     if (finishEvent != NULL)
         finishEvent->release();
+    for (MTL::CommandBuffer* slice : keepAlivePending) {
+        slice->waitUntilCompleted();
+        slice->release();
+    }
+    if (keepAliveOut != NULL)
+        keepAliveOut->release();
+    if (keepAlivePipeline != NULL)
+        keepAlivePipeline->release();
+    if (keepAliveQueue != NULL)
+        keepAliveQueue->release();
     stream->release();
 }
 
@@ -145,8 +175,11 @@ void MetalQueue::finish() {
     MTL::CommandBuffer* last = getCommandBuffer()->retain();
     last->encodeSignalEvent(finishEvent, ++finishValue);
     commit();
-    while (finishEvent->signaledValue() < finishValue && last->status() < MTL::CommandBufferStatusCompleted)
+    while (finishEvent->signaledValue() < finishValue && last->status() < MTL::CommandBufferStatusCompleted) {
+        if (keepAliveEnabled)
+            keepAlive();
         usleep(10);
+    }
     MTL::CommandBufferStatus status = last->status();
     string error = (status == MTL::CommandBufferStatusError ? string(last->error()->localizedDescription()->utf8String()) : "");
     last->release();
@@ -155,6 +188,62 @@ void MetalQueue::finish() {
     atomic_thread_fence(memory_order_acquire);
     commit();
     finishedCommits = commitCount;
+}
+
+void MetalQueue::keepAlive() {
+    // Create the second queue, the slice kernel and its output on first use, and size the slice once from GPU
+    // timestamps of a calibration run.
+    if (keepAlivePipeline == NULL) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::Device* device = stream->device();
+        NS::Error* error = NULL;
+        MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
+        MTL::Library* library = device->newLibrary(NS::String::string(KeepAliveSource, NS::UTF8StringEncoding), options, &error);
+        options->release();
+        MTL::Function* function = (library == NULL ? NULL : library->newFunction(NS::String::string("keepAlive", NS::UTF8StringEncoding)));
+        MTL::ComputePipelineState* pipeline = (function == NULL ? NULL : device->newComputePipelineState(function, &error));
+        if (function != NULL)
+            function->release();
+        if (library != NULL)
+            library->release();
+        pool->release();
+        if (pipeline == NULL) {
+            keepAliveEnabled = false;
+            return;
+        }
+        keepAlivePipeline = pipeline;
+        keepAliveQueue = device->newCommandQueue();
+        keepAliveOut = device->newBuffer(KeepAliveThreads*sizeof(unsigned int), MTL::ResourceStorageModePrivate);
+        keepAliveIterations = KeepAliveCalibrationIterations;
+        keepAlive();
+        MTL::CommandBuffer* probe = keepAlivePending.front();
+        probe->waitUntilCompleted();
+        double seconds = probe->GPUEndTime()-probe->GPUStartTime();
+        if (seconds > 0)
+            keepAliveIterations = (unsigned int) max(1024.0, min(1.0e7, KeepAliveCalibrationIterations*KeepAliveSliceSeconds/seconds));
+        reapKeepAlive();
+    }
+    reapKeepAlive();
+    if ((int) keepAlivePending.size() >= KeepAliveSlicesInFlight)
+        return;
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::CommandBuffer* slice = keepAliveQueue->commandBuffer()->retain();
+    MTL::ComputeCommandEncoder* sliceEncoder = slice->computeCommandEncoder();
+    sliceEncoder->setComputePipelineState(keepAlivePipeline);
+    sliceEncoder->setBuffer(keepAliveOut, 0, 0);
+    sliceEncoder->setBytes(&keepAliveIterations, sizeof(keepAliveIterations), 1);
+    sliceEncoder->dispatchThreads(MTL::Size(KeepAliveThreads, 1, 1), MTL::Size(KeepAliveThreads, 1, 1));
+    sliceEncoder->endEncoding();
+    slice->commit();
+    keepAlivePending.push_back(slice);
+    pool->release();
+}
+
+void MetalQueue::reapKeepAlive() {
+    while (!keepAlivePending.empty() && keepAlivePending.front()->status() >= MTL::CommandBufferStatusCompleted) {
+        keepAlivePending.front()->release();
+        keepAlivePending.pop_front();
+    }
 }
 
 bool MetalQueue::isIdle() {

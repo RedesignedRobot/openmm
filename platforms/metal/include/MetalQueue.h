@@ -112,6 +112,8 @@ private:
     void endEncoding();
     void submit();
     void runIdleCommits();
+    void keepAlive();
+    void reapKeepAlive();
     metalStream_t stream;
     MTL::CommandBuffer* openBuffer;
     MTL::ComputeCommandEncoder* encoder;
@@ -127,6 +129,14 @@ private:
     MTL::SharedEvent* finishEvent;
     uint64_t finishValue;
     long long finishedCommits;   // commitCount when finish() last saw the queue's final signal
+    // Keep-alive: while finish() waits, short bounded kernels on a second queue keep the GPU from idling, so the
+    // command buffer that follows the wait starts without the restart latency of a drained GPU.
+    bool keepAliveEnabled;
+    MTL::CommandQueue* keepAliveQueue;
+    MTL::ComputePipelineState* keepAlivePipeline;
+    MTL::Buffer* keepAliveOut;
+    std::deque<MTL::CommandBuffer*> keepAlivePending;
+    unsigned int keepAliveIterations;
 };
 
 } // namespace OpenMM
