@@ -134,7 +134,6 @@ void MetalQueue::finish() {
     lock_guard<recursive_mutex> guard(lock);
     if (openBuffer == NULL && isIdle()) {
         commit();
-        finishedCommits = commitCount;
         return;
     }
     // A command buffer's completion wakes a waiting host 90 to 110 us after the GPU finishes on the M3 Ultra, and
@@ -156,15 +155,6 @@ void MetalQueue::finish() {
     atomic_thread_fence(memory_order_acquire);
     commit();
     finishedCommits = commitCount;
-}
-
-void MetalQueue::commitIfDrained() {
-    // A command buffer committed to an idle queue on the M3 Ultra starts 72-85 us after the commit when it holds one
-    // kernel, and 134-142 us after when it holds a whole force evaluation.  So the first kernel after finish() goes
-    // out alone and the rest of the work queues behind it with no gap.
-    lock_guard<recursive_mutex> guard(lock);
-    if (openBuffer != NULL && commitCount == finishedCommits)
-        submit();
 }
 
 bool MetalQueue::isIdle() {

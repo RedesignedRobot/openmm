@@ -86,12 +86,6 @@ public:
      */
     bool isDrained();
     /**
-     * Commit the open command buffer if finish() emptied the queue and nothing has been committed since.  Kernel
-     * launches call this after encoding, so the GPU starts on the first kernel after a download without waiting
-     * for the rest.
-     */
-    void commitIfDrained();
-    /**
      * From now on, commit the open command buffer from a background thread whenever the GPU finishes every
      * committed buffer.  Code that can leave steps open calls this, so they don't wait for the host's next
      * commit after Integrator::step() returns.
