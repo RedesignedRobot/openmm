@@ -145,8 +145,26 @@ private:
     bool createOwnedKernels();
     MetalContext& cu;
     bool hasCheckedOwned = false, useOwned = false;
-    ComputeArray partialForce;
-    ComputeKernel ownedBornSumKernel, ownedForce1Kernel, ownedReduceBornForceKernel;
+    ComputeKernel ownedBornSumKernel, ownedForce1Kernel;
+};
+
+/**
+ * Changing the periodic box moves every atom a reorder has wrapped back to its unwrapped position first, so that its
+ * position stays the same.  The common kernel does that on the host with a download and an upload of all positions,
+ * and MonteCarloBarostat changes the box on every trial: 0.6 ms of a 2.4 ms trial on a 29,451-atom unit.  This one
+ * uploads the cell offsets and shifts the wrapped atoms on the device.
+ */
+class MetalUpdateStateDataKernel : public CommonUpdateStateDataKernel {
+public:
+    MetalUpdateStateDataKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonUpdateStateDataKernel(name, platform, cu), cu(cu) {
+    }
+    void initialize(const System& system);
+    void setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c);
+private:
+    MetalContext& cu;
+    ComputeArray cellOffsets, boxVectors;
+    ComputeKernel unwrapKernel;
 };
 
 /**
@@ -157,6 +175,7 @@ public:
     MetalIntegrateLangevinMiddleStepKernel(std::string name, const Platform& platform, MetalContext& cu) :
             CommonIntegrateLangevinMiddleStepKernel(name, platform, cu), cu(cu) {
     }
+    void initialize(const System& system, const LangevinMiddleIntegrator& integrator);
 private:
     void integrate(double tol);
     MetalContext& cu;

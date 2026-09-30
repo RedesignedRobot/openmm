@@ -46,7 +46,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == CalcForcesAndEnergyKernel::Name())
         return new MetalCalcForcesAndEnergyKernel(name, platform, cu);
     if (name == UpdateStateDataKernel::Name())
-        return new CommonUpdateStateDataKernel(name, platform, cu);
+        return new MetalUpdateStateDataKernel(name, platform, cu);
     if (name == ApplyConstraintsKernel::Name())
         return new CommonApplyConstraintsKernel(name, platform, cu);
     if (name == VirtualSitesKernel::Name())
