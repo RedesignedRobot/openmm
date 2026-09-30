@@ -455,10 +455,6 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 }
                 pmeGrid1.initialize(cc, gridElements, 2*elementSize, "pmeGrid1");
                 pmeGrid2.initialize(cc, gridElements, 2*elementSize, "pmeGrid2");
-                if (useFixedPointChargeSpreading)
-                    cc.addAutoclearBuffer(pmeGrid2);
-                else
-                    cc.addAutoclearBuffer(pmeGrid1);
                 pmeBsplineModuliX.initialize(cc, gridSizeX, elementSize, "pmeBsplineModuliX");
                 pmeBsplineModuliY.initialize(cc, gridSizeY, elementSize, "pmeBsplineModuliY");
                 pmeBsplineModuliZ.initialize(cc, gridSizeZ, elementSize, "pmeBsplineModuliZ");
@@ -481,6 +477,14 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 // The PME queue covers Coulomb PME on force-only steps.  LJPME shares the grids between two chains,
                 // so it stays in place.  Energy steps, and every step without the queue, take the paths below.
                 this->usePmeQueue = (usePmeQueue && hasCoulomb && !doLJPME);
+                // The spreading grid is cleared with the other accumulation buffers at the start of the step, except
+                // with the PME queue, where execute() clears it on the queue that spreads into it.
+                if (!this->usePmeQueue) {
+                    if (useFixedPointChargeSpreading)
+                        cc.addAutoclearBuffer(pmeGrid2);
+                    else
+                        cc.addAutoclearBuffer(pmeGrid1);
+                }
 
                 // Where the platform allows it, one PME kernel runs next to the bonded and nonbonded kernels.  With
                 // float atomics that is charge spreading, a single kernel that needs only the positions, and the
@@ -1027,6 +1031,8 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             cc.setCurrentQueue(pmeQueue);
             cc.clearBuffer(pmeForces);
         }
+        if (usePmeQueue)
+            cc.clearBuffer(useFixedPointChargeSpreading ? pmeGrid2 : pmeGrid1);
 
         // Invert the periodic box vectors.
 
