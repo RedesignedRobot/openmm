@@ -35,15 +35,34 @@ private:
     __half v[3];
 };
 
+#ifdef INDIRECT_REBUILD
+// Slots of the rebuild dispatch buffer past the five indirect dispatch triples: how many findBlockBounds
+// threadgroups have arrived, and whether any block moved.
+#define REBUILD_ARRIVED 15
+#define REBUILD_MOVED 16
+#endif
+
 /**
  * Find a bounding box for the atoms in each block.  Each SIMD group handles one block, and each threadgroup of
  * FIND_BLOCK_BOUNDS_GROUP threads records the range of block sizes with one atomic pair, not one per block.
+ * With the indirect rebuild it also gathers the positions into nonbonded order (ROLE_ORDER), and its last
+ * threadgroup decides the rebuild and sizes the rebuild chain's indirect dispatches, so the list bracket is
+ * one dispatch on a step without a rebuild instead of three.
  */
 extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
+#if defined(INDIRECT_REBUILD) && defined(ROLE_ORDER)
+        real4* __restrict__ posq,
+#else
+        const real4* __restrict__ posq,
+#endif
+        real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
         real2* __restrict__ blockSizeRange
 #ifdef INDIRECT_REBUILD
-        , const real4* __restrict__ oldPositions, unsigned int* __restrict__ displacementFlags, bool forceRebuild
+        , const real4* __restrict__ oldPositions, bool forceRebuild, unsigned int* __restrict__ interactionCount,
+        unsigned int* __restrict__ pinnedInteractionCount, unsigned int* __restrict__ dispatch
+#ifdef ROLE_ORDER
+        , const real4* __restrict__ contextPosq, const int* __restrict__ atomOrder
+#endif
 #endif
         ) {
     const int indexInTile = threadIdx.x%TILE_SIZE;
@@ -51,17 +70,29 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
     const int index = blockIdx.x*(FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE) + tileInGroup;
     const int base = index * TILE_SIZE;
     const bool validBlock = base < numAtoms;
+    const int atom = base+indexInTile;
 
-    real4 tPos = posq[base + indexInTile < numAtoms ? base + indexInTile : 0];
+#if defined(INDIRECT_REBUILD) && defined(ROLE_ORDER)
+    // Gather this thread's atom into nonbonded order (posq here is the ordered copy).  Padding atoms are gathered
+    // too, since the nonbonded kernel reads the last block's padding.  A padding atom takes atom 0's position for
+    // the bounds, as below, read from the context copy so no thread reads what another writes.
+    real4 tPos = contextPosq[atomOrder[atom < PADDED_NUM_ATOMS ? atom : 0]];
+    if (atom < PADDED_NUM_ATOMS)
+        posq[atom] = tPos;
+    if (atom >= numAtoms)
+        tPos = contextPosq[atomOrder[0]];
+#else
+    real4 tPos = posq[atom < numAtoms ? atom : 0];
+#endif
 #ifdef INDIRECT_REBUILD
     bool moved = forceRebuild;
-    if (!forceRebuild && base+indexInTile < numAtoms) {
-        real4 displacement = oldPositions[base+indexInTile]-tPos;
+    if (!forceRebuild && atom < numAtoms) {
+        real4 displacement = oldPositions[atom]-tPos;
         moved = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
     }
-    bool tileMoved = simd_any(moved);
-    if (indexInTile == 0 && validBlock)
-        displacementFlags[index] = tileMoved;
+    __shared__ int tileMoved[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
+    if (indexInTile == 0)
+        tileMoved[tileInGroup] = (validBlock && simd_any(moved));
 #endif
     real4 pos = make_real4(tPos.x, tPos.y, tPos.z, 0);
 #ifdef USE_PERIODIC
@@ -108,9 +139,59 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         if (minSize < 1e38f)
             atomicMin((device real*) blockSizeRange, minSize);
         atomicMax((device real*) blockSizeRange+1, maxSize);
+#ifdef INDIRECT_REBUILD
+        bool groupMoved = false;
+        for (int i = 0; i < FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE; i++)
+            groupMoved = groupMoved || tileMoved[i];
+        if (groupMoved)
+            atomic_fetch_or_explicit((device atomic_uint*) dispatch+REBUILD_MOVED, 1u, memory_order_relaxed);
+#endif
     }
+#ifdef INDIRECT_REBUILD
+    // The last threadgroup to arrive decides the rebuild and sizes the rebuild chain, so the decision needs no
+    // dispatch of its own.  The fences order every threadgroup's atomics and stores before its arrival and the
+    // last one's reads after it, as in sort.metal's computeRange.  It also does copyInteractionCounts' work for
+    // steps where the host doesn't wait for the count, so those steps skip that dispatch.
+    __shared__ bool isLastGroup;
+    __threadfence();
+    if (threadIdx.x == 0)
+        isLastGroup = (atomicAdd(dispatch+REBUILD_ARRIVED, 1u)+1 == gridDim.x);
+    __syncthreads();
+    __threadfence();
+    if (isLastGroup && threadIdx.x == 0) {
+        const bool rebuild = atomic_load_explicit((device atomic_uint*) dispatch+REBUILD_MOVED, memory_order_relaxed) != 0;
+        pinnedInteractionCount[0] = interactionCount[0];
+        pinnedInteractionCount[1] = interactionCount[1];
+        rebuildNeighborList[0] = rebuild;
+        if (rebuild) {
+            interactionCount[0] = 0;
+            interactionCount[1] = 0;
+        }
+        else {
+            // Nothing reads this step's range.  sortBoxData resets it on rebuild steps.
+            blockSizeRange->x = 1e38;
+            blockSizeRange->y = 0;
+        }
+        dispatch[0] = rebuild ? (NUM_ATOMS+63)/64 : 0;
+        dispatch[3] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
+#ifdef SORT_BLOCKS_BY_BINS
+        // countBlockBins and scatterBlocks, then sumBlockBins.
+        dispatch[6] = rebuild ? (NUM_BLOCKS+BIN_SORT_GROUP-1)/BIN_SORT_GROUP : 0;
+        dispatch[9] = rebuild ? 1 : 0;
+#else
+        dispatch[12] = rebuild ? 1 : 0;
+#endif
+        for (int i = 0; i < 5; i++) {
+            dispatch[3*i+1] = 1;
+            dispatch[3*i+2] = 1;
+        }
+        atomic_store_explicit((device atomic_uint*) dispatch+REBUILD_ARRIVED, 0u, memory_order_relaxed);
+        atomic_store_explicit((device atomic_uint*) dispatch+REBUILD_MOVED, 0u, memory_order_relaxed);
+    }
+#else
     if (blockIdx.x == 0 && threadIdx.x == 0)
         rebuildNeighborList[0] = 0;
+#endif
 }
 
 extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks, const real2* __restrict__ blockSizeRange/*, int numSizes*/) {
@@ -677,65 +758,15 @@ extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict_
     *((device uint4*) (pinnedInteractionCount+4+4*(counts.z%4))) = counts;
 }
 
-#ifdef INDIRECT_REBUILD
-// A separate dispatch supplies the device-wide ordering between the per-tile
-// displacement test and the decision.  It runs as one threadgroup, so on rebuild
-// steps it also computes the sort keys and sorts them, with only threadgroup
-// barriers, in sortShortList2's order.  Above MaxBlocksSortedInOneGroup blocks
-// (SORT_BLOCKS_BY_BINS) it sizes the bin sort's three dispatches instead.
-// It also does copyInteractionCounts' work for steps where the host doesn't wait
-// for the count, so those steps skip that dispatch.
-extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict__ displacementFlags,
-        int* __restrict__ rebuildNeighborList, unsigned int* __restrict__ interactionCount,
-        unsigned int* __restrict__ pinnedInteractionCount, real2* __restrict__ blockSizeRange,
-        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks,
-        unsigned int* __restrict__ dispatch) {
-#ifndef SORT_BLOCKS_BY_BINS
+#if defined(INDIRECT_REBUILD) && !defined(SORT_BLOCKS_BY_BINS)
+// On rebuild steps (findBlockBounds sizes this dispatch to one threadgroup, else none) computes the sort keys
+// and sorts them, with only threadgroup barriers, in sortShortList2's order.  Above MaxBlocksSortedInOneGroup
+// blocks (SORT_BLOCKS_BY_BINS) the bin sort's three dispatches take its place.
+extern "C" __global__ void sortBlocksInOneGroup(const real2* __restrict__ blockSizeRange,
+        const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks) {
     __shared__ unsigned char blockBin[NUM_BLOCKS];
     __shared__ unsigned int simdCounts[32*NUM_SIZE_BINS];
     __shared__ unsigned int binStart[NUM_SIZE_BINS];
-#endif
-    __shared__ bool anyMoved;
-    if (threadIdx.x == 0)
-        anyMoved = false;
-    __syncthreads();
-    bool moved = false;
-    for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
-        moved = moved || displacementFlags[i] != 0;
-    if (simd_any(moved))
-        anyMoved = true;
-    __syncthreads();
-    bool rebuild = anyMoved;
-    if (threadIdx.x == 0) {
-        pinnedInteractionCount[0] = interactionCount[0];
-        pinnedInteractionCount[1] = interactionCount[1];
-        rebuildNeighborList[0] = rebuild;
-        if (rebuild) {
-            interactionCount[0] = 0;
-            interactionCount[1] = 0;
-        }
-        else {
-            // Nothing reads this step's range.  sortBoxData resets it on rebuild steps.
-            blockSizeRange->x = 1e38;
-            blockSizeRange->y = 0;
-        }
-        dispatch[0] = rebuild ? (NUM_ATOMS+63)/64 : 0;
-        dispatch[3] = rebuild ? (NUM_BLOCKS*32*NUM_TILES_IN_BATCH+GROUP_SIZE-1)/GROUP_SIZE : 0;
-#ifdef SORT_BLOCKS_BY_BINS
-        // countBlockBins and scatterBlocks, then sumBlockBins.
-        dispatch[6] = rebuild ? (NUM_BLOCKS+BIN_SORT_GROUP-1)/BIN_SORT_GROUP : 0;
-        dispatch[9] = rebuild ? 1 : 0;
-        for (int i = 0; i < 4; i++) {
-#else
-        for (int i = 0; i < 2; i++) {
-#endif
-            dispatch[3*i+1] = 1;
-            dispatch[3*i+2] = 1;
-        }
-    }
-#ifndef SORT_BLOCKS_BY_BINS
-    if (!rebuild)
-        return;
 
     // A stable counting sort over computeSortKeys' size bins, so sortedBlocks holds its keys in sorted order.
     // Each SIMD group owns one contiguous run of blocks.  It counts its run per bin, one pass over the per-SIMD
@@ -810,13 +841,13 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
         if (bin >= 0)
             sortedBlocks[slot] = (((unsigned int) bin)<<BIN_SHIFT) + i;
     }
-#endif
 }
+#endif
 
 #ifdef SORT_BLOCKS_BY_BINS
 /**
  * A stable counting sort over computeSortKeys' 20 size bins, for block counts too large for
- * prepareRebuildDispatch.  Inside a bin, blocks stay in index order, which is the order of sorting
+ * sortBlocksInOneGroup.  Inside a bin, blocks stay in index order, which is the order of sorting
  * computeSortKeys' keys, so the neighbor list and its tile orientation are unchanged.  countBlockBins
  * ranks each block inside its threadgroup's share of its bin, sumBlockBins turns the per-threadgroup
  * counts into offsets, and scatterBlocks writes the keys.  Adapted from the dual neighbor list's

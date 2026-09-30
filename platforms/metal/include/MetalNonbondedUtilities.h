@@ -356,7 +356,7 @@ private:
     MetalArray largeBlockBoundingBox;
     MetalArray oldPositions;
     MetalArray rebuildNeighborList;
-    MetalArray displacementFlags, rebuildDispatch;
+    MetalArray rebuildDispatch;
     MetalArray binRanks, binCounts, binOffsets;
     bool useIndirectRebuild, sortBlocksByBins;
     // Role order: atomOrder maps a nonbonded index to a context index, atomRoles holds 1 for LJ and 2 for charge,
@@ -400,7 +400,7 @@ public:
     bool hasForces;
     std::string source;
     metalFunction_t forceKernel, energyKernel, forceEnergyKernel;
-    metalFunction_t findBlockBoundsKernel, prepareRebuildDispatchKernel;
+    metalFunction_t findBlockBoundsKernel, sortBlocksKernel;
     metalFunction_t countBlockBinsKernel, sumBlockBinsKernel, scatterBlocksKernel;
     metalFunction_t computeSortKeysKernel;
     metalFunction_t sortBoxDataKernel;
