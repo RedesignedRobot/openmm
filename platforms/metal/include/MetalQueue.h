@@ -94,6 +94,20 @@ public:
     long long getCommitCount() const {
         return commitCount;
     }
+    /**
+     * Get how many times any queue has handed out an encoder or command buffer, or the host has written a device
+     * array, since the process started.  Two equal readings prove no GPU work was encoded and no array was
+     * written in between, on any queue of any context.
+     */
+    static long long getWorkCount() {
+        return workCount;
+    }
+    /**
+     * Count host work that writes device memory without an encoder, such as MetalArray uploads.
+     */
+    static void noteWork() {
+        workCount++;
+    }
 private:
     void endEncoding();
     void submit();
@@ -105,6 +119,7 @@ private:
     std::deque<MTL::CommandBuffer*> pending;
     std::vector<MTL::HandlerFunction> completedHandlers;
     std::atomic<long long> commitCount;
+    static std::atomic<long long> workCount;
     std::recursive_mutex lock;
     std::condition_variable_any bufferOpened;
     std::thread committer;

@@ -118,8 +118,10 @@ void ComputeContext::addForce(ComputeForceInfo* force) {
 }
 
 void ComputeContext::setAtomIndex(std::vector<int>& index){
+    syncAtomOrder();
     atomIndex = index;
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
 }
@@ -512,6 +514,7 @@ void ComputeContext::findMoleculeGroups() {
         for (int j = 0; j < (int) atoms.size(); j++)
             moleculeGroups[i].atoms[j] = atoms[j]-atoms[0];
     }
+    moleculeGroupsVersion++;
 }
 
 void ComputeContext::invalidateMolecules() {
@@ -578,6 +581,7 @@ bool ComputeContext::invalidateMolecules(ComputeForceInfo* force, bool checkAtom
 
 void ComputeContext::resetAtomOrder() {
     ContextSelector selector(*this);
+    syncAtomOrder();
     vector<mm_int4> newCellOffsets(numAtoms);
     if (getUseDoublePrecision()) {
         vector<mm_double4> oldPosq(paddedNumAtoms);
@@ -637,12 +641,14 @@ void ComputeContext::resetAtomOrder() {
         posCellOffsets[i] = newCellOffsets[i];
     }
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
     forceNextReorder = true;
 }
 
 void ComputeContext::validateAtomOrder() {
+    syncAtomOrder();
     for (auto& mol : moleculeGroups) {
         for (int atom : mol.atoms) {
             set<int> identical;
@@ -658,19 +664,53 @@ void ComputeContext::validateAtomOrder() {
     }
 }
 
+void ComputeContext::updateAtomOrder(const vector<int>& newToOld, const vector<mm_int4>& cells) {
+    vector<int> newAtomIndex(numAtoms);
+    vector<mm_int4> newCellOffsets(numAtoms);
+    for (int i = 0; i < numAtoms; i++) {
+        int old = newToOld[i];
+        const mm_int4& offset = posCellOffsets[old];
+        newAtomIndex[i] = atomIndex[old];
+        newCellOffsets[i] = mm_int4(offset.x-cells[old].x, offset.y-cells[old].y, offset.z-cells[old].z, offset.w);
+    }
+    for (int i = 0; i < numAtoms; i++) {
+        atomIndex[i] = newAtomIndex[i];
+        posCellOffsets[i] = newCellOffsets[i];
+    }
+}
+
+void ComputeContext::syncAtomOrder() const {
+    if (deviceReorder != NULL)
+        deviceReorder->syncHost();
+}
+
+void ComputeContext::atomOrderChangedOnHost() {
+    if (deviceReorder != NULL)
+        deviceReorder->hostChanged();
+}
+
 void ComputeContext::forceReorder() {
     forceNextReorder = true;
 }
 
 void ComputeContext::reorderAtoms() {
     atomsWereReordered = false;
-    if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff() || (stepsSinceReorder < 250 && !forceNextReorder)) {
+    if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff()) {
+        stepsSinceReorder++;
+        return;
+    }
+    if (stepsSinceReorder < 250 && !forceNextReorder) {
         stepsSinceReorder++;
         return;
     }
     forceNextReorder = false;
     atomsWereReordered = true;
     stepsSinceReorder = 0;
+    if (deviceReorder != NULL && deviceReorder->apply()) {
+        for (auto listener : reorderListeners)
+            listener->execute();
+        return;
+    }
     if (getUseDoublePrecision())
         reorderAtomsImpl<double, mm_double4, double, mm_double4>();
     else if (getUseMixedPrecision())
@@ -679,21 +719,16 @@ void ComputeContext::reorderAtoms() {
         reorderAtomsImpl<float, mm_float4, float, mm_float4>();
 }
 
-template <class Real, class Real4, class Mixed, class Mixed4>
-void ComputeContext::reorderAtomsImpl() {
+template <class Real, class Real4>
+void ComputeContext::findAtomOrder(const Real4* posq, vector<int>& newToOld, vector<mm_int4>& cells) {
+    newToOld.resize(numAtoms);
+    cells.assign(numAtoms, mm_int4(0, 0, 0, 0));
 
     // Find the range of positions and the number of bins along each axis.
 
-    vector<Real4> oldPosq(paddedNumAtoms);
-    vector<Real4> oldPosqCorrection(paddedNumAtoms);
-    vector<Mixed4> oldVelm(paddedNumAtoms);
-    getPosq().download(oldPosq);
-    getVelm().download(oldVelm);
-    if (getUseMixedPrecision())
-        getPosqCorrection().download(oldPosqCorrection);
-    Real minx = oldPosq[0].x, maxx = oldPosq[0].x;
-    Real miny = oldPosq[0].y, maxy = oldPosq[0].y;
-    Real minz = oldPosq[0].z, maxz = oldPosq[0].z;
+    Real minx = posq[0].x, maxx = posq[0].x;
+    Real miny = posq[0].y, maxy = posq[0].y;
+    Real minz = posq[0].z, maxz = posq[0].z;
     Vec3 periodicBoxX, periodicBoxY, periodicBoxZ;
     getPeriodicBoxVectors(periodicBoxX, periodicBoxY, periodicBoxZ);
     Vec3 invPeriodicBoxSize(1.0/periodicBoxX[0], 1.0/periodicBoxY[1], 1.0/periodicBoxZ[2]);
@@ -705,7 +740,7 @@ void ComputeContext::reorderAtomsImpl() {
     }
     else {
         for (int i = 1; i < numAtoms; i++) {
-            const Real4& pos = oldPosq[i];
+            const Real4& pos = posq[i];
             minx = min(minx, pos.x);
             maxx = max(maxx, pos.x);
             miny = min(miny, pos.y);
@@ -717,12 +752,6 @@ void ComputeContext::reorderAtomsImpl() {
 
     // Loop over each group of identical molecules and reorder them.
 
-    
-    vector<int> originalIndex(numAtoms);
-    vector<Real4> newPosq(paddedNumAtoms, Real4(0,0,0,0));
-    vector<Real4> newPosqCorrection(paddedNumAtoms, Real4(0,0,0,0));
-    vector<Mixed4> newVelm(paddedNumAtoms, Mixed4(0,0,0,0));
-    vector<mm_int4> newCellOffsets(numAtoms);
     for (auto& mol : moleculeGroups) {
         // Find the center of each molecule.
 
@@ -736,7 +765,7 @@ void ComputeContext::reorderAtomsImpl() {
             molPos[i].z = 0.0f;
             for (int j = 0; j < (int)atoms.size(); j++) {
                 int atom = atoms[j]+mol.offsets[i];
-                const Real4& pos = oldPosq[atom];
+                const Real4& pos = posq[atom];
                 molPos[i].x += pos.x;
                 molPos[i].y += pos.y;
                 molPos[i].z += pos.z;
@@ -762,31 +791,9 @@ void ComputeContext::reorderAtomsImpl() {
                 int xcell = (int) floor(center.x*invPeriodicBoxSize[0]);
                 center.x -= xcell*periodicBoxX[0];
                 if (xcell != 0 || ycell != 0 || zcell != 0) {
-                    // Shift in double by whole box vectors.  In mixed precision posqCorrection holds the bits
-                    // that posq drops, so split the shifted position again instead of rounding it to float.
-
-                    Vec3 shift = periodicBoxX*xcell + periodicBoxY*ycell + periodicBoxZ*zcell;
                     molPos[i] = center;
-                    for (int j = 0; j < (int) atoms.size(); j++) {
-                        int atom = atoms[j]+mol.offsets[i];
-                        Real4& p = oldPosq[atom];
-                        Real4& c = oldPosqCorrection[atom];
-                        bool mixed = getUseMixedPrecision();
-                        double x = (double) p.x - shift[0] + (mixed ? c.x : 0);
-                        double y = (double) p.y - shift[1] + (mixed ? c.y : 0);
-                        double z = (double) p.z - shift[2] + (mixed ? c.z : 0);
-                        p.x = (Real) x;
-                        p.y = (Real) y;
-                        p.z = (Real) z;
-                        if (mixed) {
-                            c.x = (Real) (x - p.x);
-                            c.y = (Real) (y - p.y);
-                            c.z = (Real) (z - p.z);
-                        }
-                        posCellOffsets[atom].x -= xcell;
-                        posCellOffsets[atom].y -= ycell;
-                        posCellOffsets[atom].z -= zcell;
-                    }
+                    for (int j = 0; j < (int) atoms.size(); j++)
+                        cells[atoms[j]+mol.offsets[i]] = mm_int4(xcell, ycell, zcell, 0);
                 }
             }
         }
@@ -825,35 +832,78 @@ void ComputeContext::reorderAtomsImpl() {
             molBins[i] = pair<int, int>(bin, i);
         }
         sort(molBins.begin(), molBins.end());
+        for (int i = 0; i < numMolecules; i++)
+            for (int atom : atoms)
+                newToOld[mol.offsets[i]+atom] = mol.offsets[molBins[i].second]+atom;
+    }
+}
 
-        // Reorder the atoms.
+template void ComputeContext::findAtomOrder<float, mm_float4>(const mm_float4*, vector<int>&, vector<mm_int4>&);
+template void ComputeContext::findAtomOrder<double, mm_double4>(const mm_double4*, vector<int>&, vector<mm_int4>&);
 
-        for (int i = 0; i < numMolecules; i++) {
-            for (int atom : atoms) {
-                int oldIndex = mol.offsets[molBins[i].second]+atom;
-                int newIndex = mol.offsets[i]+atom;
-                originalIndex[newIndex] = atomIndex[oldIndex];
-                newPosq[newIndex] = oldPosq[oldIndex];
-                if (getUseMixedPrecision())
-                    newPosqCorrection[newIndex] = oldPosqCorrection[oldIndex];
-                newVelm[newIndex] = oldVelm[oldIndex];
-                newCellOffsets[newIndex] = posCellOffsets[oldIndex];
-            }
+template <class Real, class Real4, class Mixed, class Mixed4>
+void ComputeContext::reorderAtomsImpl() {
+    syncAtomOrder();
+    vector<Real4> oldPosq(paddedNumAtoms);
+    vector<Real4> oldPosqCorrection(paddedNumAtoms);
+    vector<Mixed4> oldVelm(paddedNumAtoms);
+    getPosq().download(oldPosq);
+    getVelm().download(oldVelm);
+    if (getUseMixedPrecision())
+        getPosqCorrection().download(oldPosqCorrection);
+    vector<int> newToOld;
+    vector<mm_int4> cells;
+    findAtomOrder<Real, Real4>(oldPosq.data(), newToOld, cells);
+
+    // Shift molecules into the central box by whole box vectors.  In mixed precision posqCorrection holds the bits
+    // that posq drops, so the shifted position is split again instead of being rounded to float.
+
+    Vec3 periodicBoxX, periodicBoxY, periodicBoxZ;
+    getPeriodicBoxVectors(periodicBoxX, periodicBoxY, periodicBoxZ);
+    bool mixed = getUseMixedPrecision();
+    for (int atom = 0; atom < numAtoms; atom++) {
+        const mm_int4& cell = cells[atom];
+        if (cell.x == 0 && cell.y == 0 && cell.z == 0)
+            continue;
+        Vec3 shift = periodicBoxX*cell.x + periodicBoxY*cell.y + periodicBoxZ*cell.z;
+        Real4& p = oldPosq[atom];
+        Real4& c = oldPosqCorrection[atom];
+        double x = (double) p.x - shift[0] + (mixed ? c.x : 0);
+        double y = (double) p.y - shift[1] + (mixed ? c.y : 0);
+        double z = (double) p.z - shift[2] + (mixed ? c.z : 0);
+        p.x = (Real) x;
+        p.y = (Real) y;
+        p.z = (Real) z;
+        if (mixed) {
+            c.x = (Real) (x - p.x);
+            c.y = (Real) (y - p.y);
+            c.z = (Real) (z - p.z);
         }
+    }
+
+    // Reorder the atoms.
+
+    vector<Real4> newPosq(paddedNumAtoms, Real4(0,0,0,0));
+    vector<Real4> newPosqCorrection(paddedNumAtoms, Real4(0,0,0,0));
+    vector<Mixed4> newVelm(paddedNumAtoms, Mixed4(0,0,0,0));
+    for (int newIndex = 0; newIndex < numAtoms; newIndex++) {
+        int oldIndex = newToOld[newIndex];
+        newPosq[newIndex] = oldPosq[oldIndex];
+        if (mixed)
+            newPosqCorrection[newIndex] = oldPosqCorrection[oldIndex];
+        newVelm[newIndex] = oldVelm[oldIndex];
     }
 
     // Update the arrays.
 
     ContextSelector selector(*this);
-    for (int i = 0; i < numAtoms; i++) {
-        atomIndex[i] = originalIndex[i];
-        posCellOffsets[i] = newCellOffsets[i];
-    }
+    updateAtomOrder(newToOld, cells);
     getPosq().upload(newPosq);
-    if (getUseMixedPrecision())
+    if (mixed)
         getPosqCorrection().upload(newPosqCorrection);
     getVelm().upload(newVelm);
     getAtomIndexArray().upload(atomIndex);
+    atomOrderChangedOnHost();
     for (auto listener : reorderListeners)
         listener->execute();
 }
