@@ -49,6 +49,7 @@
 #include <iterator>
 #include <memory>
 #include <sstream>
+#include <typeinfo>
 #include <set>
 #include <assert.h>
 
@@ -78,7 +79,7 @@ void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
-    cu.clearAutoclearBuffers();
+    cu.clearAutoclearBuffersIfNeeded();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
         computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
@@ -101,14 +102,23 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
     // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.  Force
     // pass kernels (PME interpolation) also add to the force buffer only with integer atomics and write
-    // nothing else.
+    // nothing else.  A refill of the random number pool joins too: it writes only the pool and its seeds,
+    // which only the integrator reads, after the pass.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
         ConcurrentDispatchScope scope(cu.getCurrentStream(), overlap);
         cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
+        cu.getIntegrationUtilities().refillExhaustedRandomNumbers();
         cu.executeForcePassKernels();
         cu.getBondedUtilities().computeInteractions(groups);
+        // The kinetic energy kernel reads only the velocities and writes only its own result, so in a pass with
+        // energy it runs beside the nonbonded kernel.  Its single thread group goes first, as above.
+        MetalIntegrationUtilities& integration = cu.getIntegrationUtilities();
+        if (includeEnergy && integration.getPrefetchKineticEnergy()) {
+            cu.getCurrentStream().setConcurrentDispatch(true);
+            integration.prefetchKineticEnergy();
+        }
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
     cu.getNonbondedUtilities().scatterRoleForces();
@@ -116,8 +126,10 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
-    if (includeEnergy)
+    if (includeEnergy) {
         sum += cu.reduceEnergy();
+        cu.getIntegrationUtilities().finishKineticEnergyPrefetch();
+    }
     // Without a neighbor list nothing else inside step() commits, and the GPU would sit idle until the host
     // next waits for a result.
     if (!cu.getNonbondedUtilities().getUseNeighborList())
@@ -218,10 +230,17 @@ void MetalIntegrateCustomStepKernel::initialize(const System& system, const Cust
 
 /**
  * Get whether a force leaves the velocities alone in updateContextState() and calcForcesAndEnergy().  Unknown forces,
- * thermostats, barostats and forces that evaluate an inner Context count as touching them.
+ * thermostats, other barostats and forces that evaluate an inner Context count as touching them.
+ *
+ * MonteCarloBarostat counts as leaving them alone.  Its trial reads only potential energies (the kinetic energy that
+ * getState() adds is dropped), and a rejected trial restores velm whole, so the velocities the integrator sees are the
+ * same whether the center of mass motion comes off before the trial or inside the integrator.  openmm.app adds the
+ * barostat after CMMotionRemover, so without this every system with one pays two extra dispatches per step.  The
+ * anisotropic, flexible and membrane barostats stay out: some of them read the kinetic energy inside a trial.
  */
 static bool ignoresVelocities(const Force& force) {
-    return dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
+    return typeid(force) == typeid(MonteCarloBarostat) ||
+           dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
            dynamic_cast<const PeriodicTorsionForce*>(&force) != NULL || dynamic_cast<const RBTorsionForce*>(&force) != NULL ||
            dynamic_cast<const CMAPTorsionForce*>(&force) != NULL || dynamic_cast<const NonbondedForce*>(&force) != NULL ||
            dynamic_cast<const GBSAOBCForce*>(&force) != NULL || dynamic_cast<const CustomBondForce*>(&force) != NULL ||
@@ -280,22 +299,72 @@ void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
     kernel2->execute(numAtoms, 64);
 }
 
+void MetalUpdateStateDataKernel::initialize(const System& system) {
+    CommonUpdateStateDataKernel::initialize(system);
+    ContextSelector selector(cu);
+    bool mixed = cu.getUseMixedPrecision();
+    cellOffsets.initialize<mm_int4>(cu, cu.getPaddedNumAtoms(), "cellOffsets");
+    boxVectors.initialize(cu, 3, mixed ? sizeof(mm_double4) : sizeof(mm_float4), "unwrapBoxVectors");
+    ComputeProgram program = cu.compileProgram(MetalKernelSources::unwrapPositions);
+    unwrapKernel = program->createKernel("unwrapPositions");
+    unwrapKernel->addArg(cu.getNumAtoms());
+    unwrapKernel->addArg(cu.getPosq());
+    if (mixed)
+        unwrapKernel->addArg(cu.getPosqCorrection());
+    else
+        unwrapKernel->addArg(nullptr);
+    unwrapKernel->addArg(cellOffsets);
+    unwrapKernel->addArg(boxVectors);
+}
+
+void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c) {
+    vector<mm_int4>& offsets = cu.getPosCellOffsets();
+    bool wrapped = any_of(offsets.begin(), offsets.end(), [] (const mm_int4& o) { return o.x != 0 || o.y != 0 || o.z != 0; });
+    if (wrapped) {
+        // Unwrap with the current box, then zero the offsets, so the common kernel below only sets the box.
+        ContextSelector selector(cu);
+        Vec3 box[3];
+        cu.getPeriodicBoxVectors(box[0], box[1], box[2]);
+        if (cu.getUseMixedPrecision()) {
+            vector<mm_double4> vectors;
+            for (const Vec3& v : box)
+                vectors.push_back(mm_double4(v[0], v[1], v[2], 0));
+            boxVectors.upload(vectors);
+        }
+        else {
+            vector<mm_float4> vectors;
+            for (const Vec3& v : box)
+                vectors.push_back(mm_float4((float) v[0], (float) v[1], (float) v[2], 0));
+            boxVectors.upload(vectors);
+        }
+        cellOffsets.upload(offsets);
+        unwrapKernel->execute(cu.getNumAtoms());
+        for (auto& offset : offsets)
+            offset = mm_int4(0, 0, 0, 0);
+    }
+    CommonUpdateStateDataKernel::setPeriodicBoxVectors(context, a, b, c);
+}
+
+void MetalIntegrateLangevinMiddleStepKernel::initialize(const System& system, const LangevinMiddleIntegrator& integrator) {
+    CommonIntegrateLangevinMiddleStepKernel::initialize(system, integrator);
+    // Its kinetic energy is computeKineticEnergy(0), which a prefetch in the energy pass can answer.
+    cu.getIntegrationUtilities().setPrefetchKineticEnergy(true);
+}
+
 void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
     if (!cu.getIntegrationUtilities().integrateLangevinMiddle(params, tol))
         CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
 }
 
-// Lanes that share one atom in reduceBornForceOwned.
-static const int REDUCE_LANES = 8;
-
 // Threads per threadgroup in the pair kernels, which launch one SIMD group per block pair.
 static const int PAIR_GROUP_SIZE = 256;
 
 // The block-pair kernels win when the half-list launch leaves the GPU short of work, so that its tail after the last
-// atomics is exposed, and lose when the launch already fills the GPU, since they read and write one partial per atom
-// per block.  gbsa (78 blocks) has 1.27 block pairs per SIMD group of the launch on the M3 Ultra (60 cores), where
-// they gain, and 7.6 on the M2 (10 cores), where they cost 12-14%.  The count per SIMD group comes from the core
-// count, so this picks the path per device and system.
+// atomics is exposed, and lose when the launch already fills the GPU.  gbsa (78 blocks) has 1.27 block pairs per SIMD
+// group of the launch on the M3 Ultra (60 cores), where they gain, and 7.6 on the M2 (10 cores), where they cost
+// 12-14%.  The count per SIMD group comes from the core count, so this picks the path per device and system.  Those
+// numbers predate Force1 adding with atomics, which gained another 3.7% single and 4.5% mixed on gbsa on the M3 Ultra
+// by removing the kernel that reduced its per-block partials; the M2 side wasn't measured again.
 static const double MAX_OWNED_BLOCK_PAIRS_PER_WARP = 2.0;
 
 bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
@@ -303,18 +372,12 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     if (!nb.getUseCutoff() || cu.getUseDoublePrecision())
         return false;
 
-    // The partial force buffer holds one slot per atom per block.  Keep it inside 1% of the working set.
-
     int numBlocks = cu.getNumAtomBlocks();
     int paddedAtoms = cu.getPaddedNumAtoms();
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
     int numWarps = threads/32;
     if ((double) numBlocks*numBlocks > MAX_OWNED_BLOCK_PAIRS_PER_WARP*numWarps)
         return false;
-    long long partialBytes = (long long) numBlocks*paddedAtoms*sizeof(mm_float4);
-    if (partialBytes > cu.getDevice()->recommendedMaxWorkingSetSize()/100)
-        return false;
-    partialForce.initialize<mm_float4>(cu, numBlocks*paddedAtoms, "partialForce");
     map<string, string> defines;
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
@@ -327,7 +390,6 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     defines["NUM_BLOCKS"] = cu.intToString(numBlocks);
     defines["NUM_BLOCK_PAIRS"] = cu.intToString(numBlocks*(numBlocks+1)/2);
     defines["TILE_SIZE"] = "32";
-    defines["REDUCE_LANES"] = cu.intToString(REDUCE_LANES);
     defines["DIELECTRIC_OFFSET"] = "0.009f";
     defines["OBC_ALPHA"] = "1.0f";
     defines["OBC_BETA"] = "0.8f";
@@ -343,28 +405,18 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     ownedBornSumKernel->addArg(nb.getBlockCenters());
     ownedBornSumKernel->addArg(nb.getBlockBoundingBoxes());
     ownedForce1Kernel = program->createKernel("computeGBSAForce1Owned");
-    ownedForce1Kernel->addArg(partialForce);
+    ownedForce1Kernel->addArg(cu.getLongForceBuffer());
+    ownedForce1Kernel->addArg(bornForce);
     ownedForce1Kernel->addArg(cu.getEnergyBuffer());
     ownedForce1Kernel->addArg(cu.getPosq());
     ownedForce1Kernel->addArg(bornSum);
     ownedForce1Kernel->addArg(params);
     ownedForce1Kernel->addArg(charges);
-    ownedForce1Kernel->addArg(bornRadii);
-    ownedForce1Kernel->addArg(obcChain);
     ownedForce1Kernel->addArg(); // Whether to include energy.
     for (int i = 0; i < 5; i++)
         ownedForce1Kernel->addArg(); // The periodic box size arguments are set when the kernel is executed.
     ownedForce1Kernel->addArg(nb.getBlockCenters());
     ownedForce1Kernel->addArg(nb.getBlockBoundingBoxes());
-    ownedReduceBornForceKernel = program->createKernel("reduceBornForceOwned");
-    ownedReduceBornForceKernel->addArg(partialForce);
-    ownedReduceBornForceKernel->addArg(cu.getLongForceBuffer());
-    ownedReduceBornForceKernel->addArg(bornForce);
-    ownedReduceBornForceKernel->addArg(cu.getEnergyBuffer());
-    ownedReduceBornForceKernel->addArg(params);
-    ownedReduceBornForceKernel->addArg(bornRadii);
-    ownedReduceBornForceKernel->addArg(obcChain);
-    ownedReduceBornForceKernel->addArg(); // Whether to include energy.
     return true;
 }
 
@@ -381,12 +433,10 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     int threads = nb.getNumForceThreadBlocks()*nb.getForceThreadBlockSize();
     int numBlocks = cu.getNumAtomBlocks();
     int pairThreads = min(threads, (numBlocks*(numBlocks+1)/2*32+PAIR_GROUP_SIZE-1)/PAIR_GROUP_SIZE*PAIR_GROUP_SIZE);
-    ownedForce1Kernel->setArg(8, (int) includeEnergy);
-    ownedReduceBornForceKernel->setArg(7, (int) includeEnergy);
+    ownedForce1Kernel->setArg(7, (int) includeEnergy);
     setPeriodicBoxArgs(cu, ownedBornSumKernel, 3);
-    setPeriodicBoxArgs(cu, ownedForce1Kernel, 9);
+    setPeriodicBoxArgs(cu, ownedForce1Kernel, 8);
     ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
-    ownedReduceBornForceKernel->execute(cu.getPaddedNumAtoms()*REDUCE_LANES);
     return 0.0;
 }

@@ -48,6 +48,7 @@ MetalArray::~MetalArray() {
 void MetalArray::initialize(ComputeContext& context, size_t size, int elementSize, const std::string& name) {
     if (this->pointer != 0)
         throw OpenMMException("MetalArray has already been initialized");
+    MetalQueue::noteWork();
     this->context = &dynamic_cast<MetalContext&>(context);
     this->size = size;
     this->elementSize = elementSize;
@@ -98,6 +99,7 @@ void MetalArray::uploadSubArray(const void* data, int offset, int elements, bool
     if (offset < 0 || offset+elements > getSize())
         throw OpenMMException("uploadSubArray: data exceeds range of array");
     context->getCurrentStream().finish();
+    MetalQueue::noteWork();
     char* dest = reinterpret_cast<char*>(pointer->contents())+offset*elementSize;
     if (pairStorage)
         doublesToPairs((const double*) data, (float*) dest, elements*4);

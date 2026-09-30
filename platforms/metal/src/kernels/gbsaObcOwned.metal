@@ -8,9 +8,9 @@
  *
  * The Born sum adds each atom's sum over a block pair to the fixed point bornSum buffer, one atomic per atom per block
  * pair.  Integer addition is exact, so the total doesn't depend on scheduling, and Force1 turns the totals of its
- * two blocks into Born radii itself instead of waiting for a separate kernel.  Force1 has four times as many values
- * per atom, so it keeps one slot per atom and block in partialForce, written by exactly one SIMD group, and
- * reduceBornForceOwned adds the slots in a fixed order.
+ * two blocks into Born radii itself instead of waiting for a separate kernel.  Force1 adds its sums the same way, to
+ * the force buffer and to bornForce, finished for the chain rule term in the nonbonded kernel, so no reduction kernel
+ * runs between Force1 and the nonbonded kernel.
  */
 
 #define CULL_SQUARED (CUTOFF_SQUARED*1.0001f)
@@ -182,16 +182,32 @@ DEVICE real4 gbsaPair(real r2, real4 atomData1, real quarterInvRadius1, real cha
 }
 
 /**
+ * Add one atom's sums over a block pair to the force buffer and bornForce.  The finished Born force is
+ * (sum + saTerm/B)*B^2*chain, linear in the sums, so each sum takes the factor B^2*chain here.  Fixed point addition
+ * is exact, so the totals don't depend on scheduling.
+ */
+DEVICE void addAtomForce(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mm_ulong* RESTRICT bornForce, unsigned int atom,
+        real4 force, real4 atomData) {
+    if (atom >= NUM_ATOMS)
+        return;
+    ATOMIC_ADD(&forceBuffers[atom], (mm_ulong) realToFixedPoint(force.x));
+    ATOMIC_ADD(&forceBuffers[atom+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force.y));
+    ATOMIC_ADD(&forceBuffers[atom+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force.z));
+    ATOMIC_ADD(&bornForce[atom], (mm_ulong) realToFixedPoint(force.w*atomData.y*atomData.y*atomData.w));
+}
+
+/**
  * Compute the first part of the GBSA interaction, the force in xyz and the Born force in w, over each block pair
  * (x, y) with x <= y.  An off-diagonal pair is evaluated once: each lane keeps its x atom's sum in registers, and the
- * y atoms with their sums rotate one lane per step, so each lane ends holding one y atom's sum.  The x sums go to
- * slot y and the y sums to slot x of partialForce, so every (atom, slot) is written by exactly one SIMD group and
- * nothing is accumulated in device memory.  A diagonal pair is evaluated from both sides, like the Born sum.
+ * y atoms with their sums rotate one lane per step, so each lane ends holding one y atom's sum.  Each lane then adds
+ * both sums with one atomic per value.  A diagonal pair is evaluated from both sides, like the Born sum, and adds each
+ * atom's surface area term once.
  */
-KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL mixed* RESTRICT energyBuffer,
-        GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum, GLOBAL const float2* RESTRICT params,
-        GLOBAL const real* RESTRICT charge, GLOBAL real* RESTRICT bornRadii, GLOBAL real* RESTRICT obcChain, int needEnergy, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY,
-        real4 periodicBoxVecZ, GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize) {
+KERNEL void computeGBSAForce1Owned(GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mm_ulong* RESTRICT bornForce,
+        GLOBAL mixed* RESTRICT energyBuffer, GLOBAL const real4* RESTRICT posq, GLOBAL const mm_long* RESTRICT bornSum,
+        GLOBAL const float2* RESTRICT params, GLOBAL const real* RESTRICT charge, int needEnergy, real4 periodicBoxSize,
+        real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        GLOBAL const real4* RESTRICT blockCenter, GLOBAL const real4* RESTRICT blockSize) {
     const unsigned int totalWarps = GLOBAL_SIZE/TILE_SIZE;
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
     mixed energy = 0;
@@ -206,10 +222,6 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
         if (blocksInRange(blockCenter[x], blockSize[x], blockCenter[y], blockSize[y], periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ)) {
             const real4 posq1 = posq[atom1];
             const real4 atomData1 = bornAtomData(atom1, bornSum, params, charge);
-            if (x == y && atom1 < NUM_ATOMS) {
-                bornRadii[atom1] = atomData1.y;
-                obcChain[atom1] = atomData1.w;
-            }
             const real chargeProduct1 = PREFACTOR*atomData1.x;
             const real quarterInvRadius1 = 0.25f*atomData1.z;
             const real4 posqAtomY = posq[atomY];
@@ -265,59 +277,20 @@ KERNEL void computeGBSAForce1Owned(GLOBAL real4* RESTRICT partialForce, GLOBAL m
                     forceY = simd_shuffle_rotate_down(forceY, (ushort) 1);
                 }
             }
+            if (x == y && atom1 < NUM_ATOMS) {
+                float offsetRadius = params[atom1].x;
+                real r = offsetRadius+DIELECTRIC_OFFSET+PROBE_RADIUS;
+                real ratio6 = POW((offsetRadius+DIELECTRIC_OFFSET)/atomData1.y, (real) 6);
+                real saTerm = SURFACE_AREA_FACTOR*r*r*ratio6;
+                force.w += saTerm/atomData1.y;
+                if (needEnergy)
+                    energy -= saTerm/6;
+            }
+            addAtomForce(forceBuffers, bornForce, atom1, force, atomData1);
+            if (x != y)
+                addAtomForce(forceBuffers, bornForce, atomY, forceY, atomDataAtomY);
         }
-        partialForce[y*PADDED_NUM_ATOMS + atom1] = force;
-        if (x != y)
-            partialForce[x*PADDED_NUM_ATOMS + atomY] = forceY;
     }
     if (needEnergy)
         energyBuffer[GLOBAL_ID] += energy;
-}
-
-/**
- * Add a value over each aligned group of REDUCE_LANES lanes.  Every lane adds the same values in the same order, so
- * the sum doesn't depend on scheduling.
- */
-DEVICE real4 sumOverReduceLanes(real4 value) {
-    for (ushort mask = 1; mask < REDUCE_LANES; mask *= 2)
-        value += simd_shuffle_xor(value, mask);
-    return value;
-}
-
-/**
- * Add each atom's force and Born force over the chunks, add the force to the force buffer, and finish the Born force
- * for the chain rule term in the nonbonded kernel.  REDUCE_LANES lanes share an atom, each adding every REDUCE_LANES-th
- * chunk.  The chunk order is fixed, so plain floating point addition is deterministic.
- */
-KERNEL void reduceBornForceOwned(GLOBAL const real4* RESTRICT partialForce, GLOBAL mm_ulong* RESTRICT forceBuffers,
-        GLOBAL mm_long* RESTRICT bornForce, GLOBAL mixed* RESTRICT energyBuffer, GLOBAL const float2* RESTRICT params,
-        GLOBAL const real* RESTRICT bornRadii, GLOBAL const real* RESTRICT obcChain, int needEnergy) {
-    const unsigned int part = GLOBAL_ID%REDUCE_LANES;
-    mixed energy = 0;
-    for (unsigned int index = GLOBAL_ID/REDUCE_LANES; index < PADDED_NUM_ATOMS; index += GLOBAL_SIZE/REDUCE_LANES) {
-        real4 f = make_real4(0);
-        for (unsigned int chunk = part; chunk < NUM_BLOCKS; chunk += REDUCE_LANES)
-            f += partialForce[chunk*PADDED_NUM_ATOMS + index];
-        f = sumOverReduceLanes(f);
-        if (part != 0 || index >= NUM_ATOMS)
-            continue;
-        ATOMIC_ADD(&forceBuffers[index], (mm_ulong) realToFixedPoint(f.x));
-        ATOMIC_ADD(&forceBuffers[index+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(f.y));
-        ATOMIC_ADD(&forceBuffers[index+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(f.z));
-        real force = f.w;
-
-        // Now calculate the actual force
-
-        float offsetRadius = params[index].x;
-        real bornRadius = bornRadii[index];
-        real r = offsetRadius+DIELECTRIC_OFFSET+PROBE_RADIUS;
-        real ratio6 = POW((offsetRadius+DIELECTRIC_OFFSET)/bornRadius, (real) 6);
-        real saTerm = SURFACE_AREA_FACTOR*r*r*ratio6;
-        force += saTerm/bornRadius;
-        energy += saTerm;
-        force *= bornRadius*bornRadius*obcChain[index];
-        bornForce[index] = realToFixedPoint(force);
-    }
-    if (needEnergy)
-        energyBuffer[GLOBAL_ID] += energy/-6;
 }

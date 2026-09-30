@@ -59,6 +59,11 @@ public:
      */
     MetalArray& getStepSize();
     /**
+     * Compute the positions of virtual sites.  The kernel writes only positions, so a clear of the autoclear buffers
+     * that integrateLangevinMiddle() folded into the step stays valid across it.
+     */
+    void computeVirtualSites();
+    /**
      * Distribute forces from virtual sites to the atoms they are based on.
      */
     void distributeForcesFromVirtualSites();
@@ -91,17 +96,50 @@ public:
      * reads the velocities and writes only its own output, so it can share a concurrent pass with the force kernels.
      */
     void calcPendingCenterOfMassMomentum();
+    /**
+     * Refill the random number pool now if the fused LangevinMiddle kernel runs and the pool is used up.  The next
+     * prepareRandomNumbers() would refill it anyway and return index 0, so this draws the same numbers in the same
+     * order.  It writes only the pool and its seeds, so it can share a concurrent pass with the force kernels.
+     */
+    void refillExhaustedRandomNumbers();
+    /**
+     * Turn on prefetchKineticEnergy().  An integrator whose kinetic energy is computeKineticEnergy(0) turns it on.
+     */
+    void setPrefetchKineticEnergy(bool prefetch);
+    /**
+     * Get whether setPrefetchKineticEnergy() turned prefetchKineticEnergy() on.
+     */
+    bool getPrefetchKineticEnergy() const {
+        return prefetchesKineticEnergy;
+    }
+    /**
+     * Queue the kinetic energy kernel in a force computation that includes energy, ahead of the energy readback.
+     * Context::getState() asks for the kinetic energy right after the potential energy, and the kernel alone in a
+     * command buffer of its own costs a second round trip to the GPU: 0.2-0.3 ms on an idle M3 Ultra, twice per
+     * MonteCarloBarostat trial.  Does nothing unless setPrefetchKineticEnergy() turned it on.
+     */
+    void prefetchKineticEnergy();
+    /**
+     * Call once the energy readback that followed prefetchKineticEnergy() has waited for the GPU.  From then until
+     * the next GPU work, computeKineticEnergy(0) returns the prefetched result without running the kernel again.
+     */
+    void finishKineticEnergyPrefetch();
+    double computeKineticEnergy(double timeShift);
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
+    bool bindAutoclearBuffers();
     int* ccmaConvergedMemory;
     metalDeviceptr_t ccmaConvergedDeviceMemory;
     ComputeEvent ccmaEvent;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
-    int numLangevinMiddleThreads;
+    int numLangevinMiddleThreads, numClearThreads, numBoundAutoclearBuffers;
+    bool clearsAutoclearBuffers;
     ComputeKernel pendingCMCalc;
     int pendingCMBlockSize;
     ComputeArray* pendingCMVelocity;
+    bool prefetchesKineticEnergy, kineticEnergyQueued;
+    long long kineticEnergyWorkCount;
 };
 
 } // namespace OpenMM

@@ -25,6 +25,7 @@
 
 #include "MetalIntegrationUtilities.h"
 #include "MetalContext.h"
+#include "MetalQueue.h"
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
@@ -32,8 +33,16 @@
 using namespace OpenMM;
 using namespace std;
 
+// The fused LangevinMiddle kernel's arguments for the autoclear buffers other than the force buffer: MaxClearedBuffers
+// buffers starting at ClearArgument, then their sizes in 32 bit words as an int4.  The flag that turns the clear on
+// comes two arguments before them, followed by the atom count.
+static const int MaxClearedBuffers = 4;
+static const int ClearArgument = 22;
+
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
-        ccmaConvergedMemory(NULL), pendingCMBlockSize(0), pendingCMVelocity(NULL) {
+        ccmaConvergedMemory(NULL), numClearThreads(0), numBoundAutoclearBuffers(-1), clearsAutoclearBuffers(false),
+        pendingCMBlockSize(0), pendingCMVelocity(NULL), prefetchesKineticEnergy(false), kineticEnergyQueued(false),
+        kineticEnergyWorkCount(-1) {
         ccmaEvent = context.createEvent();
         ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
         ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
@@ -166,6 +175,16 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+void MetalIntegrationUtilities::computeVirtualSites() {
+    // Without this, every system with virtual sites (TIP4P water) would pay the clear twice: the vsite kernel runs
+    // after the integrator and counts as work, so beginComputation() would clear again.
+    MetalContext& cu = dynamic_cast<MetalContext&>(context);
+    bool cleared = cu.getAutoclearBuffersMarkedCleared();
+    IntegrationUtilities::computeVirtualSites();
+    if (cleared)
+        cu.markAutoclearBuffersCleared();
+}
+
 bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
     return !ccmaConstraintAtoms.isInitialized() && !context.getUseDoublePrecision();
 }
@@ -259,7 +278,13 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         }
         langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
         langevinMiddleKernel->addArg(nullptr);
+        langevinMiddleKernel->addArg(0); // bindAutoclearBuffers() sets the clear arguments.
+        langevinMiddleKernel->addArg(numAtoms);
+        for (int i = 0; i < MaxClearedBuffers; i++)
+            langevinMiddleKernel->addArg(nullptr);
+        langevinMiddleKernel->addArg(mm_int4(0, 0, 0, 0));
     }
+    bool clearBuffers = bindAutoclearBuffers();
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
     else
@@ -270,7 +295,83 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
     langevinMiddleKernel->setArg(18, pendingCMVelocity == NULL ? 0 : 1);
     if (pendingCMVelocity != NULL)
         langevinMiddleKernel->setArg(19, *pendingCMVelocity);
-    langevinMiddleKernel->execute(numLangevinMiddleThreads);
+    langevinMiddleKernel->execute(max(numLangevinMiddleThreads, numClearThreads));
+    if (clearBuffers)
+        dynamic_cast<MetalContext&>(context).markAutoclearBuffersCleared();
     pendingCMVelocity = NULL;
     return true;
+}
+
+bool MetalIntegrationUtilities::bindAutoclearBuffers() {
+    // The kernel zeroes each atom's force after reading it and clears up to MaxClearedBuffers other buffers with the
+    // whole grid.  The buffer list only grows while forces initialize, so it is bound again only when its size changes.
+
+    MetalContext& cu = dynamic_cast<MetalContext&>(context);
+    const vector<ArrayInterface*>& buffers = cu.getAutoclearBuffers();
+    if (buffers.size() == numBoundAutoclearBuffers)
+        return clearsAutoclearBuffers;
+    numBoundAutoclearBuffers = buffers.size();
+    MetalArray* force = &cu.unwrap(cu.getLongForceBuffer());
+    vector<ArrayInterface*> others;
+    int numForce = 0;
+    for (ArrayInterface* buffer : buffers) {
+        if (&cu.unwrap(*buffer) == force)
+            numForce++;
+        else
+            others.push_back(buffer);
+    }
+    clearsAutoclearBuffers = (numForce == 1 && others.size() <= MaxClearedBuffers);
+    int words[MaxClearedBuffers] = {0, 0, 0, 0};
+    numClearThreads = 0;
+    for (int i = 0; i < MaxClearedBuffers; i++) {
+        if (clearsAutoclearBuffers && i < others.size()) {
+            words[i] = others[i]->getSize()*others[i]->getElementSize()/4;
+            numClearThreads = max(numClearThreads, (words[i]+3)/4);
+            langevinMiddleKernel->setArg(ClearArgument+i, *others[i]);
+        }
+        else
+            langevinMiddleKernel->setArg(ClearArgument+i, nullptr);
+    }
+    langevinMiddleKernel->setArg(ClearArgument-2, clearsAutoclearBuffers ? 1 : 0);
+    langevinMiddleKernel->setArg(ClearArgument+MaxClearedBuffers, mm_int4(words[0], words[1], words[2], words[3]));
+    return clearsAutoclearBuffers;
+}
+
+void MetalIntegrationUtilities::setPrefetchKineticEnergy(bool prefetch) {
+    prefetchesKineticEnergy = prefetch;
+}
+
+void MetalIntegrationUtilities::prefetchKineticEnergy() {
+    if (!prefetchesKineticEnergy)
+        return;
+    kineticEnergyKernel->execute(keWorkGroupSize, keWorkGroupSize);
+    kineticEnergyQueued = true;
+}
+
+void MetalIntegrationUtilities::finishKineticEnergyPrefetch() {
+    // The readback waited for everything queued, the kernel included.  Any later encoder or upload moves the count.
+    if (kineticEnergyQueued)
+        kineticEnergyWorkCount = MetalQueue::getWorkCount();
+    kineticEnergyQueued = false;
+}
+
+double MetalIntegrationUtilities::computeKineticEnergy(double timeShift) {
+    if (timeShift != 0 || kineticEnergyWorkCount != MetalQueue::getWorkCount())
+        return IntegrationUtilities::computeKineticEnergy(timeShift);
+    ContextSelector selector(context);
+    if (context.getUseMixedPrecision()) {
+        double energy;
+        kineticEnergy.download(&energy);
+        return energy;
+    }
+    float energy;
+    kineticEnergy.download(&energy);
+    return energy;
+}
+
+void MetalIntegrationUtilities::refillExhaustedRandomNumbers() {
+    if (!langevinMiddleKernel || !random.isInitialized() || randomPos != random.getSize())
+        return;
+    randomKernel->execute(random.getSize(), 64);
+    randomPos = 0;
 }
