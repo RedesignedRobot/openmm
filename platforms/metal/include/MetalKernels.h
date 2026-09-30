@@ -81,7 +81,15 @@ public:
      */
     double finishComputation(ContextImpl& context, bool includeForce, bool includeEnergy, int groups, bool& valid);
 private:
-   MetalContext& cu;
+    /**
+     * Checked mode: compare the forces the pass just computed to the copy taken before it, and throw if they differ.
+     */
+    void compareCachedForces();
+    MetalContext& cu;
+    ComputeArray cachedForces;
+    bool checkingPass = false;
+    int checks = 0;
+    double worstCheckRatio = 0;
 };
 
 /**
@@ -99,6 +107,10 @@ public:
      * @param force      the NonbondedForce this kernel will be used for
      */
     void initialize(const System& system, const NonbondedForce& force);
+    /**
+     * Dispatches nothing while the force cache skips the pass; otherwise the common kernel's execute().
+     */
+    double execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal);
 private:
     MetalContext& cu;
 };
@@ -169,6 +181,24 @@ private:
     MetalContext& cu;
     ComputeArray cellOffsets, boxVectors;
     ComputeKernel unwrapKernel;
+};
+
+/**
+ * The common kernel saves and restores the long force buffer with the positions.  This one also carries the force
+ * cache's stamp across a rejected trial: if the buffer held current forces when saveCoordinates() ran, it holds
+ * them again after restoreCoordinates(), so the integrator's pass can reuse them (see MetalContext::getForceCache()).
+ */
+class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
+public:
+    MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
+    }
+    void saveCoordinates(ContextImpl& context);
+    void restoreCoordinates(ContextImpl& context);
+private:
+    MetalContext& cu;
+    bool savedForcesCurrent = false;
+    int savedGroups = 0;
 };
 
 /**

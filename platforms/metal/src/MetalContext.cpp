@@ -207,7 +207,8 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
         useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false), autoclearWorkCount(-1),
-        autoclearBufferCount(0) {
+        autoclearBufferCount(0), forceCache(false), forceCacheCheck(false), skippingPass(false), forceStamp(-1),
+        forceStampGroups(0) {
     if (precision == "single") {
         useDoublePrecision = false;
         useMixedPrecision = false;

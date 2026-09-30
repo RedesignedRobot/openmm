@@ -533,6 +533,68 @@ public:
      * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
      */
     void clearAutoclearBuffersIfNeeded();
+    /**
+     * The force cache.  A Monte Carlo barostat trial evaluates the energy at the old and the new box, and the
+     * integrator then computes the forces again at whichever positions it kept: a third pass at positions a pass
+     * has already seen.  With the cache on, every pass computes forces, and a pass that finishes with valid forces
+     * stamps MetalQueue's work count and its force groups.  A later pass that wants forces without energy at the
+     * same count and groups reuses the buffer.  The count moves on every dispatch, blit and upload, so any
+     * kernel or upload that touches positions or parameters invalidates the stamp by itself.  Two host-only
+     * writes do not move it and invalidate explicitly: the periodic box (MetalUpdateStateDataKernel) and global
+     * parameter values (updateGlobalParamValues() uploads before the check in beginComputation()).
+     * MetalApplyMonteCarloBarostatKernel restores the stamp with the saved forces on a rejected trial.
+     * MetalCalcForcesAndEnergyKernel::initialize() turns the cache on only for Systems whose forces it can all
+     * hold back on a skipped pass.
+     */
+    bool getForceCache() const {
+        return forceCache;
+    }
+    void setForceCache(bool on) {
+        forceCache = on;
+    }
+    /**
+     * Checked mode (OPENMM_METAL_FORCE_CACHE=check): a pass the cache would skip runs anyway, and its forces are
+     * compared to the cached ones.
+     */
+    bool getForceCacheCheck() const {
+        return forceCacheCheck;
+    }
+    void setForceCacheCheck(bool on) {
+        forceCacheCheck = on;
+    }
+    /**
+     * Record that the long force buffer holds the forces for the current positions, box and parameters.
+     */
+    void stampForces(int groups) {
+        forceStamp = MetalQueue::getWorkCount();
+        forceStampGroups = groups;
+    }
+    void invalidateForces() {
+        forceStamp = -1;
+    }
+    /**
+     * Get whether the long force buffer still holds current forces: no work encoded and no array written since
+     * stampForces(), and no explicit invalidation.
+     */
+    bool getForcesCurrent() const {
+        return forceStamp == MetalQueue::getWorkCount();
+    }
+    bool getForcesCurrent(int groups) const {
+        return getForcesCurrent() && forceStampGroups == groups;
+    }
+    int getForceStampGroups() const {
+        return forceStampGroups;
+    }
+    /**
+     * Get whether the pass in progress is being skipped.  A force kernel whose execute() dispatches work checks
+     * this and returns without dispatching.
+     */
+    bool getSkippingPass() const {
+        return skippingPass;
+    }
+    void setSkippingPass(bool skipping) {
+        skippingPass = skipping;
+    }
 private:
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
@@ -569,6 +631,9 @@ private:
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
     long long autoclearWorkCount;
     int autoclearBufferCount;
+    bool forceCache, forceCacheCheck, skippingPass;
+    long long forceStamp;
+    int forceStampGroups;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;

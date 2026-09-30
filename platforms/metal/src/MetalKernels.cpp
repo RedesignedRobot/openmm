@@ -26,6 +26,10 @@
 #include "MetalKernels.h"
 #include "MetalForceInfo.h"
 #include "openmm/Context.h"
+#include "openmm/CMMotionRemover.h"
+#include "openmm/MonteCarloAnisotropicBarostat.h"
+#include "openmm/MonteCarloFlexibleBarostat.h"
+#include "openmm/MonteCarloMembraneBarostat.h"
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/NonbondedForceImpl.h"
 #include "openmm/common/ContextSelector.h"
@@ -46,6 +50,8 @@
 #include "lepton/ParsedExpression.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -73,14 +79,55 @@ struct ConcurrentDispatchScope {
     MetalQueue& queue;
 };
 
+// The force cache skips a pass by holding back the plugin's own work and MetalCalcNonbondedForceKernel::execute().
+// Any other force type dispatches from its own execute(), which ContextImpl calls whatever the plugin decides, so
+// the cache turns on only when every force in the System is one of these.
+static bool forceCacheSupports(const Force& force) {
+    return dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
+           dynamic_cast<const PeriodicTorsionForce*>(&force) != NULL || dynamic_cast<const NonbondedForce*>(&force) != NULL ||
+           dynamic_cast<const CMMotionRemover*>(&force) != NULL || dynamic_cast<const MonteCarloBarostat*>(&force) != NULL ||
+           dynamic_cast<const MonteCarloAnisotropicBarostat*>(&force) != NULL || dynamic_cast<const MonteCarloMembraneBarostat*>(&force) != NULL ||
+           dynamic_cast<const MonteCarloFlexibleBarostat*>(&force) != NULL;
+}
+
+static bool isBarostat(const Force& force) {
+    return dynamic_cast<const MonteCarloBarostat*>(&force) != NULL || dynamic_cast<const MonteCarloAnisotropicBarostat*>(&force) != NULL ||
+           dynamic_cast<const MonteCarloMembraneBarostat*>(&force) != NULL || dynamic_cast<const MonteCarloFlexibleBarostat*>(&force) != NULL;
+}
+
 void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
+    // Only a barostat produces passes the cache can serve, and it costs the energy passes their force code, so
+    // it stays off without one.  OPENMM_METAL_FORCE_CACHE=0 turns it off, =check runs every skipped pass anyway
+    // and compares.
+    const char* env = getenv("OPENMM_METAL_FORCE_CACHE");
+    string mode = (env == NULL ? "" : env);
+    bool supported = true, hasBarostat = false;
+    for (int i = 0; i < system.getNumForces(); i++) {
+        supported &= forceCacheSupports(system.getForce(i));
+        hasBarostat |= isBarostat(system.getForce(i));
+    }
+    bool on = supported && hasBarostat && mode != "0";
+    cu.setForceCache(on);
+    cu.setForceCacheCheck(on && mode == "check");
 }
 
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
-    cu.clearAutoclearBuffersIfNeeded();
+    // A changed global parameter uploads here and moves the work count, so this comes before the cache check.
     cu.updateGlobalParamValues();
+    if (cu.getForceCache() && includeForces && !includeEnergy && cu.getForcesCurrent(groups)) {
+        if (!cu.getForceCacheCheck()) {
+            cu.setSkippingPass(true);
+            return;
+        }
+        // Checked mode: keep the cached forces, run the pass, and compare the two in finishComputation().
+        if (!cachedForces.isInitialized())
+            cachedForces.initialize<long long>(cu, cu.getLongForceBuffer().getSize(), "cachedForces");
+        cu.getLongForceBuffer().copyTo(cachedForces);
+        checkingPass = true;
+    }
+    cu.clearAutoclearBuffersIfNeeded();
     for (auto computation : cu.getPreComputations())
         computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
     MetalNonbondedUtilities& nb = cu.getNonbondedUtilities();
@@ -93,6 +140,17 @@ void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool
 
 double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups, bool& valid) {
     ContextSelector selector(cu);
+    if (cu.getSkippingPass()) {
+        // The force buffer already holds this pass's result.  Only the work a pass carries for the integrator runs:
+        // the pending center of mass kernel and a random pool refill write nothing a force kernel reads.
+        cu.setSkippingPass(false);
+        cu.getIntegrationUtilities().calcPendingCenterOfMassMomentum();
+        cu.getIntegrationUtilities().refillExhaustedRandomNumbers();
+        return 0.0;
+    }
+    // With the cache on, an energy pass computes forces too, so the barostat's energy passes leave forces the
+    // integrator can reuse.
+    bool computeForces = includeForces || cu.getForceCache();
 
     // The bonded and nonbonded kernels share no written buffer except the force buffer, and both only add
     // to it with integer atomics, so they can run side by side and still give the same bits.  Each also does
@@ -119,7 +177,7 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
             cu.getCurrentStream().setConcurrentDispatch(true);
             integration.prefetchKineticEnergy();
         }
-        cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+        cu.getNonbondedUtilities().computeInteractions(groups, computeForces, includeEnergy);
     }
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
@@ -133,9 +191,43 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // next waits for a result.
     if (!cu.getNonbondedUtilities().getUseNeighborList())
         cu.getCurrentStream().commit();
+    if (checkingPass) {
+        checkingPass = false;
+        if (cu.getForcesValid())
+            compareCachedForces();
+    }
     if (!cu.getForcesValid())
         valid = false;
+    else if (computeForces)
+        cu.stampForces(groups);
     return sum;
+}
+
+void MetalCalcForcesAndEnergyKernel::compareCachedForces() {
+    vector<long long> cached, fresh;
+    cachedForces.download(cached);
+    cu.getLongForceBuffer().download(fresh);
+    int n = 3*cu.getNumAtoms();
+    double maxDiff = 0, sumSquares = 0;
+    for (int i = 0; i < n; i++) {
+        maxDiff = max(maxDiff, fabs((double) (fresh[i]-cached[i])));
+        sumSquares += (double) fresh[i]*(double) fresh[i];
+    }
+    double rms = sqrt(sumSquares/n);
+    double ratio = (rms > 0 ? maxDiff/rms : maxDiff);
+    checks++;
+    worstCheckRatio = max(worstCheckRatio, ratio);
+    fprintf(stderr, "force cache check %d: max |cached-fresh| over rms |fresh| %.3e, worst so far %.3e\n", checks, ratio, worstCheckRatio);
+    // Kernel variants (force+energy against force) differ by float rounding, far below 1e-3 of the rms force.
+    // A stale force differs by the motion of a step or a trial, far above it.
+    if (ratio > 1e-3)
+        throw OpenMMException("Force cache check failed: cached forces differ from a fresh pass by "+cu.doubleToString(ratio)+" of the rms force");
+}
+
+double MetalCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal) {
+    if (cu.getSkippingPass())
+        return 0.0;
+    return CommonCalcNonbondedForceKernel::execute(context, includeForces, includeEnergy, includeDirect, includeReciprocal);
 }
 
 void MetalCalcNonbondedForceKernel::initialize(const System& system, const NonbondedForce& force) {
@@ -317,6 +409,8 @@ void MetalUpdateStateDataKernel::getForces(ContextImpl& context, vector<Vec3>& f
 }
 
 void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c) {
+    // The box lives in host fields that no dispatch or upload accompanies when nothing is wrapped.
+    cu.invalidateForces();
     vector<mm_int4>& offsets = cu.getPosCellOffsets();
     bool wrapped = any_of(offsets.begin(), offsets.end(), [] (const mm_int4& o) { return o.x != 0 || o.y != 0 || o.z != 0; });
     if (wrapped) {
@@ -342,6 +436,22 @@ void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, con
             offset = mm_int4(0, 0, 0, 0);
     }
     CommonUpdateStateDataKernel::setPeriodicBoxVectors(context, a, b, c);
+}
+
+void MetalApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context) {
+    // The blits below move the work count.  Remember whether the buffer held current forces, so the restore can say
+    // so again: the barostat's first energy pass, which the cache made compute forces, ran just before this.
+    savedForcesCurrent = cu.getForcesCurrent();
+    savedGroups = cu.getForceStampGroups();
+    CommonApplyMonteCarloBarostatKernel::saveCoordinates(context);
+}
+
+void MetalApplyMonteCarloBarostatKernel::restoreCoordinates(ContextImpl& context) {
+    CommonApplyMonteCarloBarostatKernel::restoreCoordinates(context);
+    // The box was set back before this call, which invalidated the stamp; the restored positions, box and long
+    // force buffer are the saved ones.
+    if (savedForcesCurrent)
+        cu.stampForces(savedGroups);
 }
 
 void MetalIntegrateLangevinMiddleStepKernel::initialize(const System& system, const LangevinMiddleIntegrator& integrator) {
