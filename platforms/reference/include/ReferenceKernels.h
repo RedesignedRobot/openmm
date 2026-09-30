@@ -1908,6 +1908,7 @@ private:
     bool rigidMolecules;
     int components;
     ReferenceMonteCarloBarostat* barostat;
+    std::vector<Vec3> savedForces;
 };
 
 /**

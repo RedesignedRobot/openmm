@@ -88,7 +88,8 @@ void LangevinMiddleIntegrator::step(int steps) {
         throw OpenMMException("This Integrator is not bound to a context!");  
     for (int i = 0; i < steps; ++i) {
         context->updateContextState();
-        context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
+        if (!context->getForcesCurrent())
+            context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
         kernel.getAs<IntegrateLangevinMiddleStepKernel>().execute(*context, *this);
     }
 }

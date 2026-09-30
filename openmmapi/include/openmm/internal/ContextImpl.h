@@ -235,6 +235,22 @@ public:
      */
     bool updateContextState();
     /**
+     * Get whether the forces stored in the context match the current positions and box since
+     * updateContextState() last began.  A Monte Carlo barostat sets this at the end of a trial: both of
+     * its energy evaluations also compute forces, and a rejected trial restores the saved ones, so the
+     * integrator can skip the force evaluation it would otherwise run before the step.
+     */
+    bool getForcesCurrent() const {
+        return forcesCurrent;
+    }
+    /**
+     * Set whether the forces stored in the context match the current positions and box.  Only a ForceImpl's
+     * updateContextState() that leaves valid forces behind should set this to true.
+     */
+    void setForcesCurrent(bool current) {
+        forcesCurrent = current;
+    }
+    /**
      * Get the list of ForceImpls belonging to this ContextImpl.
      */
     const std::vector<ForceImpl*>& getForceImpls() const;
@@ -314,7 +330,7 @@ private:
     std::vector<ForceImpl*> forceImpls;
     std::map<std::string, double> parameters;
     mutable std::vector<std::vector<int> > molecules;
-    bool hasInitializedForces, hasSetPositions, integratorIsDeleted, hasMinimizeKernel;
+    bool hasInitializedForces, hasSetPositions, integratorIsDeleted, hasMinimizeKernel, forcesCurrent;
     int lastForceGroups;
     Platform* platform;
     Kernel initializeForcesKernel, updateStateDataKernel, applyConstraintsKernel, virtualSitesKernel, minimizeKernel;

@@ -82,7 +82,8 @@ void VariableVerletIntegrator::step(int steps) {
         throw OpenMMException("This Integrator is not bound to a context!");
     for (int i = 0; i < steps; ++i) {
         context->updateContextState();
-        context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
+        if (!context->getForcesCurrent())
+            context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
         setStepSize(kernel.getAs<IntegrateVariableVerletStepKernel>().execute(*context, *this, std::numeric_limits<double>::infinity()));
     }
 }
@@ -92,7 +93,8 @@ void VariableVerletIntegrator::stepTo(double time) {
         throw OpenMMException("This Integrator is not bound to a context!");  
     while (time > context->getTime()) {
         context->updateContextState();
-        context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
+        if (!context->getForcesCurrent())
+            context->calcForcesAndEnergy(true, false, getIntegrationForceGroups());
         setStepSize(kernel.getAs<IntegrateVariableVerletStepKernel>().execute(*context, *this, time));
     }
 }

@@ -66,7 +66,7 @@ void MonteCarloFlexibleBarostatImpl::updateContextState(ContextImpl& context, bo
     // Compute the current potential energy.
 
     int groups = context.getIntegrator().getIntegrationForceGroups();
-    double initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double initialEnergy = context.calcForcesAndEnergy(true, true, groups);
     double pressure = context.getParameter(MonteCarloFlexibleBarostat::Pressure())*(AVOGADRO*1e-25);
 
     // Generate trial box vectors
@@ -104,7 +104,7 @@ void MonteCarloFlexibleBarostatImpl::updateContextState(ContextImpl& context, bo
         numberOfScaledParticles = context.getMolecules().size();
     else
         numberOfScaledParticles = context.getSystem().getNumParticles();
-    double finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double finalEnergy = context.calcForcesAndEnergy(true, true, groups);
     double kT = BOLTZ*context.getParameter(MonteCarloFlexibleBarostat::Temperature());
     double w0 = finalEnergy-initialEnergy;
     double w1 = pressure*(newVolume-volume);
@@ -121,6 +121,7 @@ void MonteCarloFlexibleBarostatImpl::updateContextState(ContextImpl& context, bo
         numAccepted++;
         forcesInvalid = true;
     }
+    context.setForcesCurrent(true);
     numAttempted++;
     if (numAttempted >= 10) {
         if (numAccepted < 0.25*numAttempted) {

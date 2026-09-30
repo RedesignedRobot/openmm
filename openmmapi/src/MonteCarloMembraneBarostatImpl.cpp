@@ -68,7 +68,7 @@ void MonteCarloMembraneBarostatImpl::updateContextState(ContextImpl& context, bo
     // Compute the current potential energy.
     
     int groups = context.getIntegrator().getIntegrationForceGroups();
-    double initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double initialEnergy = context.calcForcesAndEnergy(true, true, groups);
     double pressure = context.getParameter(MonteCarloMembraneBarostat::Pressure())*(AVOGADRO*1e-25);
     double tension = context.getParameter(MonteCarloMembraneBarostat::SurfaceTension())*(AVOGADRO*1e-25);
     
@@ -119,7 +119,7 @@ void MonteCarloMembraneBarostatImpl::updateContextState(ContextImpl& context, bo
         numberOfScaledParticles = context.getMolecules().size();
     else
         numberOfScaledParticles = context.getSystem().getNumParticles();
-    double finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double finalEnergy = context.calcForcesAndEnergy(true, true, groups);
     double kT = BOLTZ*context.getParameter(MonteCarloMembraneBarostat::Temperature());
     double w = finalEnergy-initialEnergy + pressure*deltaVolume - tension*deltaArea - numberOfScaledParticles*kT*log(newVolume/volume);
     if (w > 0 && SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber() > exp(-w/kT)) {
@@ -132,6 +132,7 @@ void MonteCarloMembraneBarostatImpl::updateContextState(ContextImpl& context, bo
         numAccepted[axis]++;
         forcesInvalid = true;
     }
+    context.setForcesCurrent(true);
     numAttempted[axis]++;
     if (numAttempted[axis] >= 10) {
         if (numAccepted[axis] < 0.25*numAttempted[axis]) {

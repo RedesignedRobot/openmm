@@ -3318,6 +3318,7 @@ void ReferenceApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& contex
     }
     vector<Vec3>& posData = extractPositions(context);
     barostat->savePositions(posData);
+    savedForces = extractForces(context);
 }
 
 void ReferenceApplyMonteCarloBarostatKernel::scaleCoordinates(ContextImpl& context, double scaleX, double scaleY, double scaleZ,
@@ -3330,6 +3331,7 @@ void ReferenceApplyMonteCarloBarostatKernel::scaleCoordinates(ContextImpl& conte
 void ReferenceApplyMonteCarloBarostatKernel::restoreCoordinates(ContextImpl& context) {
     vector<Vec3>& posData = extractPositions(context);
     barostat->restorePositions(posData);
+    extractForces(context) = savedForces;
 }
 
 void ReferenceApplyMonteCarloBarostatKernel::computeKineticEnergy(ContextImpl& context, vector<double>& ke) {
