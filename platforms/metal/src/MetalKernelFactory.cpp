@@ -24,10 +24,10 @@
  * -------------------------------------------------------------------------- */
 
 #include "MetalKernelFactory.h"
+#include "MetalCalcCustomGBForceKernel.h"
 #include "MetalKernels.h"
 #include "MetalPlatform.h"
 #include "openmm/common/CommonKernels.h"
-#include "openmm/common/CommonCalcCustomGBForceKernel.h"
 #include "openmm/common/CommonCalcCustomHbondForceKernel.h"
 #include "openmm/common/CommonCalcCustomManyParticleForceKernel.h"
 #include "openmm/common/CommonCalcCustomNonbondedForceKernel.h"
@@ -78,7 +78,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == CalcGBSAOBCForceKernel::Name())
         return new MetalCalcGBSAOBCForceKernel(name, platform, cu);
     if (name == CalcCustomGBForceKernel::Name())
-        return new CommonCalcCustomGBForceKernel(name, platform, cu, context.getSystem());
+        return new MetalCalcCustomGBForceKernel(name, platform, cu, context.getSystem());
     if (name == CalcCustomExternalForceKernel::Name())
         return new CommonCalcCustomExternalForceKernel(name, platform, cu, context.getSystem());
     if (name == CalcCustomHbondForceKernel::Name())
