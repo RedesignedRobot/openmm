@@ -664,12 +664,15 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
     return true;
 }
 
+// Device barostat checkpoint markers.  Version 2 appends the raw device box; version 1 lacked it.  Each
+// marker's first byte differs from Common's version (3) on either byte order.
+static const int DeviceCheckpointVersion = 0xDBA0002, OldDeviceCheckpointVersion = 0xDBA0001;
+
 void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
     if (cu.deviceBarostatKernel != nullptr)
         cu.deviceBarostatKernel->prepareDeviceBarostat();
     if (cu.deviceBarostatState != nullptr) {
-        const int version = 0xDBA0001;
-        stream.write((const char*) &version, sizeof(version));
+        stream.write((const char*) &DeviceCheckpointVersion, sizeof(DeviceCheckpointVersion));
     }
     CommonUpdateStateDataKernel::createCheckpoint(context, stream);
     if (cu.deviceBarostatState != nullptr) {
@@ -687,15 +690,17 @@ void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream&
 void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& stream) {
     if (cu.deviceBarostatKernel != nullptr)
         cu.deviceBarostatKernel->prepareDeviceBarostat();
-    const int deviceVersion = 0xDBA0001;
-    // The marker's first byte differs from Common's version on either byte order.
     // Peek so ordinary checkpoints also work with non-seekable input streams.
-    if (cu.deviceBarostatState == nullptr && stream.peek() == *(const unsigned char*) &deviceVersion)
+    int first = stream.peek();
+    if (cu.deviceBarostatState == nullptr && (first == *(const unsigned char*) &DeviceCheckpointVersion ||
+            first == *(const unsigned char*) &OldDeviceCheckpointVersion))
         throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
     if (cu.deviceBarostatState != nullptr) {
         int version = 0;
         stream.read((char*) &version, sizeof(version));
-        if (version != deviceVersion)
+        if (version == OldDeviceCheckpointVersion)
+            throw OpenMMException("Device barostat checkpoint predates the saved device box; recreate it with this build");
+        if (version != DeviceCheckpointVersion)
             throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
     }
     CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
