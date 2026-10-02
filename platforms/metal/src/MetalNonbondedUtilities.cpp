@@ -622,7 +622,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
     KernelSet& kernels = groupKernels[forceGroups];
-    if (useCutoff && usePeriodic) {
+    if (useCutoff && usePeriodic && !context.getUseDeviceBox()) {
         double4 box = context.getPeriodicBoxSize();
         double minAllowedSize = 1.999999*maxCutoff;
         if (box.x < minAllowedSize || box.y < minAllowedSize || box.z < minAllowedSize)
@@ -670,7 +670,9 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     forceRebuildNeighborList = false;
     // With the indirect rebuild, findBlockBounds already copied a count, at most one list old,
     // which is all a step without the wait needs.
-    bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+    // Registered device trials need no fresh count for a fully allocated list.
+    // Lists requiring host overflow checks must still wait for exact counts.
+    bool wait = (waitForCount || (context.deviceBarostatState == nullptr && context.getStepsSinceReorder() == 0));
     if (context.getStepsSinceReorder() == 0)
         ++reorderEpoch;
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
@@ -743,7 +745,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         // Steps without the wait share a command buffer, up to StepsPerCommandBuffer of them,
         // unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
-        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        bool wait = (waitForCount || (context.deviceBarostatState == nullptr && context.getStepsSinceReorder() == 0));
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
         if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
@@ -751,8 +753,10 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             uncommittedSteps = 0;
         }
         commitCountAfterLastStep = queue.getCommitCount();
-        if (wait)
+        if (wait) {
+            ++countWaitCalls;
             queue.finish();
+        }
         updateNeighborListSize();
     }
 }

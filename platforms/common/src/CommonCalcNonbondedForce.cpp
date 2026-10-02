@@ -30,6 +30,9 @@
 #include "openmm/common/ContextSelector.h"
 #include "openmm/common/NonbondedUtilities.h"
 #include "CommonKernelSources.h"
+#ifdef OpenMMMetal_EXPORTS
+#include "MetalContext.h"
+#endif
 #include "SimTKOpenMMRealType.h"
 #include <algorithm>
 #include <assert.h>
@@ -1006,10 +1009,20 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
     double energy = 0.0;
     reciprocalOnQueue = (usePmeQueue && includeReciprocal && !includeEnergy);
     if (includeReciprocal && (pmeGrid1.isInitialized() || cosSinSums.isInitialized())) {
-        Vec3 a, b, c;
-        cc.getPeriodicBoxVectors(a, b, c);
-        double volume = a[0]*b[1]*c[2];
-        energy = ewaldSelfEnergy - totalCharge*totalCharge/(8*EPSILON0*volume*alpha*alpha);
+#ifdef OpenMMMetal_EXPORTS
+        if (static_cast<MetalContext&>(cc).getUseDeviceBox()) {
+            energy = ewaldSelfEnergy;
+            if (includeEnergy && !hasOffsets)
+                static_cast<MetalContext&>(cc).addDeviceBoxEnergy(-totalCharge*totalCharge/(8*EPSILON0*alpha*alpha));
+        }
+        else
+#endif
+        {
+            Vec3 a, b, c;
+            cc.getPeriodicBoxVectors(a, b, c);
+            double volume = a[0]*b[1]*c[2];
+            energy = ewaldSelfEnergy - totalCharge*totalCharge/(8*EPSILON0*volume*alpha*alpha);
+        }
     }
     if (recomputeParams || hasOffsets) {
         computeParamsKernel->setArg(1, (int) (includeEnergy && includeReciprocal));
@@ -1027,13 +1040,18 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             if ((pmeGrid1.isInitialized() || cosSinSums.isInitialized()) && includeReciprocal) {
                 // Invoke a kernel to compute the correction for the neutralizing plasma.
 
-                Vec3 a, b, c;
-                cc.getPeriodicBoxVectors(a, b, c);
-                double volume = a[0]*b[1]*c[2];
-                if (cc.getUseDoublePrecision())
-                    computePlasmaCorrectionKernel->setArg(3, volume);
-                else
-                    computePlasmaCorrectionKernel->setArg(3, (float) volume);
+#ifdef OpenMMMetal_EXPORTS
+                if (!static_cast<MetalContext&>(cc).getUseDeviceBox())
+#endif
+                {
+                    Vec3 a, b, c;
+                    cc.getPeriodicBoxVectors(a, b, c);
+                    double volume = a[0]*b[1]*c[2];
+                    if (cc.getUseDoublePrecision())
+                        computePlasmaCorrectionKernel->setArg(3, volume);
+                    else
+                        computePlasmaCorrectionKernel->setArg(3, (float) volume);
+                }
                 computePlasmaCorrectionKernel->execute(ComputeContext::ThreadBlockSize, ComputeContext::ThreadBlockSize);
             }
         }
@@ -1062,19 +1080,23 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             cc.clearBuffer(pmeForces);
         }
 
-        // Invert the periodic box vectors.
-
-        Vec3 boxVectors[3];
-        cc.getPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
-        double determinant = boxVectors[0][0]*boxVectors[1][1]*boxVectors[2][2];
-        double scale = 1.0/determinant;
-        mm_double4 recipBoxVectors[3];
-        recipBoxVectors[0] = mm_double4(boxVectors[1][1]*boxVectors[2][2]*scale, 0, 0, 0);
-        recipBoxVectors[1] = mm_double4(-boxVectors[1][0]*boxVectors[2][2]*scale, boxVectors[0][0]*boxVectors[2][2]*scale, 0, 0);
-        recipBoxVectors[2] = mm_double4((boxVectors[1][0]*boxVectors[2][1]-boxVectors[1][1]*boxVectors[2][0])*scale, -boxVectors[0][0]*boxVectors[2][1]*scale, boxVectors[0][0]*boxVectors[1][1]*scale, 0);
-        mm_float4 recipBoxVectorsFloat[3];
-        for (int i = 0; i < 3; i++)
-            recipBoxVectorsFloat[i] = mm_float4((float) recipBoxVectors[i].x, (float) recipBoxVectors[i].y, (float) recipBoxVectors[i].z, 0);
+        // Metal binds reciprocal arguments to the device box, so its host values are unused.
+        mm_double4 recipBoxVectors[3] = {};
+        mm_float4 recipBoxVectorsFloat[3] = {};
+#ifdef OpenMMMetal_EXPORTS
+        if (!static_cast<MetalContext&>(cc).getUseDeviceBox())
+#endif
+        {
+            Vec3 boxVectors[3];
+            cc.getPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
+            double determinant = boxVectors[0][0]*boxVectors[1][1]*boxVectors[2][2];
+            double scale = 1.0/determinant;
+            recipBoxVectors[0] = mm_double4(boxVectors[1][1]*boxVectors[2][2]*scale, 0, 0, 0);
+            recipBoxVectors[1] = mm_double4(-boxVectors[1][0]*boxVectors[2][2]*scale, boxVectors[0][0]*boxVectors[2][2]*scale, 0, 0);
+            recipBoxVectors[2] = mm_double4((boxVectors[1][0]*boxVectors[2][1]-boxVectors[1][1]*boxVectors[2][0])*scale, -boxVectors[0][0]*boxVectors[2][1]*scale, boxVectors[0][0]*boxVectors[1][1]*scale, 0);
+            for (int i = 0; i < 3; i++)
+                recipBoxVectorsFloat[i] = mm_float4((float) recipBoxVectors[i].x, (float) recipBoxVectors[i].y, (float) recipBoxVectors[i].z, 0);
+        }
 
         // Execute the reciprocal space kernels.
 
@@ -1206,9 +1228,18 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         }
     }
     if (dispersionCoefficient != 0.0 && includeDirect) {
-        Vec3 a, b, c;
-        cc.getPeriodicBoxVectors(a, b, c);
-        energy += dispersionCoefficient/(a[0]*b[1]*c[2]);
+#ifdef OpenMMMetal_EXPORTS
+        if (static_cast<MetalContext&>(cc).getUseDeviceBox()) {
+            if (includeEnergy)
+                static_cast<MetalContext&>(cc).addDeviceBoxEnergy(dispersionCoefficient);
+        }
+        else
+#endif
+        {
+            Vec3 a, b, c;
+            cc.getPeriodicBoxVectors(a, b, c);
+            energy += dispersionCoefficient/(a[0]*b[1]*c[2]);
+        }
     }
     return energy;
 }

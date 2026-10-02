@@ -64,12 +64,21 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
     step = 0;
 
     int groups = context.getIntegrator().getIntegrationForceGroups();
+    auto& barostatKernel = kernel.getAs<ApplyMonteCarloBarostatKernel>();
+    if (barostatKernel.executeTrial(context, groups,
+            context.getParameter(MonteCarloBarostat::Pressure())*(AVOGADRO*1e-25),
+            BOLTZ*context.getParameter(MonteCarloBarostat::Temperature()))) {
+        forcesInvalid = true;
+        return;
+    }
+    double proposalUniform, acceptanceUniform;
+    bool injected = barostatKernel.getTrialUniforms(proposalUniform, acceptanceUniform);
     double initialEnergy, finalEnergy, volume, deltaVolume, newVolume, numberOfScaledParticles;
     Vec3 box[3];
     auto propose = [&] () {
         context.getPeriodicBoxVectors(box[0], box[1], box[2]);
         volume = box[0][0]*box[1][1]*box[2][2];
-        deltaVolume = volumeScale*2*(SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber()-0.5);
+        deltaVolume = volumeScale*2*((injected ? proposalUniform : SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber())-0.5);
         newVolume = volume+deltaVolume;
         double lengthScale = pow(newVolume/volume, 1.0/3.0);
         kernel.getAs<ApplyMonteCarloBarostatKernel>().saveCoordinates(context);
@@ -88,7 +97,7 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
     double pressure = context.getParameter(MonteCarloBarostat::Pressure())*(AVOGADRO*1e-25);
     double kT = BOLTZ*context.getParameter(MonteCarloBarostat::Temperature());
     double w = finalEnergy-initialEnergy + pressure*deltaVolume - numberOfScaledParticles*kT*log(newVolume/volume);
-    if (w > 0 && SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber() > exp(-w/kT)) {
+    if (w > 0 && (injected ? acceptanceUniform : SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber()) > exp(-w/kT)) {
         // Reject the step.
 
         context.getOwner().setPeriodicBoxVectors(box[0], box[1], box[2]);

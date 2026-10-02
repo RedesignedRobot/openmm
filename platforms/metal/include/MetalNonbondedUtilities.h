@@ -71,6 +71,8 @@ class OPENMM_EXPORT_COMMON MetalNonbondedUtilities : public NonbondedUtilities  
 public:
     MetalNonbondedUtilities(MetalContext& context);
     ~MetalNonbondedUtilities();
+    MetalAtomReorder* getAtomReorder() { return atomReorder.get(); }
+    void invalidateNeighborList() { forceRebuildNeighborList = true; }
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *
@@ -177,6 +179,10 @@ public:
      */
     void scatterRoleForces();
     bool getUseRoleOrder() const { return useRoleOrder; }
+    bool hasBoundedNeighborList() const { return !waitForCount; }
+    long long getCountWaitCalls() const { return countWaitCalls; }
+    // Exercise the conservative overflow-check path without allocating an oversized system.
+    void forceCountWaitForTesting() { waitForCount = true; }
     bool getRoleForcesPending() const { return roleForcesPending; }
     MetalArray& getOrderedForces() { return orderedForces; }
     MetalArray& getInverseAtomOrder() { return inverseAtomOrder; }
@@ -329,6 +335,7 @@ public:
     void setKernelSource(const std::string& source);
 private:
     friend class MetalHostRobustnessAccess;
+    long long countWaitCalls = 0;
     /**
      * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
      * atomOrder, atomRoles and the exclusions in that order.  See initialize().

@@ -150,7 +150,9 @@ static void testOverflow() {
             oracle.reset(new Context(system, *oracleIntegrator, platform));
             MetalHostRobustnessAccess::undersize(cc);
         }
+        auto countBefore = cc.getNonbondedUtilities().getCountWaitCalls();
         State actual = context.getState(State::Positions | State::Forces | State::Energy);
+        ASSERT(cc.getNonbondedUtilities().getCountWaitCalls() > countBefore);
         MetalHostRobustnessAccess::assertRecovered(cc);
         oracle->setPositions(actual.getPositions());
         try {

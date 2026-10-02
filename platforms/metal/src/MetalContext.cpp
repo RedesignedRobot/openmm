@@ -27,6 +27,7 @@
   #define _USE_MATH_DEFINES // Needed to get M_PI
 #endif
 #include "MetalContext.h"
+#include "MetalAtomReorder.h"
 #include "MetalArray.h"
 #include "MetalBondedUtilities.h"
 #include "MetalEvent.h"
@@ -42,6 +43,12 @@
 #include "openmm/common/ContextSelector.h"
 #include "SHA1.h"
 #include "openmm/MonteCarloFlexibleBarostat.h"
+#include "openmm/MonteCarloBarostat.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/CMMotionRemover.h"
 #include "openmm/Platform.h"
 #include "openmm/System.h"
 #include "openmm/VirtualSite.h"
@@ -71,13 +78,29 @@ const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
 const int MetalContext::SpreadBlockSize = 128;
 
+// Byte offsets in the device box.  Aliases cover the molecule reorder kernels.
+// Scalar arguments retain their positions even when their values come from this buffer.
+static const map<string, int>& deviceBoxArguments() {
+    static const map<string, int> offsets = {
+        {"periodicBoxSize", 0}, {"invPeriodicBoxSize", 16},
+        {"periodicBoxVecX", 32}, {"periodicBoxVecY", 48}, {"periodicBoxVecZ", 64},
+        {"recipBoxVecX", 80}, {"recipBoxVecY", 96}, {"recipBoxVecZ", 112},
+        {"boxX", 32}, {"boxY", 48}, {"boxZ", 64},
+        {"boxXHi", 32}, {"boxYHi", 48}, {"boxZHi", 64},
+        {"boxXLo", 128}, {"boxYLo", 144}, {"boxZLo", 160},
+        {"invBoxSize", 176}, {"invHilbertWidth", 192},
+        {"zigzagXBins", 196}, {"zigzagYBins", 200}, {"volume", 204}
+    };
+    return offsets;
+}
+
 /**
  * Rewrite one kernel parameter.  A value parameter becomes a constant reference, or, when members is
  * given, a member of the kernel's argument struct, and then this returns only its trailing macros.
  * Each other parameter that takes a buffer binding gets a one byte marker member, so the host can
  * recover the position of every argument from reflection.
  */
-static string rewriteParameter(const string& param, string& prologue, string* members, int& index) {
+static string rewriteParameter(const string& param, string& prologue, string* members, int& index, bool deviceBox) {
     smatch m;
     bool isValue = !regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[*]"));
     if (!isValue || !regex_match(param, m, regex("\\s*(const\\s+)?(\\S.*?)\\s+(\\w+)((\\s+[A-Z_]+)*)\\s*"))) {
@@ -86,6 +109,11 @@ static string rewriteParameter(const string& param, string& prologue, string* me
         if (isValue || regex_search(param, regex("\\b(GLOBAL|LOCAL|LOCAL_ARG|device|threadgroup|constant)\\b|[&\\[]")))
             return param;
         return "device "+param;
+    }
+    if (deviceBox && deviceBoxArguments().count(m[3].str())) {
+        if (members != NULL)
+            *members += "char _mmB"+to_string(index++)+";\n";
+        return "constant "+m[2].str()+"& "+m[3].str()+m[4].str();
     }
     if (members == NULL) {
         prologue += m[2].str()+" "+m[3].str()+" = _in_"+m[3].str()+";\n";
@@ -108,7 +136,7 @@ static size_t lineEnd(const string& source, size_t i) {
  * only 31 buffer bindings per kernel.  A signature that never closes is left for the compiler to
  * report.
  */
-static string rewriteKernelSignatures(const string& source, bool packValues) {
+static string rewriteKernelSignatures(const string& source, bool packValues, bool deviceBox) {
     string result;
     size_t pos = 0;
     smatch m;
@@ -125,7 +153,7 @@ static string rewriteKernelSignatures(const string& source, bool packValues) {
             size_t prologueSize = prologue.size();
             if (source[i] == '#') {
                 size_t end = lineEnd(source, i);
-                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index);
+                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index, deviceBox);
                 if (packValues && prologue.size() > prologueSize)
                     signature.erase(signature.rfind(','), 1);
                 signature += rewritten+"\n"+source.substr(i, end-i);
@@ -137,7 +165,7 @@ static string rewriteKernelSignatures(const string& source, bool packValues) {
             }
             depth += (source[i] == '(')-(source[i] == ')');
             if (depth < 0 || (source[i] == ',' && depth == 0)) {
-                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index);
+                string rewritten = rewriteParameter(param, prologue, packValues ? &members : NULL, index, deviceBox);
                 bool moved = packValues && prologue.size() > prologueSize;
                 if (moved && source[i] == ')')
                     signature.erase(signature.rfind(','), 1);
@@ -254,6 +282,30 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
         defaultQueue = originalContext->defaultQueue;
     }
     currentQueue = defaultQueue;
+
+    const char* boxSetting = getenv("OPENMM_METAL_DEVICE_BOX");
+    useDeviceBox = (boxSetting != nullptr && string(boxSetting) == "1");
+    string boxFallback;
+    if (platformData.useCpuPme)
+        boxFallback = "CPU PME uses the host box";
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const Force& force = system.getForce(i);
+        const type_info& type = typeid(force);
+        if (type != typeid(HarmonicBondForce) && type != typeid(HarmonicAngleForce) &&
+                type != typeid(PeriodicTorsionForce) && type != typeid(NonbondedForce) &&
+                type != typeid(CMMotionRemover) && type != typeid(MonteCarloBarostat))
+            boxFallback = "force outside the FAH force set";
+        if (type == typeid(NonbondedForce) && static_cast<const NonbondedForce&>(force).getNonbondedMethod() != NonbondedForce::PME)
+            boxFallback = "only NonbondedForce PME is supported";
+    }
+    if (useDeviceBox && !boxFallback.empty()) {
+        useDeviceBox = false;
+        cerr << "OpenMM Metal: device box disabled: " << boxFallback << endl;
+    }
+    if (useDeviceBox) {
+        deviceBox.initialize(*this, 320, 1, "deviceBox");
+        compilationDefines["USE_DEVICE_BOX"] = "1";
+    }
 
     // set device properties
     this->simdWidth = 32;
@@ -452,17 +504,17 @@ void MetalContext::initialize() {
     size_t pinnedBufferSize;
     if (useDoublePrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
-        energySum.initialize<double>(*this, multiprocessors, "energySum");
+        energySum.initialize<double>(*this, multiprocessors+(useDeviceBox ? 1 : 0), "energySum");
         pinnedBufferSize = max((size_t) paddedNumAtoms*4, (size_t) numEnergyBuffers)*sizeof(double);
     }
     else if (useMixedPrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
-        energySum.initialize<double>(*this, multiprocessors, "energySum");
+        energySum.initialize<double>(*this, multiprocessors+(useDeviceBox ? 1 : 0), "energySum");
         pinnedBufferSize = max((size_t) paddedNumAtoms*4, (size_t) numEnergyBuffers)*sizeof(double);
     }
     else {
         energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
-        energySum.initialize<float>(*this, multiprocessors, "energySum");
+        energySum.initialize<float>(*this, multiprocessors+(useDeviceBox ? 1 : 0), "energySum");
         pinnedBufferSize = max((size_t) paddedNumAtoms*6, (size_t) numEnergyBuffers)*sizeof(float);
     }
     pinnedBuffer = malloc(pinnedBufferSize);
@@ -490,6 +542,145 @@ void MetalContext::initialize() {
     }
     findMoleculeGroups();
     nonbonded->initialize(system);
+    if (useDeviceBox) {
+        auto program = compileProgram(MetalKernelSources::deviceBox, {{"DEVICE_BOX_ENERGY", "1"}});
+        deviceBoxReorderBins = program->createKernel("updateBoxReorderBins");
+        deviceBoxReorderBins->addArg(deviceBox);
+        float zigzagWidth = (float) (0.2*nonbonded->getMaxCutoffDistance());
+        deviceBoxReorderBins->addArg((float) (1.0/zigzagWidth));
+        deviceBoxError.initialize<int>(*this, 1, "deviceBoxError");
+        *(int*) deviceBoxError.getDevicePointer()->contents() = 0;
+        deviceBoxReorderBins->addArg(deviceBoxError);
+        deviceBoxReorderBins->addArg(1.999999*nonbonded->getMaxCutoffDistance());
+        deviceBoxScale = program->createKernel("scaleBox");
+        deviceBoxScale->addArg(deviceBox);
+        deviceBoxScale->addArg();
+        deviceBoxUnwrap = compileProgram(MetalKernelSources::unwrapPositions)->createKernel("unwrapPositions");
+        deviceBoxUnwrap->addArg(numAtoms);
+        deviceBoxUnwrap->addArg(posq);
+        if (useMixedPrecision)
+            deviceBoxUnwrap->addArg(posqCorrection);
+        else
+            deviceBoxUnwrap->addArg(nullptr);
+        deviceBoxUnwrap->addArg();
+        deviceBoxUnwrap->addArg(nullptr); // Replaced by the authoritative box binding.
+        Vec3 a, b, c;
+        getPeriodicBoxVectors(a, b, c);
+        uploadDeviceBox(a, b, c);
+        deviceBoxEnergy = program->createKernel("addBoxEnergy");
+        deviceBoxEnergyBuffer.initialize(*this, 4, energyBuffer.getElementSize(), "deviceBoxEnergy");
+        addAutoclearBuffer(deviceBoxEnergyBuffer);
+        deviceBoxEnergy->addArg(deviceBox);
+        deviceBoxEnergy->addArg(deviceBoxEnergyBuffer);
+        deviceBoxEnergy->addArg();
+    }
+}
+
+void MetalContext::uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c) {
+    // Stage each host update in its own retained buffer.  A CPU write to the live buffer would
+    // race already encoded forces, especially the two deferred barostat energy evaluations.
+    unsigned char bytes[320] = {};
+    auto put = [&](int offset, const auto& value) { memcpy(bytes+offset, &value, sizeof(value)); };
+    put(0, periodicBoxSizeFloat);
+    put(16, invPeriodicBoxSizeFloat);
+    put(32, periodicBoxVecXFloat); put(48, periodicBoxVecYFloat); put(64, periodicBoxVecZFloat);
+    double scale = 1.0/(a[0]*b[1]*c[2]);
+    put(80, make_float4(b[1]*c[2]*scale, 0, 0, 0));
+    put(96, make_float4(-b[0]*c[2]*scale, a[0]*c[2]*scale, 0, 0));
+    put(112, make_float4((b[0]*c[1]-b[1]*c[0])*scale, -a[0]*c[1]*scale, a[0]*b[1]*scale, 0));
+    Vec3 vectors[] = {a, b, c};
+    for (int i = 0; i < 3; i++) {
+        const Vec3& v = vectors[i];
+        put(128+16*i, make_float4(v[0]-(float) v[0], v[1]-(float) v[1], v[2]-(float) v[2], 0));
+        put(208+32*i, make_double4(v[0], v[1], v[2], 0));
+    }
+    put(176, make_float4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0));
+    put(204, (float) (a[0]*b[1]*c[2]));
+    put(304, a[0]*b[1]*c[2]);
+    uploadDeviceBoxBytes(bytes);
+}
+
+void MetalContext::restoreDeviceBox(const unsigned char* bytes) {
+    if (!useDeviceBox)
+        throw OpenMMException("restoreDeviceBox requires OPENMM_METAL_DEVICE_BOX=1");
+    uploadDeviceBoxBytes(bytes);
+}
+
+void MetalContext::uploadDeviceBoxBytes(const unsigned char* bytes) {
+    auto staging = NS::TransferPtr(device->newBuffer(bytes, 320, MTL::ResourceStorageModeShared));
+    if (!staging)
+        throw OpenMMException("Unable to stage the periodic box");
+    MetalQueue& queue = getCurrentStream();
+    lock_guard<recursive_mutex> guard(queue.getLock());
+    auto blit = queue.getCommandBuffer()->blitCommandEncoder();
+    blit->copyFromBuffer(staging.get(), 0, deviceBox.getDevicePointer(), 0, 320);
+    blit->endEncoding();
+    if (deviceBoxReorderBins) {
+        deviceBoxReorderBins->execute(1, 1);
+        boxValidationPending = true;
+    }
+}
+
+void MetalContext::resolveDeviceBox() const {
+    if (!useDeviceBox || (!boxHostStale && !boxValidationPending))
+        return;
+    MetalContext& self = const_cast<MetalContext&>(*this);
+    self.getCurrentStream().finish();
+    if (boxHostStale) {
+        double4 vectors[3];
+        memcpy(vectors, (char*) self.deviceBox.getDevicePointer()->contents()+208, sizeof(vectors));
+        self.updateHostBox(Vec3(vectors[0].x, vectors[0].y, vectors[0].z),
+                           Vec3(vectors[1].x, vectors[1].y, vectors[1].z),
+                           Vec3(vectors[2].x, vectors[2].y, vectors[2].z));
+        self.boxHostStale = false;
+    }
+    self.boxValidationPending = false;
+    int& error = *(int*) self.deviceBoxError.getDevicePointer()->contents();
+    if (error) {
+        error = 0;
+        throw OpenMMException("The periodic box size has decreased to less than twice the nonbonded cutoff.");
+    }
+}
+
+MetalArray& MetalContext::getDeviceCellOffsets() {
+    auto reorder = nonbonded->getAtomReorder();
+    if (!reorder)
+        throw OpenMMException("Device box updates require periodic GPU atom reordering");
+    return reorder->getCellOffsets();
+}
+
+void MetalContext::deviceCellOffsetsChanged() {
+    nonbonded->getAtomReorder()->deviceOffsetsChanged();
+}
+
+void MetalContext::unwrapDevicePositions() {
+    deviceBoxUnwrap->setArg(3, getDeviceCellOffsets());
+    deviceBoxUnwrap->execute(numAtoms);
+    deviceCellOffsetsChanged();
+}
+
+void MetalContext::scaleDeviceBox(MetalArray& scaleFactor) {
+    if (!useDeviceBox || !nonbonded->getAtomReorder())
+        throw OpenMMException("Device box scaling requires OPENMM_METAL_DEVICE_BOX and periodic GPU reordering");
+    if (scaleFactor.getSize() != 1 || scaleFactor.getElementSize() != sizeof(double))
+        throw OpenMMException("Device box scale factor must contain one IEEE double");
+    // Prepare tables before modifying positions, so unsupported molecule layouts fail without a partial scale.
+    nonbonded->getAtomReorder()->prepareScale();
+    unwrapDevicePositions();
+    nonbonded->getAtomReorder()->scaleCoordinates(scaleFactor);
+    deviceBoxScale->setArg(1, scaleFactor);
+    deviceBoxScale->execute(1, 1);
+    deviceBoxReorderBins->execute(1, 1);
+    boxHostStale = true;
+    boxValidationPending = true;
+    nonbonded->invalidateNeighborList();
+    setForcesValid(false);
+    getContextImpl()->systemChanged();
+}
+
+void MetalContext::addDeviceBoxEnergy(double coefficient) {
+    deviceBoxEnergy->setArg(2, coefficient);
+    deviceBoxEnergy->execute(1, 1);
 }
 
 void MetalContext::initializeContexts() {
@@ -548,7 +739,7 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
         src << endl;
     src << "#include <metal_stdlib>\n";
     src << "using namespace metal;\n";
-    if (useMixedPrecision) {
+    if (useMixedPrecision || defines.count("DEVICE_BOX_ENERGY")) {
         // The program's own defines come after this header, too late for df64 to see.
         if (defines.find("DF64_FINITE") != defines.end())
             src << "#define DF64_FINITE\n";
@@ -597,13 +788,13 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     // rename it.  That also renames the address space qualifier: program sources must write PRIVATE, never thread.
     string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
     string log;
-    metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);
+    metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false, useDeviceBox)+"\n", log, saveTemps);
     bool packed = false;
     if (module == NULL) {
         // A kernel past Metal's 31 buffer bindings compiles once its values are packed.  Any other
         // error fails both ways, and the first log reports it.
         string packedLog;
-        module = createLibrary(header+rewriteKernelSignatures(body, true)+"\n", packedLog, saveTemps);
+        module = createLibrary(header+rewriteKernelSignatures(body, true, useDeviceBox)+"\n", packedLog, saveTemps);
         packed = (module != NULL);
     }
     if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
@@ -689,6 +880,7 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     KernelArguments args;
     MTL::BufferBinding* argsBinding = NULL;
     vector<BufferLayout> bindingLayouts;
+    map<int, int> boxBindings;
     for (int i = 0; kernel != NULL && i < reflection->bindings()->count(); i++) {
         MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
         if (binding->type() != MTL::BindingTypeBuffer)
@@ -696,6 +888,10 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
         string bindingName = binding->name()->utf8String();
         args.sizes.resize(max((int) args.sizes.size(), (int) binding->index()+1), 0);
         bindingLayouts.resize(args.sizes.size(), PlainLayout);
+        if (useDeviceBox && deviceBoxArguments().count(bindingName))
+            boxBindings[binding->index()] = deviceBoxArguments().at(bindingName);
+        if (useDeviceBox && bindingName == "deviceBoxVectors")
+            boxBindings[binding->index()] = (useMixedPrecision ? 208 : 32);
         if (bindingName == "_in__mmArgs")
             argsBinding = (MTL::BufferBinding*) binding;
         else if (bindingName.rfind("_in_", 0) == 0)
@@ -707,11 +903,14 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
     if (validArguments) {
         // Unpacked arguments bind at their own index, packed buffers in order from index 1.
         args.layouts.resize(args.sizes.size(), PlainLayout);
+        args.boxOffsets.resize(args.sizes.size(), -1);
         int bufferIndex = 1;
         for (int i = 0; i < args.sizes.size(); i++) {
             int bindingIndex = (packed ? bufferIndex : i);
             if (args.sizes[i] != 0)
                 continue;
+            if (boxBindings.count(bindingIndex))
+                args.boxOffsets[i] = boxBindings.at(bindingIndex);
             if (bindingIndex < bindingLayouts.size())
                 args.layouts[i] = bindingLayouts[bindingIndex];
             bufferIndex++;
@@ -868,7 +1067,9 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
     const KernelArguments& args = kernelArguments[kernel];
     if (args.offsets.empty()) {
         for (int i = 0; i < args.sizes.size(); i++) {
-            if (args.sizes[i] == 0)
+            if (args.boxOffsets[i] >= 0)
+                encoder->setBuffer(deviceBox.getDevicePointer(), args.boxOffsets[i], i);
+            else if (args.sizes[i] == 0)
                 encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, i);
             else
                 encoder->setBytes(arguments[i], args.sizes[i], i);
@@ -878,7 +1079,9 @@ void MetalContext::executeKernelFlat(metalFunction_t kernel, void** arguments, i
         vector<char> packed(args.packedSize);
         int bufferIndex = 1;
         for (int i = 0; i < args.sizes.size(); i++) {
-            if (args.sizes[i] == 0)
+            if (args.boxOffsets[i] >= 0)
+                encoder->setBuffer(deviceBox.getDevicePointer(), args.boxOffsets[i], bufferIndex++);
+            else if (args.sizes[i] == 0)
                 encoder->setBuffer(*(MTL::Buffer**) arguments[i], 0, bufferIndex++);
             else
                 memcpy(&packed[args.offsets[i]], arguments[i], args.sizes[i]);
@@ -911,7 +1114,18 @@ double MetalContext::reduceEnergy() {
     reduceEnergyKernel->setArg(1, result);
     reduceEnergyKernel->setArg(2, energyBuffer.getSize());
     reduceEnergyKernel->setArg(3, workGroupSize);
-    reduceEnergyKernel->execute(workGroupSize*result.getSize(), workGroupSize);
+    reduceEnergyKernel->execute(workGroupSize*(result.getSize()-(useDeviceBox ? 1 : 0)), workGroupSize);
+    if (useDeviceBox) {
+        // Keep the small volume term out of the large single precision force sums.  The reserved
+        // final element is included in the host double sum and in each deferred energy snapshot.
+        MetalQueue& queue = getCurrentStream();
+        lock_guard<recursive_mutex> guard(queue.getLock());
+        auto blit = queue.getCommandBuffer()->blitCommandEncoder();
+        size_t elementSize = result.getElementSize();
+        blit->copyFromBuffer(deviceBoxEnergyBuffer.getDevicePointer(), 0, result.getDevicePointer(),
+                            (result.getSize()-1)*elementSize, elementSize);
+        blit->endEncoding();
+    }
     if (barostatEnergy != nullptr)
         return 0.0;
     if (deferredEnergy != NULL) {
@@ -946,6 +1160,7 @@ void MetalContext::enqueueEnergy(MetalArray& result, int groups, double& forceEn
 
 double MetalContext::readEnergy(MetalArray& buffer) {
     buffer.download(pinnedBuffer);
+    resolveDeviceBox();
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
         for (int i = 0; i < buffer.getSize(); i++)

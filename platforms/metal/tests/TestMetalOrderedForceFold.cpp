@@ -168,7 +168,10 @@ vector<State> holdoutTrajectory(FoldPlatform& platform, System& system, const St
     MetalContext& metal = platform.getMetalContext(context);
     auto& nb = metal.getNonbondedUtilities();
     platform.computeForces(context);
+    if (getenv("OPENMM_METAL_DEVICE_BOX") != nullptr && string(getenv("OPENMM_METAL_DEVICE_BOX")) == "1")
+        ASSERT(metal.getUseDeviceBox());
     cout << "Holdout fold=" << fold << " particles=" << system.getNumParticles()
+         << " deviceBox=" << metal.getUseDeviceBox()
          << " roleOrder=" << nb.getUseRoleOrder()
          << " canFold=" << metal.getIntegrationUtilities().canFoldOrderedForces()
          << " roleForcesPending=" << nb.getRoleForcesPending() << endl;

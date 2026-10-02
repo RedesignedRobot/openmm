@@ -99,6 +99,7 @@ public:
      * array, since the process started.  Two equal readings prove no GPU work was encoded and no array was
      * written in between, on any queue of any context.
      */
+    static long long getFinishCount() { return finishCount; }
     static long long getWorkCount() {
         return workCount;
     }
@@ -119,7 +120,7 @@ private:
     std::deque<MTL::CommandBuffer*> pending;
     std::vector<MTL::HandlerFunction> completedHandlers;
     std::atomic<long long> commitCount;
-    static std::atomic<long long> workCount;
+    static std::atomic<long long> workCount, finishCount;
     std::recursive_mutex lock;
     std::condition_variable_any bufferOpened;
     std::thread committer;

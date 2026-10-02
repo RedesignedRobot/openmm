@@ -37,6 +37,10 @@
 #include <map>
 #include <set>
 
+#ifdef OpenMMMetal_EXPORTS
+#include "MetalContext.h"
+#endif
+
 using namespace OpenMM;
 using namespace std;
 
@@ -828,33 +832,38 @@ void IntegrationUtilities::applyVelocityConstraints(double tol) {
 void IntegrationUtilities::computeVirtualSites() {
     ContextSelector selector(context);
     if (numVsites > 0) {
-        Vec3 boxVectors[3];
-        context.getPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
-        mm_double4 recipBoxVectorsDouble[3];
-        context.computeReciprocalBoxVectors(recipBoxVectorsDouble);
-        if (context.getUseDoublePrecision()) {
-            mm_double4 boxVectorsDouble[3];
-            for (int i = 0; i < 3; i++)
-                boxVectorsDouble[i] = mm_double4(boxVectors[i][0], boxVectors[i][1], boxVectors[i][2], 0);
-            vsitePositionKernel->setArg(17, boxVectorsDouble[0]);
-            vsitePositionKernel->setArg(18, boxVectorsDouble[1]);
-            vsitePositionKernel->setArg(19, boxVectorsDouble[2]);
-            vsitePositionKernel->setArg(20, recipBoxVectorsDouble[0]);
-            vsitePositionKernel->setArg(21, recipBoxVectorsDouble[1]);
-            vsitePositionKernel->setArg(22, recipBoxVectorsDouble[2]);
-        }
-        else {
-            mm_float4 boxVectorsFloat[3], recipBoxVectorsFloat[3];
-            for (int i = 0; i < 3; i++) {
-                boxVectorsFloat[i] = mm_float4((float) boxVectors[i][0], (float) boxVectors[i][1], (float) boxVectors[i][2], 0);
-                recipBoxVectorsFloat[i] = mm_float4((float) recipBoxVectorsDouble[i].x, (float) recipBoxVectorsDouble[i].y, (float) recipBoxVectorsDouble[i].z, 0);
+#ifdef OpenMMMetal_EXPORTS
+        if (!static_cast<MetalContext&>(context).getUseDeviceBox())
+#endif
+        {
+            Vec3 boxVectors[3];
+            context.getPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
+            mm_double4 recipBoxVectorsDouble[3];
+            context.computeReciprocalBoxVectors(recipBoxVectorsDouble);
+            if (context.getUseDoublePrecision()) {
+                mm_double4 boxVectorsDouble[3];
+                for (int i = 0; i < 3; i++)
+                    boxVectorsDouble[i] = mm_double4(boxVectors[i][0], boxVectors[i][1], boxVectors[i][2], 0);
+                vsitePositionKernel->setArg(17, boxVectorsDouble[0]);
+                vsitePositionKernel->setArg(18, boxVectorsDouble[1]);
+                vsitePositionKernel->setArg(19, boxVectorsDouble[2]);
+                vsitePositionKernel->setArg(20, recipBoxVectorsDouble[0]);
+                vsitePositionKernel->setArg(21, recipBoxVectorsDouble[1]);
+                vsitePositionKernel->setArg(22, recipBoxVectorsDouble[2]);
             }
-            vsitePositionKernel->setArg(17, boxVectorsFloat[0]);
-            vsitePositionKernel->setArg(18, boxVectorsFloat[1]);
-            vsitePositionKernel->setArg(19, boxVectorsFloat[2]);
-            vsitePositionKernel->setArg(20, recipBoxVectorsFloat[0]);
-            vsitePositionKernel->setArg(21, recipBoxVectorsFloat[1]);
-            vsitePositionKernel->setArg(22, recipBoxVectorsFloat[2]);
+            else {
+                mm_float4 boxVectorsFloat[3], recipBoxVectorsFloat[3];
+                for (int i = 0; i < 3; i++) {
+                    boxVectorsFloat[i] = mm_float4((float) boxVectors[i][0], (float) boxVectors[i][1], (float) boxVectors[i][2], 0);
+                    recipBoxVectorsFloat[i] = mm_float4((float) recipBoxVectorsDouble[i].x, (float) recipBoxVectorsDouble[i].y, (float) recipBoxVectorsDouble[i].z, 0);
+                }
+                vsitePositionKernel->setArg(17, boxVectorsFloat[0]);
+                vsitePositionKernel->setArg(18, boxVectorsFloat[1]);
+                vsitePositionKernel->setArg(19, boxVectorsFloat[2]);
+                vsitePositionKernel->setArg(20, recipBoxVectorsFloat[0]);
+                vsitePositionKernel->setArg(21, recipBoxVectorsFloat[1]);
+                vsitePositionKernel->setArg(22, recipBoxVectorsFloat[2]);
+            }
         }
         for (int i = 0; i < numVsiteStages; i++) {
             vsitePositionKernel->setArg(24, i);

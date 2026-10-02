@@ -37,12 +37,17 @@ public:
     bool apply();
     void syncHost();
     void hostChanged();
+    MetalArray& getCellOffsets();
+    void deviceOffsetsChanged();
+    bool hasUsableTables();
+    void prepareScale();
+    void scaleCoordinates(MetalArray& scaleFactor);
 private:
     bool buildTables();
     void uploadCellOffsets();
     void checkForNaN();
     MetalContext& context;
-    ComputeKernel keysKernel, largeKeysKernel, gatherKernel, storeKernel;
+    ComputeKernel keysKernel, largeKeysKernel, gatherKernel, storeKernel, scaleKernel;
     ComputeSort sort;
     std::unique_ptr<MetalArray> molecules, templateAtoms, slotMolecule, largeMolecules, keys, moleculeCells, cellOffsets;
     std::unique_ptr<MetalArray> scratch, scratchIndex, scratchOffsets, nanFlag;

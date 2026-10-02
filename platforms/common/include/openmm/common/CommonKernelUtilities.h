@@ -26,6 +26,9 @@
 #include "lepton/ExpressionTreeNode.h"
 #include "lepton/Operation.h"
 #include "lepton/ParsedExpression.h"
+#ifdef OpenMMMetal_EXPORTS
+#include "MetalContext.h"
+#endif
 #include <string>
 
 using namespace OpenMM;
@@ -40,6 +43,11 @@ using namespace Lepton;
  */
 
 static void setPeriodicBoxArgs(ComputeContext& cc, ComputeKernel kernel, int index) {
+#ifdef OpenMMMetal_EXPORTS
+    // Metal binds these arguments directly to the device box.  Do not resolve a host mirror.
+    if (static_cast<MetalContext&>(cc).getUseDeviceBox())
+        return;
+#endif
     Vec3 a, b, c;
     cc.getPeriodicBoxVectors(a, b, c);
     if (cc.getUseDoublePrecision()) {

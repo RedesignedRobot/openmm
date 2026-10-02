@@ -53,6 +53,8 @@ typedef unsigned int tileflags;
 
 namespace OpenMM {
 
+class MetalApplyMonteCarloBarostatKernel;
+
 typedef mm_int2 int2;
 typedef mm_float4 float4;
 typedef mm_double4 double4;
@@ -397,10 +399,31 @@ public:
     bool getSupportsDoublePrecision() const {
         return useMixedPrecision;
     }
+    bool getUseDeviceBox() const { return useDeviceBox; }
+    MetalArray& getDeviceBoxState() { return deviceBox; }
+    /**
+     * Replace the device box with bytes saved from getDeviceBoxState().  Checkpoints use this because the
+     * host cannot reproduce the derived fields that device df64 scaling wrote.
+     */
+    void restoreDeviceBox(const unsigned char* bytes);
+    // Eligibility is refreshed by the barostat before trials and checkpoint operations.
+    MetalApplyMonteCarloBarostatKernel* deviceBarostatKernel = nullptr;
+    MetalArray* deviceBarostatState = nullptr;
+    /** Add a coefficient divided by the current device volume to the energy buffer. */
+    void addDeviceBoxEnergy(double coefficient);
+    /** Resolve device box state and report deferred cutoff errors at host observation time. */
+    void resolveDeviceBox() const;
+    /** Device cell offsets, with no host resolution. */
+    MetalArray& getDeviceCellOffsets();
+    void deviceCellOffsetsChanged();
+    void unwrapDevicePositions();
+    /** Scale the box and rigid molecule centers by one IEEE double in a device buffer. No host wait. */
+    void scaleDeviceBox(MetalArray& scaleFactor);
     /**
      * Get the vectors defining the periodic box.
      */
     void getPeriodicBoxVectors(Vec3& a, Vec3& b, Vec3& c) const {
+        resolveDeviceBox();
         a = Vec3(periodicBoxVecX.x, periodicBoxVecX.y, periodicBoxVecX.z);
         b = Vec3(periodicBoxVecY.x, periodicBoxVecY.y, periodicBoxVecY.z);
         c = Vec3(periodicBoxVecZ.x, periodicBoxVecZ.y, periodicBoxVecZ.z);
@@ -409,27 +432,23 @@ public:
      * Set the vectors defining the periodic box.
      */
     void setPeriodicBoxVectors(const Vec3& a, const Vec3& b, const Vec3& c) {
-        periodicBoxVecX = make_double4(a[0], a[1], a[2], 0.0);
-        periodicBoxVecY = make_double4(b[0], b[1], b[2], 0.0);
-        periodicBoxVecZ = make_double4(c[0], c[1], c[2], 0.0);
-        periodicBoxVecXFloat = make_float4((float) a[0], (float) a[1], (float) a[2], 0.0f);
-        periodicBoxVecYFloat = make_float4((float) b[0], (float) b[1], (float) b[2], 0.0f);
-        periodicBoxVecZFloat = make_float4((float) c[0], (float) c[1], (float) c[2], 0.0f);
-        periodicBoxSize = make_double4(a[0], b[1], c[2], 0.0);
-        invPeriodicBoxSize = make_double4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0.0);
-        periodicBoxSizeFloat = make_float4((float) a[0], (float) b[1], (float) c[2], 0.0f);
-        invPeriodicBoxSizeFloat = make_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f);
+        updateHostBox(a, b, c);
+        boxHostStale = false;
+        if (useDeviceBox)
+            uploadDeviceBox(a, b, c);
     }
     /**
      * Get the size of the periodic box.
      */
     double4 getPeriodicBoxSize() const {
+        resolveDeviceBox();
         return periodicBoxSize;
     }
     /**
      * Get the inverse of the size of the periodic box.
      */
     double4 getInvPeriodicBoxSize() const {
+        resolveDeviceBox();
         return invPeriodicBoxSize;
     }
     /**
@@ -579,8 +598,22 @@ private:
      * each value goes in one struct bound at index 0, and packedSize is that struct's size.  layouts
      * holds the layout each buffer argument reads.
      */
+    void updateHostBox(const Vec3& a, const Vec3& b, const Vec3& c) {
+        periodicBoxVecX = make_double4(a[0], a[1], a[2], 0.0);
+        periodicBoxVecY = make_double4(b[0], b[1], b[2], 0.0);
+        periodicBoxVecZ = make_double4(c[0], c[1], c[2], 0.0);
+        periodicBoxVecXFloat = make_float4((float) a[0], (float) a[1], (float) a[2], 0.0f);
+        periodicBoxVecYFloat = make_float4((float) b[0], (float) b[1], (float) b[2], 0.0f);
+        periodicBoxVecZFloat = make_float4((float) c[0], (float) c[1], (float) c[2], 0.0f);
+        periodicBoxSize = make_double4(a[0], b[1], c[2], 0.0);
+        invPeriodicBoxSize = make_double4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0.0);
+        periodicBoxSizeFloat = make_float4((float) a[0], (float) b[1], (float) c[2], 0.0f);
+        invPeriodicBoxSizeFloat = make_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f);
+    }
+    void uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c);
+    void uploadDeviceBoxBytes(const unsigned char* bytes);
     struct KernelArguments {
-        std::vector<int> sizes, offsets;
+        std::vector<int> sizes, offsets, boxOffsets;
         std::vector<BufferLayout> layouts;
         int packedSize = 0;
     };
@@ -618,6 +651,10 @@ private:
     std::map<metalFunction_t, KernelArguments> kernelArguments;
     metalDevice_t device;
     void* pinnedBuffer;
+    bool useDeviceBox = false;
+    bool boxHostStale = false, boxValidationPending = false;
+    MetalArray deviceBox, deviceBoxEnergyBuffer, deviceBoxError;
+    ComputeKernel deviceBoxEnergy, deviceBoxReorderBins, deviceBoxScale, deviceBoxUnwrap;
     MetalArray energyBuffer;
     ArrayInterface* deferredEnergy = NULL;
     int deferredEnergyIndex = 0;

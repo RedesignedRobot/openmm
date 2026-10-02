@@ -1786,6 +1786,13 @@ public:
      *                   equal the number of components passed to initialize().
      */
     virtual void computeKineticEnergy(ContextImpl& context, std::vector<double>& ke) = 0;
+    /** Optionally submit a complete isotropic trial.  A true result owns proposal,
+     * decision, rollback and adaptation.  The caller must invalidate forces.
+     * False must have no simulation side effects.
+     */
+    virtual bool executeTrial(ContextImpl& context, int groups, double pressure, double kT) { return false; }
+    /** Optional deterministic uniforms for testing both implementations. */
+    virtual bool getTrialUniforms(double& proposal, double& acceptance) { return false; }
     /**
      * Optionally evaluate the energies around an isotropic barostat proposal.
      * Return false without side effects to use the existing synchronous path.
