@@ -669,7 +669,9 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     forceRebuildNeighborList = false;
     // With the indirect rebuild, findBlockBounds already copied a count, at most one list old,
     // which is all a step without the wait needs.
-    bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+    // A fully allocated list cannot overflow.  With device trials its old count
+    // only guides optional early reordering; the periodic reorder remains bounded.
+    bool wait = (waitForCount || (context.deviceBarostatState == nullptr && context.getStepsSinceReorder() == 0));
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
     if (wait || !useIndirectRebuild) {
@@ -706,7 +708,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
         // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
-        bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+        bool wait = (waitForCount || (context.deviceBarostatState == nullptr && context.getStepsSinceReorder() == 0));
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
         if (wait) {
@@ -734,6 +736,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
 }
 
 void MetalNonbondedUtilities::waitForCountCopy() {
+    countWaitCalls++;
     // The host watches the copy counter in pinned memory instead of waiting on a shared event.  A signal
     // between the neighbor list and the force kernels stalled the force kernels on the M3 Ultra until the
     // host's next commit, 47 us per step on apoa1.  The counter usually shows up while the force kernels

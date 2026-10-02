@@ -35,6 +35,7 @@ using namespace std;
 static const int MaxBuffersInFlight = 8;
 
 atomic<long long> MetalQueue::workCount(0);
+std::atomic<long long> MetalQueue::finishCount{0};
 
 MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false), finishEvent(NULL), finishValue(0), finishedCommits(-1) {
 }
@@ -130,6 +131,7 @@ void MetalQueue::submit() {
 }
 
 void MetalQueue::finish() {
+    finishCount++;
     lock_guard<recursive_mutex> guard(lock);
     if (openBuffer == NULL && isIdle()) {
         commit();

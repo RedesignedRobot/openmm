@@ -409,3 +409,86 @@ Device scaling must be no worse than host scaling against Reference on the same
 box; the bitwise Metal force comparison establishes that condition. Energy tolerance is
 `1e-5` of summed group magnitudes. The round-3 handoff records runtime results
 and any remaining limitations; the implementation alone is not validation.
+
+### Phase 2b device trial
+
+`OPENMM_METAL_DEVICE_BAROSTAT=1` selects a complete device trial and requires
+`OPENMM_METAL_DEVICE_BOX=1`. Both flags default off. The phase 1 flag still
+controls the host-decision fallback. The device path requires the phase 1 FAH
+force whitelist, one context, GPU PME, LangevinMiddle, rigid molecule scaling,
+GPU molecule reorder, and a neighbor list allocated for every possible pair.
+An ineligible request prints its reason and retains phase 1 or the host path.
+
+The optional `ApplyMonteCarloBarostatKernel::executeTrial` hook returns true
+only when the platform owns the complete trial. The core passes pressure in
+energy per volume and kT, before drawing a host uniform or reading the box.
+It invalidates forces after every submitted device trial because the host does
+not know the decision. Other platforms inherit a false result. No ContextImpl
+change is needed. A second default-false hook, `getTrialUniforms`, lets the
+Metal test inject uniforms into the existing core host decision. It changes
+neither platform's production RNG. These are the only new core virtual methods.
+
+Metal snapshots positions, mixed position corrections, velocities, fixed-point
+forces, atom indices, cell offsets and the complete box buffer with queue-ordered
+copies. Energy-only force evaluations do not reorder atoms. The proposal kernel
+draws a uniform, computes the volume increment and writes one IEEE scale factor.
+`enqueueEnergy` retains each reduction on the device. `scaleDeviceBox` performs
+the molecule translation and updates all box consumers. A single work item sums
+each energy reduction with df64, evaluates the work and conditionally draws the
+acceptance uniform. Conditional word copies restore every snapshot on rejection.
+Both decisions invalidate the trial neighbor list and require the next force
+calculation. No host outcome, atom-order listener, or host box update is involved.
+
+The independent stream is Philox4x32-10, keyed by the barostat seed. Seed zero
+obtains a fresh key at initialization. Each consumed uniform uses one counter
+block and the first 32-bit word, converted exactly to [0, 1) in df64. A downhill
+move consumes one block; an uphill move consumes two. The stream does not mirror
+or advance host SFMT. The device stores its cursor, seed, adaptation counts,
+lifetime counts, last energies and last work with the volume scale. It uses the
+host's ten-attempt adaptation threshold, 25%/75% limits, factor 1.1 and 30% cap
+based on the pre-trial volume. Its df64 arithmetic targets errors well below kT;
+it does not promise bitwise identity with host double exp/log.
+
+The registered Metal barostat buffer is downloaded only by the test getter or
+checkpoint creation. Ordinary getState resolves the device box and coordinates.
+Enabled checkpoints have a Metal-specific version marker and include the device
+RNG and adaptation state. Loading requires matching device-barostat eligibility
+and flags. Default-off checkpoints retain the existing format. The core's
+barostat frequency counter retains its existing checkpoint behavior.
+Loading across the flag change throws an exception naming
+`OPENMM_METAL_DEVICE_BAROSTAT` in either direction. The phase 2a device-box
+checkpoint transfer test disables only the device barostat within that test.
+
+For a fully allocated neighbor list, the interaction count cannot cause an
+overflow. While a device barostat is registered, the host uses the already
+available count only as an early-reorder hint and keeps the ordinary periodic
+reorder. It no longer waits for a fresh count at a reorder boundary. Systems
+that require synchronous overflow handling are ineligible. The new global
+`MetalQueue::getFinishCount()` counts calls on all queues, including calls that
+find an idle queue, for the no-wait test.
+
+`TestMetalDeviceBarostat all` runs paired uniform decisions, bitwise rejection
+snapshots, fresh-context checkpoints after both outcomes, and 1,000 plain plus
+1,000 trial-bearing steps per precision. `all statistics [system.xml state.xml]`
+runs 20,000 steps per arm on 19,652-site TIP4P-Ew water after equilibration, then
+5,000 steps per arm on the optional FAH fixture. It uses distinct seeds and 20
+blocks for volume, volume variance and acceptance uncertainty. The required
+three-combined-SE comparisons are correctness checks, with no timing windows.
+The default test also verifies the nonrigid and host-overflow-check fallbacks:
+each prints its reason once and uses phase 1. A test hook can force the
+conservative count-wait path without allocating an oversized system. Optional
+`all system.xml state.xml integrator.xml` arguments additionally verify that a
+FAH fixture executes a device trial with its original integrator and force set.
+
+The paired test imports the same State into both contexts before each trial.
+The first setPositions wraps/reorders coordinates; subsequent setState calls
+unwrap them and ordinarily do not reorder. Importing into only the device
+context compared wrapped host float positions with unwrapped device float
+positions. This explained the mixed first-trial energy gap in the initial test.
+Mixed force kernels read the float posq words, even though the correction words
+preserve the physical coordinates. Both paths now use the same import sequence.
+Every mixed trial must agree within 1e-3 kT. Single mode reports its existing
+float energy accumulation noise. Both modes independently check device work
+against a CPU sum of the very same reduction buffers within 1e-3 kT, and apply
+the brief's strict mismatch/boundary exception without a blanket single-mode
+cross-path bound. The liaison approved this interpretation after batch 3.

@@ -169,6 +169,8 @@ public:
      * The fused LangevinMiddle kernel may have left the virtual sites' forces undistributed; distribute them first.
      */
     void getForces(ContextImpl& context, std::vector<Vec3>& forces);
+    void createCheckpoint(ContextImpl& context, std::ostream& stream) override;
+    void loadCheckpoint(ContextImpl& context, std::istream& stream) override;
 private:
     MetalContext& cu;
     ComputeArray cellOffsets, boxVectors;
@@ -267,14 +269,30 @@ public:
     MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
             CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
     }
+    ~MetalApplyMonteCarloBarostatKernel() {
+        if (cu.deviceBarostatState == &trialState) cu.deviceBarostatState = nullptr;
+    }
     void initialize(const System& system, const Force& barostat, int components, bool rigidMolecules=true);
     void saveCoordinates(ContextImpl& context) override;
+    bool executeTrial(ContextImpl& context, int groups, double pressure, double kT) override;
+    bool getTrialUniforms(double& proposal, double& acceptance) override;
+    void setTrialUniforms(double proposal, double acceptance);
+    std::vector<double> getTrialState();
+    void readTrialEnergies(double& initial, double& final);
+    double testInitialEnergy = 0, testFinalEnergy = 0;
     bool computeTrialEnergies(ContextImpl& context, int groups, const std::function<void()>& propose,
                               double& initialEnergy, double& finalEnergy);
 private:
     MetalContext& cu;
     bool deferEnergies = false;
     MetalArray initialEnergySum, finalEnergySum;
+    MetalArray trialState, scaleFactor;
+    std::vector<std::unique_ptr<MetalArray>> trialSaved;
+    ComputeKernel proposeTrial, decideTrial, restoreTrial;
+    bool deviceRequested = false, deviceEligible = false, reportedFallback = false;
+    bool rigidTrial = true, injectedUniforms = false;
+    int trialSeed = 0;
+    double testProposal = 0, testAcceptance = 0;
 };
 
 } // namespace OpenMM

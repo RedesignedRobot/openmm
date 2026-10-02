@@ -398,6 +398,9 @@ public:
         return useMixedPrecision;
     }
     bool getUseDeviceBox() const { return useDeviceBox; }
+    MetalArray& getDeviceBoxState() { return deviceBox; }
+    // Registered by the eligible isotropic barostat; resolved only by its getters/checkpoint.
+    MetalArray* deviceBarostatState = nullptr;
     /** Add a coefficient divided by the current device volume to the energy buffer. */
     void addDeviceBoxEnergy(double coefficient);
     /** Resolve device box state and report deferred cutoff errors at host observation time. */

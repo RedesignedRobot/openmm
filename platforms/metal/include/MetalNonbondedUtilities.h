@@ -179,6 +179,10 @@ public:
      */
     void scatterRoleForces();
     bool getUseRoleOrder() const { return useRoleOrder; }
+    bool hasBoundedNeighborList() const { return !waitForCount; }
+    long long getCountWaitCalls() const { return countWaitCalls; }
+    // Exercise the conservative overflow-check path without allocating an oversized system.
+    void forceCountWaitForTesting() { waitForCount = true; }
     bool getRoleForcesPending() const { return roleForcesPending; }
     MetalArray& getOrderedForces() { return orderedForces; }
     MetalArray& getInverseAtomOrder() { return inverseAtomOrder; }
@@ -334,6 +338,7 @@ private:
      * Wait until copyInteractionCounts has written this step's counts to pinned memory.
      */
     void waitForCountCopy();
+    long long countWaitCalls = 0;
     /**
      * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
      * atomOrder, atomRoles and the exclusions in that order.  See initialize().

@@ -52,6 +52,9 @@
 #include <sstream>
 #include <typeinfo>
 #include <set>
+#include <random>
+#include <iostream>
+#include "MetalAtomReorder.h"
 #include <assert.h>
 
 using namespace OpenMM;
@@ -477,9 +480,15 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
 
 void MetalApplyMonteCarloBarostatKernel::initialize(const System& system, const Force& barostat, int components, bool rigidMolecules) {
     CommonApplyMonteCarloBarostatKernel::initialize(system, barostat, components, rigidMolecules);
+    const char* deviceSetting = getenv("OPENMM_METAL_DEVICE_BAROSTAT");
+    deviceRequested = deviceSetting != nullptr && string(deviceSetting) == "1";
+    rigidTrial = rigidMolecules;
+    if (typeid(barostat) == typeid(MonteCarloBarostat))
+        trialSeed = static_cast<const MonteCarloBarostat&>(barostat).getRandomNumberSeed();
+    if (deviceRequested && trialSeed == 0)
+        trialSeed = (int) std::random_device{}();
     const char* setting = getenv("OPENMM_METAL_DEFER_BAROSTAT_ENERGIES");
-    deferEnergies = (setting == nullptr || string(setting) != "0") &&
-            typeid(barostat) == typeid(MonteCarloBarostat) && cu.getNumContexts() == 1 && !cu.getPlatformData().useCpuPme;
+    deferEnergies = typeid(barostat) == typeid(MonteCarloBarostat) && cu.getNumContexts() == 1 && !cu.getPlatformData().useCpuPme;
     // These forces have no nested Context evaluation or host callback.  Other systems retain getState().
     for (int i = 0; i < system.getNumForces(); i++) {
         const type_info& type = typeid(system.getForce(i));
@@ -488,6 +497,20 @@ void MetalApplyMonteCarloBarostatKernel::initialize(const System& system, const 
                 type != typeid(CMMotionRemover) && type != typeid(MonteCarloBarostat))
             deferEnergies = false;
     }
+    deviceEligible = deferEnergies;
+    // Register checkpoint storage at construction, including before the first trial.
+    if (deviceRequested && deviceEligible && rigidTrial && cu.getUseDeviceBox() &&
+            typeid(cu.getContextImpl()->getIntegrator()) == typeid(LangevinMiddleIntegrator)) {
+        trialState.initialize(cu, 16, sizeof(double), "deviceBarostatState");
+        vector<double> initial(16, 0);
+        Vec3 box[3];
+        system.getDefaultPeriodicBoxVectors(box[0], box[1], box[2]);
+        initial[0] = 0.01*box[0][0]*box[1][1]*box[2][2];
+        initial[12] = (unsigned int) trialSeed;
+        trialState.upload(initial);
+        cu.deviceBarostatState = &trialState;
+    }
+    deferEnergies = deferEnergies && (setting == nullptr || string(setting) != "0");
 }
 
 bool MetalApplyMonteCarloBarostatKernel::computeTrialEnergies(ContextImpl& context, int groups,
@@ -506,5 +529,164 @@ bool MetalApplyMonteCarloBarostatKernel::computeTrialEnergies(ContextImpl& conte
     // ContextImpl's addition: hostForce + (hostPlatform + deviceReduction), never reassociate it.
     initialEnergy = initialForce+(initialPlatform+cu.readEnergy(initialEnergySum));
     finalEnergy = finalForce+(finalPlatform+cu.readEnergy(finalEnergySum));
+    testInitialEnergy = initialEnergy;
+    testFinalEnergy = finalEnergy;
     return true;
+}
+
+bool MetalApplyMonteCarloBarostatKernel::getTrialUniforms(double& proposal, double& acceptance) {
+    proposal = testProposal;
+    acceptance = testAcceptance;
+    return injectedUniforms;
+}
+
+void MetalApplyMonteCarloBarostatKernel::setTrialUniforms(double proposal, double acceptance) {
+    if (proposal < 0 || proposal >= 1 || acceptance < 0 || acceptance >= 1)
+        throw OpenMMException("Barostat test uniforms must be in [0, 1)");
+    injectedUniforms = true;
+    testProposal = proposal;
+    testAcceptance = acceptance;
+}
+
+vector<double> MetalApplyMonteCarloBarostatKernel::getTrialState() {
+    vector<double> result;
+    if (trialState.isInitialized())
+        trialState.download(result);
+    return result;
+}
+
+void MetalApplyMonteCarloBarostatKernel::readTrialEnergies(double& initial, double& final) {
+    initial = testInitialEnergy+cu.readEnergy(initialEnergySum);
+    final = testFinalEnergy+cu.readEnergy(finalEnergySum);
+}
+
+bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int groups, double pressure, double kT) {
+    if (!deviceRequested)
+        return false;
+    string reason;
+    if (!deviceEligible)
+        reason = "requires an isotropic FAH force set, one context and GPU PME";
+    else if (!cu.getUseDeviceBox())
+        reason = "requires OPENMM_METAL_DEVICE_BOX=1 and an eligible device box";
+    else if (typeid(context.getIntegrator()) != typeid(LangevinMiddleIntegrator))
+        reason = "requires LangevinMiddleIntegrator";
+    else if (!rigidTrial)
+        reason = "requires rigid molecule scaling";
+    else if (!cu.getNonbondedUtilities().getAtomReorder())
+        reason = "requires periodic GPU atom reordering";
+    else if (!cu.getNonbondedUtilities().hasBoundedNeighborList())
+        reason = "neighbor list requires host overflow checks";
+    if (!reason.empty()) {
+        if (!reportedFallback)
+            cerr << "OpenMM Metal: device barostat disabled: " << reason << endl;
+        reportedFallback = true;
+        return false;
+    }
+    ContextSelector selector(cu);
+    if (!proposeTrial) {
+        cu.getNonbondedUtilities().getAtomReorder()->prepareScale();
+        if (!trialState.isInitialized()) {
+            trialState.initialize(cu, 16, sizeof(double), "deviceBarostatState");
+            vector<double> initial(16, 0);
+            initial[12] = (unsigned int) trialSeed;
+            trialState.upload(initial);
+        }
+        cu.deviceBarostatState = &trialState;
+        scaleFactor.initialize(cu, 1, sizeof(double), "barostatScale");
+        map<string, string> defines;
+        defines["DEVICE_BOX_ENERGY"] = "1"; // Enable df64 in single mode as well.
+        ComputeProgram program = cu.compileProgram(MetalKernelSources::deviceBarostat, defines);
+        proposeTrial = program->createKernel("proposeBarostat");
+        decideTrial = program->createKernel("decideBarostat");
+        restoreTrial = program->createKernel("restoreBarostat");
+        for (int i = 0; i < 5; i++) proposeTrial->addArg();
+        for (int i = 0; i < 11; i++) decideTrial->addArg();
+        for (int i = 0; i < 4; i++) restoreTrial->addArg();
+    }
+    // Energy-only evaluations do not reorder atoms.  Save the complete device transaction anyway,
+    // including offsets and index, so rejection preserves bits without host observation/listeners.
+    cu.getIntegrationUtilities().ensureVirtualSiteForcesDistributed();
+    cu.getNonbondedUtilities().scatterRoleForces();
+    vector<ArrayInterface*> arrays = {&cu.getPosq(), &cu.getVelm(), &cu.getLongForceBuffer(),
+                                    &cu.getAtomIndexArray()};
+    if (cu.getUseMixedPrecision()) arrays.push_back(&cu.getPosqCorrection());
+    vector<MetalArray*> targets;
+    for (auto array : arrays) targets.push_back(&cu.unwrap(*array));
+    targets.push_back(&cu.getDeviceCellOffsets());
+    targets.push_back(&cu.getDeviceBoxState());
+    for (int i = 0; i < targets.size(); i++) {
+        if (i == trialSaved.size())
+            trialSaved.emplace_back(new MetalArray(cu, targets[i]->getSize(), targets[i]->getElementSize(), "barostatSaved"));
+        targets[i]->copyTo(*trialSaved[i]);
+    }
+    proposeTrial->setArg(0, trialState);
+    proposeTrial->setArg(1, cu.getDeviceBoxState());
+    proposeTrial->setArg(2, scaleFactor);
+    proposeTrial->setArg(3, (int) injectedUniforms);
+    proposeTrial->setArg(4, testProposal);
+    proposeTrial->execute(1, 1);
+    double initialForce, initialPlatform, finalForce, finalPlatform;
+    cu.enqueueEnergy(initialEnergySum, groups, initialForce, initialPlatform);
+    cu.scaleDeviceBox(scaleFactor);
+    cu.enqueueEnergy(finalEnergySum, groups, finalForce, finalPlatform);
+    testInitialEnergy = initialForce+initialPlatform;
+    testFinalEnergy = finalForce+finalPlatform;
+    decideTrial->setArg(0, trialState);
+    decideTrial->setArg(1, initialEnergySum);
+    decideTrial->setArg(2, finalEnergySum);
+    decideTrial->setArg(3, (int) initialEnergySum.getSize());
+    decideTrial->setArg(4, initialForce+initialPlatform);
+    decideTrial->setArg(5, finalForce+finalPlatform);
+    decideTrial->setArg(6, pressure);
+    decideTrial->setArg(7, kT);
+    decideTrial->setArg(8, (int) context.getMolecules().size());
+    decideTrial->setArg(9, (int) injectedUniforms);
+    decideTrial->setArg(10, testAcceptance);
+    decideTrial->execute(1, 1);
+    restoreTrial->setArg(0, trialState);
+    for (int i = 0; i < targets.size(); i++) {
+        int words = targets[i]->getSize()*targets[i]->getElementSize()/sizeof(unsigned int);
+        restoreTrial->setArg(1, *trialSaved[i]);
+        restoreTrial->setArg(2, *targets[i]);
+        restoreTrial->setArg(3, words);
+        restoreTrial->execute(words);
+    }
+    cu.deviceCellOffsetsChanged();
+    cu.getNonbondedUtilities().invalidateNeighborList();
+    cu.setForcesValid(false);
+    return true;
+}
+
+void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
+    if (cu.deviceBarostatState != nullptr) {
+        const int version = 0xDBA0001;
+        stream.write((const char*) &version, sizeof(version));
+    }
+    CommonUpdateStateDataKernel::createCheckpoint(context, stream);
+    if (cu.deviceBarostatState != nullptr) {
+        vector<double> state;
+        cu.deviceBarostatState->download(state);
+        stream.write((char*) state.data(), state.size()*sizeof(double));
+    }
+}
+
+void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& stream) {
+    const int deviceVersion = 0xDBA0001;
+    // The marker's first byte differs from Common's version on either byte order.
+    // Peek so ordinary checkpoints also work with non-seekable input streams.
+    if (cu.deviceBarostatState == nullptr && stream.peek() == *(const unsigned char*) &deviceVersion)
+        throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
+    if (cu.deviceBarostatState != nullptr) {
+        int version = 0;
+        stream.read((char*) &version, sizeof(version));
+        if (version != deviceVersion)
+            throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
+    }
+    CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
+    if (cu.deviceBarostatState != nullptr) {
+        vector<double> state(16);
+        stream.read((char*) state.data(), state.size()*sizeof(double));
+        if (!stream) throw OpenMMException("Missing device barostat checkpoint state (flags must match)");
+        cu.deviceBarostatState->upload(state);
+    }
 }

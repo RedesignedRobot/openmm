@@ -169,6 +169,17 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
 
 static void testDeviceScale(BoxPlatform& platform, System& system, const State* initial,
         const vector<Vec3>& positions, bool trajectory) {
+    // This phase 2a test transfers checkpoints across device-box flags.  Device
+    // barostat checkpoints require matching eligibility and have their own test.
+    struct BarostatSetting {
+        bool present = getenv("OPENMM_METAL_DEVICE_BAROSTAT") != nullptr;
+        string value = present ? getenv("OPENMM_METAL_DEVICE_BAROSTAT") : "";
+        BarostatSetting() { setenv("OPENMM_METAL_DEVICE_BAROSTAT", "0", 1); }
+        ~BarostatSetting() {
+            if (present) setenv("OPENMM_METAL_DEVICE_BAROSTAT", value.c_str(), 1);
+            else unsetenv("OPENMM_METAL_DEVICE_BAROSTAT");
+        }
+    } barostatSetting;
     setDeviceBox(true);
     LangevinMiddleIntegrator integrator(300, 1, 0.001);
     integrator.setRandomNumberSeed(2026);
