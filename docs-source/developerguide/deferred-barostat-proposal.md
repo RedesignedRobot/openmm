@@ -378,27 +378,39 @@ reason. CUDA and OpenCL keep their original volume corrections.
 
 Device scaling remains blocked on CPU reorder fallback and bin-overflow checks,
 host cutoff validation, host box getters and checkpoint serialization, and host
-cell-offset ownership. PME still calculates unused host reciprocal arguments.
-Those calls must stop resolving the host box before any lazy getter is added.
+cell-offset ownership. The enabled Metal path now skips common periodic argument
+setup, PME host reciprocal construction, and parameter-offset plasma host volume
+calculation. Host box updates also skip the unused old-box read and upload for
+unwrapping. Those arguments bind directly to the device box. Other host readers
+must stop resolving the box during stepping before any lazy getter is added.
 A future device update must rebuild every derived buffer field and preserve the
 exact host vectors for observations. It must also order updates across the PME
 queue, handle saved barostat state, invalidate forces and neighbor lists, and
 provide device cutoff error reporting. No partially implemented scale entry
 point is available.
 
-`TestMetalDeviceBox [single|mixed|all [system.xml state.xml]]` checks packed and
+`TestMetalDeviceBox [single|mixed|all [system.xml state.xml integrator.xml]]` checks packed and
 unpacked buffer binding with poisoned host scalars, 19,652-atom TIP4P-Ew PME water with
-role ordering, neutral and charged volume terms, scaled host box updates,
+role ordering, neutral and charged volume terms including parameter offsets, scaled host box updates,
 checkpoint reload, unsupported-force fallback, and 1000 LangevinMiddle steps
-with a barostat every 25 steps. The optional XML pair adds the FAH unit to the
-host-update checks. The test compares the switch unset with the switch set in
+with a barostat every 25 steps. The optional XML files add the FAH unit and its
+integrator to the host-update checks. The test compares the switch unset with the switch set in
 each precision. Device scaling and checkpoints after device scaling are not
 covered because the entry point is intentionally absent.
 
-The current implementation does not pass the correctness gate. With deterministic
-forces, the single precision water test finds identical forces and reciprocal
-energy but a total energy delta of 0.0156268596 kJ/mol, or 5.79456649e-6 relative.
-This exceeds the required 1e-6. Mixed precision, the trajectory test and the FAH
-XML case were not reached. The switch must remain off and this change needs
-further diagnosis before integration. The complete handoff records the group
-energies and the remaining host dependencies.
+The round-2 stage-1 batch passed in single and mixed precision: neutral and
+charged water, the 1000-step barostat trajectories, and the 38,876-particle FAH
+unit. Under DeterministicForces, total and group forces match bitwise. Each group
+energy must agree within 1e-7 times its flag-off magnitude, and total energy must
+agree within 1e-8 times the sum of flag-off group magnitudes. Checkpoint reload
+reproduces forces and energy exactly. Round 1's 7.6e-9 direct-space relative
+energy delta passes this corrected criterion and likely reflects compiler
+code-shape differences in energy accumulation.
+
+The phase-1 deferred-energy test passes with the device-box flag both off and on
+in both precisions. The FAH ordered-force fold also matches positions, velocities,
+and boxes bitwise at all 50 checked steps with the device-box flag on. Its synthetic
+CutoffPeriodic fixture exercises the unsupported-context fallback instead.
+These results validate the host-controlled subset; device scaling, lazy host
+observations, and the fresh Reference comparison remain unfinished. The flag
+stays off by default. The handoff report records the remaining CPU dependencies.

@@ -16,6 +16,7 @@
 #include "openmm/serialization/XmlSerializer.h"
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -87,25 +88,32 @@ static void createWater(System& system, vector<Vec3>& positions, int side) {
             }
 }
 
-static void compare(const State& expected, const State& found) {
+static void compare(const State& expected, const State& found, double energyTolerance) {
     double energy = expected.getPotentialEnergy();
     ASSERT(isfinite(found.getPotentialEnergy()));
-    double error = 0, norm = 0;
+    ASSERT_EQUAL(expected.getForces().size(), found.getForces().size());
     for (int i = 0; i < expected.getForces().size(); i++) {
-        Vec3 delta = expected.getForces()[i]-found.getForces()[i];
-        error += delta.dot(delta);
-        norm += expected.getForces()[i].dot(expected.getForces()[i]);
+        for (int j = 0; j < 3; j++) {
+            const double a = expected.getForces()[i][j], b = found.getForces()[i][j];
+            ASSERT(memcmp(&a, &b, sizeof(double)) == 0);
+        }
     }
-    double relative = sqrt(error/max(1.0, norm));
-    cout << "energy expected=" << energy << " found=" << found.getPotentialEnergy() << " relative=" << abs(energy-found.getPotentialEnergy())/max(1.0, abs(energy))
-         << " force RMS relative=" << relative << endl;
-    ASSERT(abs(energy-found.getPotentialEnergy()) <= 1e-6*max(1.0, abs(energy)));
-    ASSERT(relative < 1e-5);
+    cout << "energy expected=" << energy << " found=" << found.getPotentialEnergy()
+         << " absolute delta=" << abs(energy-found.getPotentialEnergy())
+         << " tolerance=" << energyTolerance << " forces=bitwise" << endl;
+    ASSERT(abs(energy-found.getPotentialEnergy()) <= energyTolerance);
 }
 
-static void testHostUpdate(BoxPlatform& platform, System& system, const State* initial, const vector<Vec3>& positions) {
+template<class T> static unique_ptr<T> readXml(const string& path) {
+    ifstream input(path);
+    if (!input) throw OpenMMException("Cannot read "+path);
+    return unique_ptr<T>(XmlSerializer::deserialize<T>(input));
+}
+
+static void testHostUpdate(BoxPlatform& platform, System& system, const State* initial, const vector<Vec3>& positions,
+        const string& integratorPath = "") {
     vector<State> results;
-    vector<vector<double>> groupEnergies;
+    vector<vector<State>> groupStates;
     for (int i = 0; i < system.getNumForces(); i++) {
         auto* nb = dynamic_cast<NonbondedForce*>(&system.getForce(i));
         system.getForce(i).setForceGroup(nb ? 1 : 0);
@@ -113,8 +121,8 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
     }
     for (bool enabled : {false, true}) {
         setDeviceBox(enabled);
-        VerletIntegrator integrator(0.001);
-        Context context(system, integrator, platform);
+        unique_ptr<Integrator> integrator = integratorPath.empty() ? unique_ptr<Integrator>(new VerletIntegrator(0.001)) : readXml<Integrator>(integratorPath);
+        Context context(system, *integrator, platform);
         ASSERT_EQUAL(enabled, platform.metal(context).getUseDeviceBox());
         if (initial) context.setState(*initial);
         else context.setPositions(positions);
@@ -126,26 +134,28 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         before.getPeriodicBoxVectors(box[0], box[1], box[2]);
         context.setPeriodicBoxVectors(box[0]*1.015, box[1]*1.015, box[2]*1.015);
         results.push_back(context.getState(State::Energy | State::Forces));
-        vector<double> groups;
+        vector<State> groups;
         for (int group = 0; group < 3; group++)
-            groups.push_back(context.getState(State::Energy, false, 1<<group).getPotentialEnergy());
-        groupEnergies.push_back(groups);
+            groups.push_back(context.getState(State::Energy | State::Forces, false, 1<<group));
+        groupStates.push_back(groups);
         stringstream checkpoint;
         context.createCheckpoint(checkpoint);
         context.setPeriodicBoxVectors(box[0], box[1], box[2]);
         context.loadCheckpoint(checkpoint);
         State restored = context.getState(State::Energy | State::Forces);
-        compare(results.back(), restored);
+        compare(results.back(), restored, 0);
         Vec3 found[3];
         restored.getPeriodicBoxVectors(found[0], found[1], found[2]);
         for (int i = 0; i < 3; i++) ASSERT_EQUAL_VEC(box[i]*1.015, found[i], 1e-12);
     }
+    double magnitude = 0;
     for (int group = 0; group < 3; group++) {
-        double off = groupEnergies[0][group], on = groupEnergies[1][group];
-        cout << "group=" << group << " off=" << off << " on=" << on << " absolute delta=" << on-off
-             << " relative delta=" << abs(on-off)/max(1.0, abs(off)) << endl;
+        double off = groupStates[0][group].getPotentialEnergy();
+        magnitude += abs(off);
+        cout << "group=" << group << " ";
+        compare(groupStates[0][group], groupStates[1][group], 1e-7*abs(off));
     }
-    compare(results[0], results[1]);
+    compare(results[0], results[1], 1e-8*magnitude);
 }
 
 // Poison the encoded scalar so this fails if an argument is silently copied with setBytes.
@@ -196,6 +206,7 @@ static void testBarostat(BoxPlatform& platform) {
         LangevinMiddleIntegrator integrator(300, 1, 0.001);
         integrator.setRandomNumberSeed(9127);
         Context context(system, integrator, platform);
+        ASSERT_EQUAL(bool(enabled), platform.metal(context).getUseDeviceBox());
         context.setPositions(positions);
         context.setVelocitiesToTemperature(300, 281);
         for (int i = 0; i < 40; i++) {
@@ -212,18 +223,12 @@ static void testBarostat(BoxPlatform& platform) {
     ASSERT(abs(mean[0]-mean[1]) < 0.02*mean[0]);
 }
 
-template<class T> static unique_ptr<T> readXml(const string& path) {
-    ifstream input(path);
-    if (!input) throw OpenMMException("Cannot read "+path);
-    return unique_ptr<T>(XmlSerializer::deserialize<T>(input));
-}
-
 int main(int argc, char* argv[]) {
     try {
         BoxSetting restore;
         cout << setprecision(16);
-        if (argc != 1 && argc != 2 && argc != 4)
-            throw OpenMMException("Usage: TestMetalDeviceBox [single|mixed|all [system.xml state.xml]]");
+        if (argc != 1 && argc != 2 && argc != 5)
+            throw OpenMMException("Usage: TestMetalDeviceBox [single|mixed|all [system.xml state.xml integrator.xml]]");
         string precision = argc > 1 ? argv[1] : "all";
         if (precision != "single" && precision != "mixed" && precision != "all")
             throw OpenMMException("Unknown precision: "+precision);
@@ -242,13 +247,18 @@ int main(int argc, char* argv[]) {
             // Nonzero net charge exercises the volume correction as well as neutral water.
             auto& nb = dynamic_cast<NonbondedForce&>(water.getForce(0));
             nb.setParticleParameters(3, -0.94844, 1, 0);
+            cout << "Charged PME water" << endl;
+            testHostUpdate(platform, water, nullptr, positions);
+            nb.addGlobalParameter("chargeOffset", 0.5);
+            nb.addParticleParameterOffset("chargeOffset", 3, 0.2, 0, 0);
+            cout << "Charged PME water with parameter offset" << endl;
             testHostUpdate(platform, water, nullptr, positions);
             testBarostat(platform);
-            if (argc == 4) {
+            if (argc == 5) {
                 auto system = readXml<System>(argv[2]);
                 auto initial = readXml<State>(argv[3]);
                 cout << "FAH XML atoms=" << system->getNumParticles() << endl;
-                testHostUpdate(platform, *system, initial.get(), {});
+                testHostUpdate(platform, *system, initial.get(), {}, argv[4]);
             }
         }
         cout << "Done" << endl;

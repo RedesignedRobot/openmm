@@ -343,19 +343,22 @@ void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, con
     if (wrapped) {
         // Unwrap with the current box, then zero the offsets, so the common kernel below only sets the box.
         ContextSelector selector(cu);
-        Vec3 box[3];
-        cu.getPeriodicBoxVectors(box[0], box[1], box[2]);
-        if (cu.getUseMixedPrecision()) {
-            vector<mm_double4> vectors;
-            for (const Vec3& v : box)
-                vectors.push_back(mm_double4(v[0], v[1], v[2], 0));
-            boxVectors.upload(vectors);
-        }
-        else {
-            vector<mm_float4> vectors;
-            for (const Vec3& v : box)
-                vectors.push_back(mm_float4((float) v[0], (float) v[1], (float) v[2], 0));
-            boxVectors.upload(vectors);
+        // The enabled unwrap kernel reads the old box directly from the device buffer.
+        if (!cu.getUseDeviceBox()) {
+            Vec3 box[3];
+            cu.getPeriodicBoxVectors(box[0], box[1], box[2]);
+            if (cu.getUseMixedPrecision()) {
+                vector<mm_double4> vectors;
+                for (const Vec3& v : box)
+                    vectors.push_back(mm_double4(v[0], v[1], v[2], 0));
+                boxVectors.upload(vectors);
+            }
+            else {
+                vector<mm_float4> vectors;
+                for (const Vec3& v : box)
+                    vectors.push_back(mm_float4((float) v[0], (float) v[1], (float) v[2], 0));
+                boxVectors.upload(vectors);
+            }
         }
         cellOffsets.upload(offsets);
         unwrapKernel->execute(cu.getNumAtoms());
