@@ -902,20 +902,41 @@ int MetalContext::computeThreadBlockSize(double memory) const {
 }
 
 double MetalContext::reduceEnergy() {
+    MetalArray& result = (deferredEnergy == nullptr ? unwrap(energySum) : *deferredEnergy);
     int workGroupSize = getMaxThreadBlockSize();
     reduceEnergyKernel->setArg(0, energyBuffer);
-    reduceEnergyKernel->setArg(1, energySum);
+    reduceEnergyKernel->setArg(1, result);
     reduceEnergyKernel->setArg(2, energyBuffer.getSize());
     reduceEnergyKernel->setArg(3, workGroupSize);
-    reduceEnergyKernel->execute(workGroupSize*energySum.getSize(), workGroupSize);
-    energySum.download(pinnedBuffer);
+    reduceEnergyKernel->execute(workGroupSize*result.getSize(), workGroupSize);
+    return deferredEnergy == nullptr ? readEnergy(result) : 0.0;
+}
+
+void MetalContext::enqueueEnergy(MetalArray& result, int groups, double& forceEnergy, double& platformEnergy) {
+    if (deferredEnergy != nullptr)
+        throw OpenMMException("Nested deferred energy evaluation");
+    if (!result.isInitialized())
+        result.initialize(*this, energySum.getSize(), energySum.getElementSize(), "barostatEnergy");
+    deferredEnergy = &result;
+    try {
+        platformEnergy = getContextImpl()->calcForcesAndEnergy(false, true, groups, forceEnergy);
+    }
+    catch (...) {
+        deferredEnergy = nullptr;
+        throw;
+    }
+    deferredEnergy = nullptr;
+}
+
+double MetalContext::readEnergy(MetalArray& buffer) {
+    buffer.download(pinnedBuffer);
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
-        for (int i = 0; i < energySum.getSize(); i++)
+        for (int i = 0; i < buffer.getSize(); i++)
             result += ((double*) pinnedBuffer)[i];
     }
     else {
-        for (int i = 0; i < energySum.getSize(); i++)
+        for (int i = 0; i < buffer.getSize(); i++)
             result += ((float*) pinnedBuffer)[i];
     }
     return result;

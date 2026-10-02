@@ -46,6 +46,7 @@
 #include "lepton/ParsedExpression.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -447,4 +448,38 @@ double MetalCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeFo
     ownedBornSumKernel->execute(pairThreads, PAIR_GROUP_SIZE);
     ownedForce1Kernel->execute(pairThreads, PAIR_GROUP_SIZE);
     return 0.0;
+}
+
+void MetalApplyMonteCarloBarostatKernel::initialize(const System& system, const Force& barostat, int components, bool rigidMolecules) {
+    CommonApplyMonteCarloBarostatKernel::initialize(system, barostat, components, rigidMolecules);
+    const char* setting = getenv("OPENMM_METAL_DEFER_BAROSTAT_ENERGIES");
+    deferEnergies = (setting == nullptr || string(setting) != "0") &&
+            typeid(barostat) == typeid(MonteCarloBarostat) && cu.getNumContexts() == 1 && !cu.getPlatformData().useCpuPme;
+    // These forces have no nested Context evaluation or host callback.  Other systems retain getState().
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const type_info& type = typeid(system.getForce(i));
+        if (type != typeid(HarmonicBondForce) && type != typeid(HarmonicAngleForce) &&
+                type != typeid(PeriodicTorsionForce) && type != typeid(NonbondedForce) &&
+                type != typeid(CMMotionRemover) && type != typeid(MonteCarloBarostat))
+            deferEnergies = false;
+    }
+}
+
+bool MetalApplyMonteCarloBarostatKernel::computeTrialEnergies(ContextImpl& context, int groups,
+        const function<void()>& propose, double& initialEnergy, double& finalEnergy) {
+    // LangevinMiddle's kinetic energy is an unshifted, read-only reduction.  Omitting its unused
+    // getState() result cannot change coordinates, forces, velocities, or random number consumption.
+    // Custom and force-shifted integrators retain the complete synchronous getState() path.
+    if (!deferEnergies || typeid(context.getIntegrator()) != typeid(LangevinMiddleIntegrator))
+        return false;
+    ContextSelector selector(cu);
+    double initialForce, initialPlatform, finalForce, finalPlatform;
+    cu.enqueueEnergy(initialEnergySum, groups, initialForce, initialPlatform);
+    propose();
+    cu.enqueueEnergy(finalEnergySum, groups, finalForce, finalPlatform);
+    // The first download waits for both reductions.  Keep finishComputation's addition inside
+    // ContextImpl's addition: hostForce + (hostPlatform + deviceReduction), never reassociate it.
+    initialEnergy = initialForce+(initialPlatform+cu.readEnergy(initialEnergySum));
+    finalEnergy = finalForce+(finalPlatform+cu.readEnergy(finalEnergySum));
+    return true;
 }

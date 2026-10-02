@@ -335,6 +335,10 @@ public:
      * Sum the buffer containing energy.
      */
     double reduceEnergy();
+    /** Queue an energy evaluation into a private reduction buffer, retaining the two host sums. */
+    void enqueueEnergy(MetalArray& result, int groups, double& forceEnergy, double& platformEnergy);
+    /** Read a completed reduction in the same order as reduceEnergy(). */
+    double readEnergy(MetalArray& result);
     /**
      * Get the maximum number of threads in a thread block supported by this device.
      */
@@ -557,6 +561,7 @@ public:
      */
     void executeAfterForcePass();
 private:
+    MetalArray* deferredEnergy = nullptr;
     friend class MetalSort;
     void releaseResources();
     void releaseModule(metalModule_t module);

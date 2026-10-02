@@ -300,6 +300,12 @@ void ContextImpl::computeVirtualSites() {
 }
 
 double ContextImpl::calcForcesAndEnergy(bool includeForces, bool includeEnergy, int groups) {
+    double forceEnergy;
+    double platformEnergy = calcForcesAndEnergy(includeForces, includeEnergy, groups, forceEnergy);
+    return forceEnergy+platformEnergy;
+}
+
+double ContextImpl::calcForcesAndEnergy(bool includeForces, bool includeEnergy, int groups, double& forceEnergy) {
     if (!hasSetPositions)
         throw OpenMMException("Particle positions have not been set");
     lastForceGroups = groups;
@@ -310,9 +316,11 @@ double ContextImpl::calcForcesAndEnergy(bool includeForces, bool includeEnergy, 
         for (auto force : forceImpls)
             energy += force->calcForcesAndEnergy(*this, includeForces, includeEnergy, groups);
         bool valid = true;
-        energy += kernel.finishComputation(*this, includeForces, includeEnergy, groups, valid);
-        if (valid)
-            return energy;
+        double platformEnergy = kernel.finishComputation(*this, includeForces, includeEnergy, groups, valid);
+        if (valid) {
+            forceEnergy = energy;
+            return platformEnergy;
+        }
     }
 }
 
