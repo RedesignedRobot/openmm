@@ -960,6 +960,8 @@ void MetalContext::clearAutoclearBuffersIfNeeded() {
     autoclearWorkCount = -1;
     if (!cleared)
         clearAutoclearBuffers();
+}
+
 void MetalContext::executeAfterForcePass() {
     for (auto& work : afterForcePass)
         work();
