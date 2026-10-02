@@ -146,6 +146,7 @@ private:
     ComputeArray pmeDispersionBsplineModuliY;
     ComputeArray pmeDispersionBsplineModuliZ;
     ComputeArray pmeAtomGridIndex;
+    ComputeArray pmeOwnerHeads, pmeOwnerAtoms, pmeOwnerSplines;
     ComputeArray pmeForces;
     ComputeArray chargeBuffer;
     ComputeSort sort;
@@ -159,6 +160,7 @@ private:
     ComputeKernel ewaldSumsKernel, ewaldForcesKernel;
     ComputeKernel pmeGridIndexKernel, pmeDispersionGridIndexKernel;
     ComputeKernel pmeSpreadChargeKernel, pmeDispersionSpreadChargeKernel;
+    ComputeKernel pmeOwnerBinKernel, pmeOwnerGatherKernel;
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
     ComputeKernel pmeEvalEnergyKernel, pmeDispersionEvalEnergyKernel;
@@ -176,6 +178,7 @@ private:
     int stepsToSort;
     bool usePmeQueue, reciprocalOnQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
+    bool usePmeOwnerSpread;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;
 };

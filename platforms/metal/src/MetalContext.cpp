@@ -824,7 +824,10 @@ int MetalContext::findLegalFFTDimension(int minimum) {
 }
 
 ComputeProgram MetalContext::compileProgram(const std::string source, const std::map<std::string, std::string>& defines) {
-    metalModule_t module = createModule(MetalKernelSources::vectorOps+source, defines);
+    string kernels = MetalKernelSources::vectorOps+source;
+    if (defines.count("PME_OWNER_SPREAD"))
+        kernels += MetalKernelSources::pmeOwner;
+    metalModule_t module = createModule(kernels, defines);
     return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, module));
 }
 
