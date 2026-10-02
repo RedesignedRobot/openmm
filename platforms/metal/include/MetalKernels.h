@@ -270,10 +270,13 @@ public:
             CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
     }
     ~MetalApplyMonteCarloBarostatKernel() {
+        if (cu.deviceBarostatKernel == this) cu.deviceBarostatKernel = nullptr;
         if (cu.deviceBarostatState == &trialState) cu.deviceBarostatState = nullptr;
     }
     void initialize(const System& system, const Force& barostat, int components, bool rigidMolecules=true);
     void saveCoordinates(ContextImpl& context) override;
+    /** Refresh eligibility and register checkpoint storage only for device trials. */
+    bool prepareDeviceBarostat();
     bool executeTrial(ContextImpl& context, int groups, double pressure, double kT) override;
     bool getTrialUniforms(double& proposal, double& acceptance) override;
     void setTrialUniforms(double proposal, double acceptance);

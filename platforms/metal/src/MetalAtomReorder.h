@@ -39,6 +39,7 @@ public:
     void hostChanged();
     MetalArray& getCellOffsets();
     void deviceOffsetsChanged();
+    bool hasUsableTables();
     void prepareScale();
     void scaleCoordinates(MetalArray& scaleFactor);
 private:

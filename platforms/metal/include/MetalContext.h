@@ -53,6 +53,8 @@ typedef unsigned int tileflags;
 
 namespace OpenMM {
 
+class MetalApplyMonteCarloBarostatKernel;
+
 typedef mm_int2 int2;
 typedef mm_float4 float4;
 typedef mm_double4 double4;
@@ -399,7 +401,13 @@ public:
     }
     bool getUseDeviceBox() const { return useDeviceBox; }
     MetalArray& getDeviceBoxState() { return deviceBox; }
-    // Registered by the eligible isotropic barostat; resolved only by its getters/checkpoint.
+    /**
+     * Replace the device box with bytes saved from getDeviceBoxState().  Checkpoints use this because the
+     * host cannot reproduce the derived fields that device df64 scaling wrote.
+     */
+    void restoreDeviceBox(const unsigned char* bytes);
+    // Eligibility is refreshed by the barostat before trials and checkpoint operations.
+    MetalApplyMonteCarloBarostatKernel* deviceBarostatKernel = nullptr;
     MetalArray* deviceBarostatState = nullptr;
     /** Add a coefficient divided by the current device volume to the energy buffer. */
     void addDeviceBoxEnergy(double coefficient);
@@ -603,6 +611,7 @@ private:
         invPeriodicBoxSizeFloat = make_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f);
     }
     void uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c);
+    void uploadDeviceBoxBytes(const unsigned char* bytes);
     struct KernelArguments {
         std::vector<int> sizes, offsets, boxOffsets;
         std::vector<BufferLayout> layouts;

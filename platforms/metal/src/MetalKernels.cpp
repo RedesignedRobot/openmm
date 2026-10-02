@@ -498,18 +498,8 @@ void MetalApplyMonteCarloBarostatKernel::initialize(const System& system, const 
             deferEnergies = false;
     }
     deviceEligible = deferEnergies;
-    // Register checkpoint storage at construction, including before the first trial.
-    if (deviceRequested && deviceEligible && rigidTrial && cu.getUseDeviceBox() &&
-            typeid(cu.getContextImpl()->getIntegrator()) == typeid(LangevinMiddleIntegrator)) {
-        trialState.initialize(cu, 16, sizeof(double), "deviceBarostatState");
-        vector<double> initial(16, 0);
-        Vec3 box[3];
-        system.getDefaultPeriodicBoxVectors(box[0], box[1], box[2]);
-        initial[0] = 0.01*box[0][0]*box[1][1]*box[2][2];
-        initial[12] = (unsigned int) trialSeed;
-        trialState.upload(initial);
-        cu.deviceBarostatState = &trialState;
-    }
+    // Neighbor list allocation and molecule tables are not ready until context initialization finishes.
+    cu.deviceBarostatKernel = this;
     deferEnergies = deferEnergies && (setting == nullptr || string(setting) != "0");
 }
 
@@ -560,7 +550,8 @@ void MetalApplyMonteCarloBarostatKernel::readTrialEnergies(double& initial, doub
     final = testFinalEnergy+cu.readEnergy(finalEnergySum);
 }
 
-bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int groups, double pressure, double kT) {
+bool MetalApplyMonteCarloBarostatKernel::prepareDeviceBarostat() {
+    cu.deviceBarostatState = nullptr;
     if (!deviceRequested)
         return false;
     string reason;
@@ -568,7 +559,7 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
         reason = "requires an isotropic FAH force set, one context and GPU PME";
     else if (!cu.getUseDeviceBox())
         reason = "requires OPENMM_METAL_DEVICE_BOX=1 and an eligible device box";
-    else if (typeid(context.getIntegrator()) != typeid(LangevinMiddleIntegrator))
+    else if (typeid(cu.getContextImpl()->getIntegrator()) != typeid(LangevinMiddleIntegrator))
         reason = "requires LangevinMiddleIntegrator";
     else if (!rigidTrial)
         reason = "requires rigid molecule scaling";
@@ -576,6 +567,8 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
         reason = "requires periodic GPU atom reordering";
     else if (!cu.getNonbondedUtilities().hasBoundedNeighborList())
         reason = "neighbor list requires host overflow checks";
+    else if (!cu.getNonbondedUtilities().getAtomReorder()->hasUsableTables())
+        reason = "reorder tables do not support this molecule layout";
     if (!reason.empty()) {
         if (!reportedFallback)
             cerr << "OpenMM Metal: device barostat disabled: " << reason << endl;
@@ -583,15 +576,24 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
         return false;
     }
     ContextSelector selector(cu);
+    if (!trialState.isInitialized()) {
+        trialState.initialize(cu, 16, sizeof(double), "deviceBarostatState");
+        vector<double> initial(16, 0);
+        Vec3 box[3];
+        cu.getContextImpl()->getSystem().getDefaultPeriodicBoxVectors(box[0], box[1], box[2]);
+        initial[0] = 0.01*box[0][0]*box[1][1]*box[2][2];
+        initial[12] = (unsigned int) trialSeed;
+        trialState.upload(initial);
+    }
+    cu.deviceBarostatState = &trialState;
+    return true;
+}
+
+bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int groups, double pressure, double kT) {
+    if (!prepareDeviceBarostat())
+        return false;
+    ContextSelector selector(cu);
     if (!proposeTrial) {
-        cu.getNonbondedUtilities().getAtomReorder()->prepareScale();
-        if (!trialState.isInitialized()) {
-            trialState.initialize(cu, 16, sizeof(double), "deviceBarostatState");
-            vector<double> initial(16, 0);
-            initial[12] = (unsigned int) trialSeed;
-            trialState.upload(initial);
-        }
-        cu.deviceBarostatState = &trialState;
         scaleFactor.initialize(cu, 1, sizeof(double), "barostatScale");
         map<string, string> defines;
         defines["DEVICE_BOX_ENERGY"] = "1"; // Enable df64 in single mode as well.
@@ -658,6 +660,8 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
 }
 
 void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
+    if (cu.deviceBarostatKernel != nullptr)
+        cu.deviceBarostatKernel->prepareDeviceBarostat();
     if (cu.deviceBarostatState != nullptr) {
         const int version = 0xDBA0001;
         stream.write((const char*) &version, sizeof(version));
@@ -667,10 +671,17 @@ void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream&
         vector<double> state;
         cu.deviceBarostatState->download(state);
         stream.write((char*) state.data(), state.size()*sizeof(double));
+        // Save the raw device box: its derived fields come from device df64 scaling, which
+        // setPeriodicBoxVectors() cannot reproduce, so continuation would not be bitwise.
+        vector<unsigned char> box(cu.getDeviceBoxState().getSize());
+        cu.getDeviceBoxState().download(box.data());
+        stream.write((char*) box.data(), box.size());
     }
 }
 
 void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& stream) {
+    if (cu.deviceBarostatKernel != nullptr)
+        cu.deviceBarostatKernel->prepareDeviceBarostat();
     const int deviceVersion = 0xDBA0001;
     // The marker's first byte differs from Common's version on either byte order.
     // Peek so ordinary checkpoints also work with non-seekable input streams.
@@ -686,7 +697,10 @@ void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& s
     if (cu.deviceBarostatState != nullptr) {
         vector<double> state(16);
         stream.read((char*) state.data(), state.size()*sizeof(double));
+        vector<unsigned char> box(cu.getDeviceBoxState().getSize());
+        stream.read((char*) box.data(), box.size());
         if (!stream) throw OpenMMException("Missing device barostat checkpoint state (flags must match)");
         cu.deviceBarostatState->upload(state);
+        cu.restoreDeviceBox(box.data());
     }
 }

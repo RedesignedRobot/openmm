@@ -202,8 +202,22 @@ static void parity(TrialPlatform& p) {
     ASSERT(maxReductionError < 1e-3);
 }
 static void fallbacks(TrialPlatform& p) {
-    for (bool rigid : {false, true}) {
-        System system; vector<Vec3> positions; createWater(system,positions,7);
+    for (int mode=0; mode<3; mode++) {
+        bool rigid=mode!=0;
+        System system; vector<Vec3> positions;
+        if (mode==2) {
+            system.setDefaultPeriodicBoxVectors(Vec3(9,0,0),Vec3(0,9,0),Vec3(0,0,9));
+            auto* force=new NonbondedForce();
+            force->setNonbondedMethod(NonbondedForce::PME);
+            force->setCutoffDistance(0.9);
+            system.addForce(force);
+            for (int i=0; i<4097; i++) {
+                system.addParticle(1);
+                force->addParticle(0,0.2+1e-5*i,0.1);
+                positions.push_back(Vec3(0.5*(i%17),0.5*((i/17)%17),0.5*(i/289)));
+            }
+        } else
+            createWater(system,positions,7);
         auto& barostat=addBarostat(system,1,741);
         barostat.setScaleMoleculesAsRigid(rigid);
         deviceMode(true);
@@ -211,8 +225,12 @@ static void fallbacks(TrialPlatform& p) {
         LangevinMiddleIntegrator integrator(300,1,0.001);
         Context c(system,integrator,p); auto* kernel=p.last;
         auto& nb=p.metal(c).getNonbondedUtilities();
-        if (rigid) nb.forceCountWaitForTesting();
+        if (mode==1) nb.forceCountWaitForTesting();
         c.setPositions(positions); c.computeVirtualSites();
+        if (mode==2) {
+            ASSERT_EQUAL(4097,p.metal(c).getMoleculeGroups().size());
+            ASSERT(nb.hasBoundedNeighborList());
+        }
         stringstream messages;
         struct Capture {
             streambuf* previous;
@@ -228,7 +246,8 @@ static void fallbacks(TrialPlatform& p) {
                 ASSERT(isfinite(kernel->testInitialEnergy)); // Phase 1 supplied both energies.
             }
         }
-        string reason=rigid ? "neighbor list requires host overflow checks" : "requires rigid molecule scaling";
+        string reason=mode==0 ? "requires rigid molecule scaling" : mode==1 ?
+                "neighbor list requires host overflow checks" : "reorder tables do not support this molecule layout";
         size_t first=messages.str().find(reason);
         ASSERT(first!=string::npos);
         ASSERT(messages.str().find(reason,first+reason.size())==string::npos);
@@ -256,6 +275,53 @@ static void fallbacks(TrialPlatform& p) {
         ASSERT(clearException);
     }
     cout << "checkpoint flag mismatch: clear exception in both directions" << endl;
+}
+static void checkpointEligibility(TrialPlatform& p) {
+    System system; vector<Vec3> positions; createWater(system,positions,7);
+    addBarostat(system,1,741);
+    deviceMode(true);
+    LangevinMiddleIntegrator si(300,1,0.001), ti(300,1,0.001), ri(300,1,0.001);
+    Context source(system,si,p); auto* sk=p.last;
+    source.setPositions(positions); source.computeVirtualSites();
+    for (int trial=0; trial<12; trial++) p.impl(source).updateContextState();
+    stringstream checkpoint;
+    source.createCheckpoint(checkpoint);
+    Context target(system,ti,p);
+    target.setPositions(positions);
+    // Register storage before forcing fallback, so load must refresh the previous eligibility.
+    stringstream beforeFallback;
+    target.createCheckpoint(beforeFallback);
+    p.metal(target).getNonbondedUtilities().forceCountWaitForTesting();
+    bool clearException=false;
+    try { target.loadCheckpoint(checkpoint); }
+    catch (const OpenMMException& e) {
+        clearException=string(e.what()).find("OPENMM_METAL_DEVICE_BAROSTAT")!=string::npos;
+    }
+    ASSERT(clearException);
+    checkpoint.clear(); checkpoint.seekg(0);
+    Context restored(system,ri,p); auto* rk=p.last;
+    restored.loadCheckpoint(checkpoint);
+    ASSERT(sk->getTrialState()==rk->getTrialState());
+    for (int trial=0; trial<3; trial++) {
+        p.impl(source).updateContextState();
+        p.impl(restored).updateContextState();
+        ASSERT(sk->getTrialState()==rk->getTrialState());
+        sameState(source.getState(State::Positions|State::Velocities|State::Forces),
+                  restored.getState(State::Positions|State::Velocities|State::Forces));
+    }
+    // A context that switches to phase 1 must also write the phase 1 checkpoint format.
+    p.metal(source).getNonbondedUtilities().forceCountWaitForTesting();
+    stringstream fallbackCheckpoint;
+    source.createCheckpoint(fallbackCheckpoint);
+    clearException=false;
+    try { restored.loadCheckpoint(fallbackCheckpoint); }
+    catch (const OpenMMException& e) {
+        clearException=string(e.what()).find("OPENMM_METAL_DEVICE_BAROSTAT")!=string::npos;
+    }
+    ASSERT(clearException);
+    fallbackCheckpoint.clear(); fallbackCheckpoint.seekg(0);
+    target.loadCheckpoint(fallbackCheckpoint);
+    cout << "checkpoint eligibility: rejects both mode mismatches; eligible continuation bitwise; phase 1 loads" << endl;
 }
 static void noWait(TrialPlatform& p) {
     System system; vector<Vec3> positions; createWater(system,positions,7);
@@ -397,6 +463,7 @@ int main(int argc, char* argv[]) {
                 try { parity(platform); } catch (const exception& e) { cerr << "parity: " << e.what() << endl; failures++; }
                 try { noWait(platform); } catch (const exception& e) { cerr << "no-wait: " << e.what() << endl; failures++; }
                 try { fallbacks(platform); } catch (const exception& e) { cerr << "fallbacks: " << e.what() << endl; failures++; }
+                try { checkpointEligibility(platform); } catch (const exception& e) { cerr << "checkpoint eligibility: " << e.what() << endl; failures++; }
                 if (argc==5) {
                     try { fahEligibility(platform,argv[2],argv[3],argv[4]); }
                     catch (const exception& e) { cerr << "FAH eligibility: " << e.what() << endl; failures++; }

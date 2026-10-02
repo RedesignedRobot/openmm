@@ -147,10 +147,14 @@ void MetalAtomReorder::checkForNaN() {
         throw OpenMMException("Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan");
 }
 
-bool MetalAtomReorder::apply() {
+bool MetalAtomReorder::hasUsableTables() {
     if (tablesVersion != context.getMoleculeGroupsVersion())
         buildTables();
-    if (!tablesUsable)
+    return tablesUsable;
+}
+
+bool MetalAtomReorder::apply() {
+    if (!hasUsableTables())
         return false;
     checkForNaN();
 
@@ -298,9 +302,7 @@ void MetalAtomReorder::deviceOffsetsChanged() {
 }
 
 void MetalAtomReorder::prepareScale() {
-    if (tablesVersion != context.getMoleculeGroupsVersion())
-        buildTables();
-    if (!tablesUsable)
+    if (!hasUsableTables())
         throw OpenMMException("Device box scaling does not support this molecule layout");
 }
 

@@ -597,13 +597,23 @@ void MetalContext::uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c) 
     put(176, make_float4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0));
     put(204, (float) (a[0]*b[1]*c[2]));
     put(304, a[0]*b[1]*c[2]);
-    auto staging = NS::TransferPtr(device->newBuffer(bytes, sizeof(bytes), MTL::ResourceStorageModeShared));
+    uploadDeviceBoxBytes(bytes);
+}
+
+void MetalContext::restoreDeviceBox(const unsigned char* bytes) {
+    if (!useDeviceBox)
+        throw OpenMMException("restoreDeviceBox requires OPENMM_METAL_DEVICE_BOX=1");
+    uploadDeviceBoxBytes(bytes);
+}
+
+void MetalContext::uploadDeviceBoxBytes(const unsigned char* bytes) {
+    auto staging = NS::TransferPtr(device->newBuffer(bytes, 320, MTL::ResourceStorageModeShared));
     if (!staging)
         throw OpenMMException("Unable to stage the periodic box");
     MetalQueue& queue = getCurrentStream();
     lock_guard<recursive_mutex> guard(queue.getLock());
     auto blit = queue.getCommandBuffer()->blitCommandEncoder();
-    blit->copyFromBuffer(staging.get(), 0, deviceBox.getDevicePointer(), 0, sizeof(bytes));
+    blit->copyFromBuffer(staging.get(), 0, deviceBox.getDevicePointer(), 0, 320);
     blit->endEncoding();
     if (deviceBoxReorderBins) {
         deviceBoxReorderBins->execute(1, 1);
