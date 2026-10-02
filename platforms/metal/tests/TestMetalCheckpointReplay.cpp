@@ -97,6 +97,9 @@ static void testCheckpoint(TestPlatform& platform, const string& precision) {
         context.setPositions(positions);
         context.setVelocitiesToTemperature(300, 2026);
         context.applyConstraints(integrator.getConstraintTolerance());
+        // Save on a barostat boundary.  MonteCarloBarostatImpl's phase counter and CustomIntegrator's
+        // cached-forces flag are not checkpointed on any platform, so exact replay holds only for a
+        // step-aligned save with an integrator that recomputes forces each step, as here.
         integrator.step(2500);
         stringstream checkpoint;
         context.createCheckpoint(checkpoint);
