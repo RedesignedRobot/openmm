@@ -347,6 +347,9 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        const char* coopShake = getenv("OPENMM_METAL_COOP_SHAKE");
+        if (coopShake != NULL && string(coopShake) == "1")
+            fusedDefines["COOP_SHAKE"] = "1";
         const char* fold = getenv("OPENMM_METAL_FOLD_ORDERED_FORCES");
         foldsOrderedForces = nb.getUseRoleOrder() && (fold == NULL || string(fold) != "0");
         if (foldsOrderedForces)

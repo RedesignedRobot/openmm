@@ -499,6 +499,110 @@ inline real3 shuffleReal3(real3 v, ushort lane) {
     return make_real3(quad_shuffle(v.x, lane), quad_shuffle(v.y, lane), quad_shuffle(v.z, lane));
 }
 
+#ifdef COOP_SHAKE
+/**
+ * Lanes 1..3 own the central-to-peripheral bonds; lane 0 owns the central atom.
+ * Each bond forms one row and one residual.  Lane 0 solves the same small system
+ * as the cluster implementation, then broadcasts its multipliers to the atoms.
+ * All shuffles execute in every lane, including missing peripheral atoms.
+ */
+inline real3 solveShakeQuad(int lane, real3 row, real g) {
+    real3 row1 = shuffleReal3(row, 1), row2 = shuffleReal3(row, 2), row3 = shuffleReal3(row, 3);
+    real g1 = quad_shuffle(g, 1), g2 = quad_shuffle(g, 2), g3 = quad_shuffle(g, 3);
+    real3 l = make_real3(0);
+    if (lane == 0)
+        l = solveBondMultipliers(row1.x, row1.y, row1.z, row2.x, row2.y, row2.z,
+                                row3.x, row3.y, row3.z, g1, g2, g3);
+    return shuffleReal3(l, 0);
+}
+
+inline void applyShakeToVelocitiesQuad(int lane, int4 atoms, float4 params, mixed tol,
+                                      mixed4 pos, PRIVATE mixed4& vel) {
+    bool active = (lane != 0 && atoms[lane] != -1);
+    mixed3 center = shuffleMixed3(make_mixed3(pos.x, pos.y, pos.z), 0);
+    mixed3 rij = make_mixed3(center.x-pos.x, center.y-pos.y, center.z-pos.z);
+    real3 r = (active ? make_real3((real) rij.x, (real) rij.y, (real) rij.z) : make_real3(0));
+    real3 r1 = shuffleReal3(r, 1), r2 = shuffleReal3(r, 2), r3 = shuffleReal3(r, 3);
+    real wc = params.x, wp = params.w;
+    // Use the upper triangle for both halves, as in the cluster velocity solve.
+    real a12 = (atoms.z != -1 ? dot(r1, r2)*wc : 0);
+    real a13 = (atoms.w != -1 ? dot(r1, r3)*wc : 0);
+    real a23 = (atoms.w != -1 ? dot(r2, r3)*wc : 0);
+    real diag = (active ? dot(r, r)*(wc+wp) : 1);
+    real3 row = (lane == 1 ? make_real3(diag, a12, a13) :
+                 (lane == 2 ? make_real3(a12, diag, a23) : make_real3(a13, a23, diag)));
+    bool converged = false;
+    for (int pass = 0; pass < 15 && !converged; pass++) {
+        mixed3 vc = shuffleMixed3(make_mixed3(vel.x, vel.y, vel.z), 0);
+        mixed3 rv = make_mixed3(vc.x-vel.x, vc.y-vel.y, vc.z-vel.z);
+        real g = (active ? -(real) (rij.x*rv.x + rij.y*rv.y + rij.z*rv.z) : 0);
+        real3 l = solveShakeQuad(lane, row, g);
+        if (lane == 0) {
+            real3 dv = (r1*l.x + r2*l.y + r3*l.z)*wc;
+            vel.x += dv.x;
+            vel.y += dv.y;
+            vel.z += dv.z;
+        }
+        else if (active) {
+            real multiplier = (lane == 1 ? l.x : (lane == 2 ? l.y : l.z));
+            vel.x -= r.x*(multiplier*wp);
+            vel.y -= r.y*(multiplier*wp);
+            vel.z -= r.z*(multiplier*wp);
+        }
+        converged = (fabs(l.x) <= (real) tol && fabs(l.y) <= (real) tol && fabs(l.z) <= (real) tol);
+    }
+}
+
+inline void applyShakeToPositionsQuad(int lane, int4 atoms, float4 params, mixed4 pos, PRIVATE mixed4& delta) {
+    bool active = (lane != 0 && atoms[lane] != -1);
+    real wc = params.x, wp = params.w, d2 = params.z;
+    mixed3 center = shuffleMixed3(make_mixed3(pos.x, pos.y, pos.z), 0);
+    mixed3 rij = make_mixed3(center.x-pos.x, center.y-pos.y, center.z-pos.z);
+    mixed ld = d2-(rij.x*rij.x + rij.y*rij.y + rij.z*rij.z);
+    real3 r = (active ? make_real3((real) rij.x, (real) rij.y, (real) rij.z) : make_real3(0));
+    real3 r1 = shuffleReal3(r, 1), r2 = shuffleReal3(r, 2), r3 = shuffleReal3(r, 3);
+    mixed3 xp = make_mixed3(delta.x, delta.y, delta.z);
+    mixed3 xc = shuffleMixed3(xp, 0);
+    real3 p = r+make_real3((real) (xc.x-xp.x), (real) (xc.y-xp.y), (real) (xc.z-xp.z));
+    real3 dx = make_real3(0);
+    bool last = false;
+    for (int iteration = 0; !last; iteration++) {
+        real3 dc = shuffleReal3(dx, 0);
+        real3 f = p+dc-dx;
+        real g = (active ? d2-dot(f, f) : 0);
+        real g1 = quad_shuffle(g, 1), g2 = quad_shuffle(g, 2), g3 = quad_shuffle(g, 3);
+        last = (iteration == 14 || (fabs(g1) < 1e-6f*d2 && fabs(g2) < 1e-6f*d2 && fabs(g3) < 1e-6f*d2));
+        if (last) {
+            xp.x += dx.x;
+            xp.y += dx.y;
+            xp.z += dx.z;
+            dx = make_real3(0);
+            xc = shuffleMixed3(xp, 0);
+            mixed3 rp = make_mixed3(xc.x-xp.x, xc.y-xp.y, xc.z-xp.z);
+            g = (active ? (real) (ld - 2.0f*(rij.x*rp.x + rij.y*rp.y + rij.z*rp.z)
+                                     - (rp.x*rp.x + rp.y*rp.y + rp.z*rp.z)) : 0);
+        }
+        real a1 = (active ? dot(f, r1)*(lane == 1 ? wc+wp : wc) : 0);
+        real a2 = (active && atoms.z != -1 ? dot(f, r2)*(lane == 2 ? wc+wp : wc) : 0);
+        real a3 = (active && atoms.w != -1 ? dot(f, r3)*(lane == 3 ? wc+wp : wc) : 0);
+        if (!active) {
+            if (lane == 2) a2 = 1;
+            if (lane == 3) a3 = 1;
+        }
+        real3 l = solveShakeQuad(lane, make_real3(a1, a2, a3), 0.5f*g);
+        if (lane == 0)
+            dx += (r1*l.x + r2*l.y + r3*l.z)*wc;
+        else if (active) {
+            real multiplier = (lane == 1 ? l.x : (lane == 2 ? l.y : l.z));
+            dx -= r*(multiplier*wp);
+        }
+    }
+    delta.x = xp.x+dx.x;
+    delta.y = xp.y+dx.y;
+    delta.z = xp.z+dx.z;
+}
+#endif
+
 /**
  * applySettleToClusterVelocities spread over the quad.  Lane i holds atom i and works bond i, AB, BC or CA, from its
  * atom to the next.  Every value is the same expression on the same operands as in the cluster form, computed once in
@@ -718,7 +822,11 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
 #ifdef EMULATED_MIXED_PRECISION
         // A SETTLE cluster's constraints run spread over the quad's lanes instead of four times over: see
         // applySettleToVelocitiesQuad.
+#ifdef COOP_SHAKE
+        bool gatherCluster = false;
+#else
         bool gatherCluster = isShake;
+#endif
 #else
         bool gatherCluster = (isSettle || isShake);
 #endif
@@ -737,6 +845,10 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
 #ifdef EMULATED_MIXED_PRECISION
         else if (isSettle)
             applySettleToVelocitiesQuad(lane, pos, vel);
+#ifdef COOP_SHAKE
+        else if (isShake)
+            applyShakeToVelocitiesQuad(lane, atoms, shakeParams[unit-numSettle], tol, pos, vel);
+#endif
 #endif
         if (atom != -1 && vel.w != 0.0)
             bathAtom(atom, random, randomIndex, halfdt, vscale, noisescale, vel, delta, oldDelta);
@@ -753,6 +865,10 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
 #ifdef EMULATED_MIXED_PRECISION
         else if (isSettle)
             applySettleToPositionsQuad(lane, settleParams[unit], pos, vel, delta);
+#ifdef COOP_SHAKE
+        else if (isShake)
+            applyShakeToPositionsQuad(lane, atoms, shakeParams[unit-numSettle], pos, delta);
+#endif
 #endif
         mixed4 finalPos = pos;
         if (atom != -1 && vel.w != 0.0)
