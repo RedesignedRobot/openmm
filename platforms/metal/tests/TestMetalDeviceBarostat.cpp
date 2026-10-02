@@ -293,6 +293,53 @@ static void sameTrialState(const vector<double>& a, const vector<double>& b) {
     const double kT=0.00831446261815324*300;
     ASSERT(fabs(a[3]-b[3]) < 0.1*kT); // Work is in kJ/mol; parity noise is about 0.02 kT.
 }
+// A first rejected trial must retain parameters lazily initialized by its initial energy evaluation.
+static void firstTrialEnergy(TrialPlatform& p) {
+    System system; vector<Vec3> positions; createWater(system,positions,7);
+    addBarostat(system,1,741).setDefaultPressure(1e8);
+    deviceMode(true);
+    LangevinMiddleIntegrator fi(300,1,0.001), pi(300,1,0.001);
+    Context fresh(system,fi,p); auto* fk=p.last;
+    fresh.setPositions(positions); fresh.computeVirtualSites();
+    Context primed(system,pi,p); auto* pk=p.last;
+    primed.setPositions(positions); primed.computeVirtualSites();
+    // E0 may initialize charges, but must not change the per-atom layout used by the force snapshot.
+    auto layoutBefore=snapshot(p.metal(primed));
+    auto velocitiesBefore=bytes(p.metal(primed).unwrap(p.metal(primed).getVelm()));
+    vector<mm_float4> positionsBefore;
+    p.metal(primed).getPosq().download(positionsBefore);
+    double expected=primed.getState(State::Energy).getPotentialEnergy();
+    auto layoutAfter=snapshot(p.metal(primed));
+    for (int i=2; i<layoutBefore.size(); i++) // Box, cell offsets, atom index, and mixed position corrections.
+        ASSERT(layoutBefore[i]==layoutAfter[i]);
+    ASSERT(velocitiesBefore==bytes(p.metal(primed).unwrap(p.metal(primed).getVelm())));
+    double tolerance=p.metal(fresh).getUseMixedPrecision() ? 1e-3 : 0.5;
+    vector<mm_float4> initialized;
+    p.metal(primed).getPosq().download(initialized);
+    for (int i=0; i<system.getNumParticles(); i++)
+        ASSERT(memcmp(&positionsBefore[i], &initialized[i], 3*sizeof(float))==0);
+    for (Context* c : {&fresh, &primed}) {
+        auto* kernel=(c==&fresh ? fk : pk);
+        kernel->setTrialUniforms(0.75,0.5); // Expansion at high pressure guarantees rejection.
+        p.impl(*c).updateContextState();
+        auto trial=kernel->getTrialState();
+        vector<mm_float4> rejected;
+        p.metal(*c).getPosq().download(rejected);
+        double chargeSquared=0, expectedChargeSquared=0;
+        for (int i=0; i<system.getNumParticles(); i++) {
+            chargeSquared+=rejected[i].w*rejected[i].w;
+            expectedChargeSquared+=initialized[i].w*initialized[i].w;
+        }
+        double after=c->getState(State::Energy).getPotentialEnergy();
+        cout << setprecision(17) << "first rejected trial primed=" << (c==&primed)
+             << " reference=" << expected << " e0=" << trial[4] << " after=" << after
+             << " chargeSquared=" << chargeSquared << "/" << expectedChargeSquared << endl;
+        ASSERT_EQUAL(0,trial[6]);
+        ASSERT(fabs(expected-trial[4]) < tolerance);
+        ASSERT_EQUAL(expectedChargeSquared,chargeSquared);
+        ASSERT(fabs(expected-after) < tolerance);
+    }
+}
 static void checkpointEligibility(TrialPlatform& p) {
     System system; vector<Vec3> positions; createWater(system,positions,7);
     addBarostat(system,1,741);
@@ -326,6 +373,17 @@ static void checkpointEligibility(TrialPlatform& p) {
         sameState(source.getState(State::Positions|State::Velocities|State::Forces),
                   restored.getState(State::Positions|State::Velocities|State::Forces));
     }
+    // Check the energy API separately so the continuation above still starts with an unprimed trial.
+    LangevinMiddleIntegrator ei(300,1,0.001);
+    Context energyChecked(system,ei,p); auto* ek=p.last;
+    checkpoint.clear(); checkpoint.seekg(0);
+    energyChecked.loadCheckpoint(checkpoint);
+    double expected=energyChecked.getState(State::Energy).getPotentialEnergy();
+    p.impl(energyChecked).updateContextState();
+    double e0=ek->getTrialState()[4];
+    double tolerance=p.metal(energyChecked).getUseMixedPrecision() ? 1e-3 : 0.5;
+    ASSERT(fabs(expected-e0) < tolerance);
+    cout << "restored first trial: energy=" << expected << " e0=" << e0 << endl;
     // A context that switches to phase 1 must also write the phase 1 checkpoint format.
     p.metal(source).getNonbondedUtilities().forceCountWaitForTesting();
     stringstream fallbackCheckpoint;
@@ -356,6 +414,7 @@ static void noWait(TrialPlatform& p) {
         integrator.step(1000);
         auto finishes=MetalQueue::getFinishCount()-before;
         cout << "steps=1000 frequency=" << frequency << " finishes=" << finishes
+             << " count waits=" << p.metal(c).getNonbondedUtilities().getCountWaitCalls()-countBefore
              << " commits=" << p.metal(c).getCurrentStream().getCommitCount()-commits << endl;
         ASSERT_EQUAL(0,finishes);
         ASSERT_EQUAL(countBefore,p.metal(c).getNonbondedUtilities().getCountWaitCalls());
@@ -480,6 +539,7 @@ int main(int argc, char* argv[]) {
                 try { parity(platform); } catch (const exception& e) { cerr << "parity: " << e.what() << endl; failures++; }
                 try { noWait(platform); } catch (const exception& e) { cerr << "no-wait: " << e.what() << endl; failures++; }
                 try { fallbacks(platform); } catch (const exception& e) { cerr << "fallbacks: " << e.what() << endl; failures++; }
+                try { firstTrialEnergy(platform); } catch (const exception& e) { cerr << "first trial energy: " << e.what() << endl; failures++; }
                 try { checkpointEligibility(platform); } catch (const exception& e) { cerr << "checkpoint eligibility: " << e.what() << endl; failures++; }
                 if (argc==5) {
                     try { fahEligibility(platform,argv[2],argv[3],argv[4]); }

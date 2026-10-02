@@ -605,8 +605,9 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
         for (int i = 0; i < 11; i++) decideTrial->addArg();
         for (int i = 0; i < 4; i++) restoreTrial->addArg();
     }
-    // Energy-only evaluations do not reorder atoms.  Save the complete device transaction anyway,
-    // including offsets and index, so rejection preserves bits without host observation/listeners.
+    // The eligible energy-only force path does not reorder atoms or change coordinates, velocities,
+    // indices, or cell offsets.  It clears forces and can initialize posq.w, so save forces before E0
+    // and the other buffers after it.  Rejection must retain the initialized particle parameters.
     cu.getIntegrationUtilities().ensureVirtualSiteForcesDistributed();
     cu.getNonbondedUtilities().scatterRoleForces();
     vector<ArrayInterface*> arrays = {&cu.getPosq(), &cu.getVelm(), &cu.getLongForceBuffer(),
@@ -619,7 +620,8 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
     for (int i = 0; i < targets.size(); i++) {
         if (i == trialSaved.size())
             trialSaved.emplace_back(new MetalArray(cu, targets[i]->getSize(), targets[i]->getElementSize(), "barostatSaved"));
-        targets[i]->copyTo(*trialSaved[i]);
+        if (targets[i] == &cu.unwrap(cu.getLongForceBuffer()))
+            targets[i]->copyTo(*trialSaved[i]);
     }
     proposeTrial->setArg(0, trialState);
     proposeTrial->setArg(1, cu.getDeviceBoxState());
@@ -629,6 +631,9 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
     proposeTrial->execute(1, 1);
     double initialForce, initialPlatform, finalForce, finalPlatform;
     cu.enqueueEnergy(initialEnergySum, groups, initialForce, initialPlatform);
+    for (int i = 0; i < targets.size(); i++)
+        if (targets[i] != &cu.unwrap(cu.getLongForceBuffer()))
+            targets[i]->copyTo(*trialSaved[i]);
     cu.scaleDeviceBox(scaleFactor);
     cu.enqueueEnergy(finalEnergySum, groups, finalForce, finalPlatform);
     testInitialEnergy = initialForce+initialPlatform;
