@@ -8,15 +8,20 @@
 #include "openmm/Context.h"
 #include "openmm/CustomExternalForce.h"
 #include "openmm/LangevinMiddleIntegrator.h"
+#include "openmm/MonteCarloBarostat.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/VirtualSite.h"
 #include "openmm/internal/AssertionUtilities.h"
 #include "openmm/internal/ContextImpl.h"
+#include "openmm/serialization/XmlSerializer.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -49,7 +54,10 @@ private:
 };
 
 void createWater(System& system, vector<Vec3>& positions) {
-    system.setDefaultPeriodicBoxVectors(Vec3(3, 0, 0), Vec3(0, 3, 0), Vec3(0, 0, 3));
+    // NonbondedForce enables the neighbor list above 3000 particles.  Role order requires that list.
+    const int side = 10;
+    const double spacing = 0.6, box = side*spacing;
+    system.setDefaultPeriodicBoxVectors(Vec3(box, 0, 0), Vec3(0, box, 0), Vec3(0, 0, box));
     auto* nb = new NonbondedForce();
     nb->setNonbondedMethod(NonbondedForce::CutoffPeriodic);
     nb->setCutoffDistance(1.0);
@@ -59,9 +67,9 @@ void createWater(System& system, vector<Vec3>& positions) {
     system.addForce(external);
     const double oh = 0.09572, hh = 0.15139;
     const double hy = sqrt(oh*oh-0.25*hh*hh);
-    for (int x = 0; x < 5; x++)
-        for (int y = 0; y < 5; y++)
-            for (int z = 0; z < 5; z++) {
+    for (int x = 0; x < side; x++)
+        for (int y = 0; y < side; y++)
+            for (int z = 0; z < side; z++) {
                 int o = system.addParticle(15.99943);
                 system.addParticle(1.007947);
                 system.addParticle(1.007947);
@@ -79,7 +87,7 @@ void createWater(System& system, vector<Vec3>& positions) {
                 system.setVirtualSite(o+3, new ThreeParticleAverageSite(o, o+1, o+2,
                         0.786646558, 0.106676721, 0.106676721));
                 external->addParticle(o+3, vector<double>());
-                Vec3 base(0.6*x+0.1, 0.6*y+0.1, 0.6*z+0.1);
+                Vec3 base(spacing*x+0.1, spacing*y+0.1, spacing*z+0.1);
                 positions.push_back(base);
                 positions.push_back(base+Vec3(-hh/2, hy, 0));
                 positions.push_back(base+Vec3(hh/2, hy, 0));
@@ -87,12 +95,17 @@ void createWater(System& system, vector<Vec3>& positions) {
             }
 }
 
-void assertSameBits(const vector<Vec3>& a, const vector<Vec3>& b) {
+void assertSameBits(const vector<Vec3>& a, const vector<Vec3>& b, const string& label = "state") {
     ASSERT_EQUAL(a.size(), b.size());
     for (int i = 0; i < a.size(); i++)
         for (int j = 0; j < 3; j++) {
             double left = a[i][j], right = b[i][j];
-            ASSERT(memcmp(&left, &right, sizeof(double)) == 0);
+            if (memcmp(&left, &right, sizeof(double)) != 0) {
+                ostringstream message;
+                message << label << " differs at particle " << i << " component " << j
+                        << ": " << hexfloat << left << " vs " << right;
+                throw OpenMMException(message.str());
+            }
         }
 }
 
@@ -110,6 +123,8 @@ vector<State> trajectory(FoldPlatform& platform, System& system, const vector<Ve
     integrator.step(1); // Prepare the fused kernel; the first force pass is materialized in both modes.
     MetalContext& metal = platform.getMetalContext(context);
     auto& nb = metal.getNonbondedUtilities();
+    cout << "Synthetic fold=" << fold << " roleOrder=" << nb.getUseRoleOrder()
+         << " canFold=" << metal.getIntegrationUtilities().canFoldOrderedForces() << endl;
     ASSERT(nb.getUseRoleOrder());
     ASSERT_EQUAL(fold, metal.getIntegrationUtilities().canFoldOrderedForces());
     platform.computeForces(context);
@@ -132,11 +147,77 @@ vector<State> trajectory(FoldPlatform& platform, System& system, const vector<Ve
     return states;
 }
 
+template <class T>
+unique_ptr<T> readXml(const string& path) {
+    ifstream stream(path);
+    if (!stream)
+        throw OpenMMException("Cannot read " + path);
+    return unique_ptr<T>(XmlSerializer::deserialize<T>(stream));
+}
+
+vector<State> holdoutTrajectory(FoldPlatform& platform, System& system, const State& initial,
+        const string& integratorPath, bool fold) {
+    setenv("OPENMM_METAL_FOLD_ORDERED_FORCES", fold ? "1" : "0", 1);
+    auto integrator = readXml<Integrator>(integratorPath);
+    auto* langevin = dynamic_cast<LangevinMiddleIntegrator*>(integrator.get());
+    ASSERT(langevin != nullptr);
+    langevin->setRandomNumberSeed(9127);
+    Context context(system, *integrator, platform);
+    context.setState(initial);
+    integrator->step(1);
+    MetalContext& metal = platform.getMetalContext(context);
+    auto& nb = metal.getNonbondedUtilities();
+    platform.computeForces(context);
+    cout << "Holdout fold=" << fold << " particles=" << system.getNumParticles()
+         << " roleOrder=" << nb.getUseRoleOrder()
+         << " canFold=" << metal.getIntegrationUtilities().canFoldOrderedForces()
+         << " roleForcesPending=" << nb.getRoleForcesPending() << endl;
+    ASSERT(nb.getUseRoleOrder());
+    ASSERT_EQUAL(fold, metal.getIntegrationUtilities().canFoldOrderedForces());
+    ASSERT_EQUAL(fold, nb.getRoleForcesPending());
+    vector<State> states;
+    for (int step = 0; step < 50; step++) {
+        integrator->step(1);
+        ASSERT(!nb.getRoleForcesPending());
+        states.push_back(context.getState(State::Positions | State::Velocities));
+    }
+    return states;
+}
+
+void testHoldout(FoldPlatform& platform, const string& systemPath, const string& statePath,
+        const string& integratorPath) {
+    auto system = readXml<System>(systemPath);
+    auto initial = readXml<State>(statePath);
+    for (int i = 0; i < system->getNumForces(); i++)
+        if (auto* barostat = dynamic_cast<MonteCarloBarostat*>(&system->getForce(i)))
+            barostat->setRandomNumberSeed(1729);
+    auto off = holdoutTrajectory(platform, *system, *initial, integratorPath, false);
+    auto on = holdoutTrajectory(platform, *system, *initial, integratorPath, true);
+    for (int i = 0; i < off.size(); i++) {
+        string step = "Holdout step " + to_string(i+1);
+        assertSameBits(off[i].getPositions(), on[i].getPositions(), step+" positions");
+        assertSameBits(off[i].getVelocities(), on[i].getVelocities(), step+" velocities");
+        Vec3 a[3], b[3];
+        off[i].getPeriodicBoxVectors(a[0], a[1], a[2]);
+        on[i].getPeriodicBoxVectors(b[0], b[1], b[2]);
+        assertSameBits(vector<Vec3>(a, a+3), vector<Vec3>(b, b+3), step+" box vectors");
+    }
+    cout << "Holdout positions, velocities, and box vectors match bitwise at all 50 steps" << endl;
+}
+
 int main(int argc, char* argv[]) {
     try {
         FoldSwitch restoreEnvironment;
+        if (argc != 1 && argc != 2 && argc != 5)
+            throw OpenMMException("Usage: TestMetalOrderedForceFold [precision [system.xml state.xml integrator.xml]]");
         FoldPlatform platform;
         platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), argc > 1 ? argv[1] : "single");
+        // PME's floating point charge atomics vary even between two fold-off runs.
+        platform.setPropertyDefaultValue(MetalPlatform::MetalDeterministicForces(), "true");
+        if (argc == 5) {
+            testHoldout(platform, argv[2], argv[3], argv[4]);
+            return 0;
+        }
         System system;
         vector<Vec3> positions;
         createWater(system, positions);
