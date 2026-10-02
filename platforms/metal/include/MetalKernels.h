@@ -175,19 +175,6 @@ private:
     ComputeKernel unwrapKernel;
 };
 
-/**
- * Materialize ordered force words before any barostat saves the context force buffer.
- */
-class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
-public:
-    MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
-            CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
-    }
-    void saveCoordinates(ContextImpl& context) override;
-private:
-    MetalContext& cu;
-};
-
 /** This kernel takes one LangevinMiddle step. */
 class MetalIntegrateLangevinMiddleStepKernel : public CommonIntegrateLangevinMiddleStepKernel {
 public:
@@ -271,13 +258,17 @@ public:
     }
 };
 
-/** Isotropic barostat with optional deferred potential energy readbacks. */
+/**
+ * Isotropic barostat with optional deferred potential energy readbacks.  It also materializes ordered force
+ * words before saving the context force buffer.
+ */
 class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
 public:
     MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
             CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
     }
     void initialize(const System& system, const Force& barostat, int components, bool rigidMolecules=true);
+    void saveCoordinates(ContextImpl& context) override;
     bool computeTrialEnergies(ContextImpl& context, int groups, const std::function<void()>& propose,
                               double& initialEnergy, double& finalEnergy);
 private:
