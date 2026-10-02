@@ -131,8 +131,11 @@ void MetalAtomReorder::uploadCellOffsets() {
 }
 
 void MetalAtomReorder::checkForNaN() {
-    if (*(volatile int*) nanFlag->getDevicePointer()->contents() != 0)
+    if (context.getCurrentStream().isDrained() && *(int*) nanFlag->getDevicePointer()->contents() != 0) {
+        // Report this operation once, so explicit position replacement can recover.
+        context.clearBuffer(*nanFlag);
         throw OpenMMException("Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan");
+    }
 }
 
 bool MetalAtomReorder::apply() {
@@ -188,6 +191,8 @@ bool MetalAtomReorder::apply() {
     keysKernel->setArg(arg++, *keys);
     keysKernel->setArg(arg++, *moleculeCells);
     keysKernel->setArg(arg++, *nanFlag);
+    // Clear in stream order before either key kernel can report this operation.
+    context.clearBuffer(*nanFlag);
     keysKernel->execute(numMolecules);
     if (numLarge > 0) {
         arg = 0;

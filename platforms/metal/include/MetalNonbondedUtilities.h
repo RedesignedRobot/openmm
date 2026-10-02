@@ -328,18 +328,19 @@ public:
      */
     void setKernelSource(const std::string& source);
 private:
-    /**
-     * Wait until copyInteractionCounts has written this step's counts to pinned memory.
-     */
-    void waitForCountCopy();
+    friend class MetalHostRobustnessAccess;
     /**
      * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
      * atomOrder, atomRoles and the exclusions in that order.  See initialize().
      */
     bool chooseRoleOrder(const System& system);
     class KernelSet;
-    struct CountAudit;
     class BlockSortTrait;
+    struct CountSnapshots;
+    std::shared_ptr<CountSnapshots> countSnapshots;
+    unsigned long long reorderEpoch = 0;
+    unsigned int adaptiveReorderCount = 0;
+    void sampleInteractionCounts(KernelSet& kernels);
     void initParamArgs();
     MetalContext& context;
     std::unique_ptr<MetalAtomReorder> atomReorder;
@@ -377,9 +378,6 @@ private:
     ComputeSort blockSorter;
     metalDeviceptr_t pinnedCountDeviceMemory;
     unsigned int* pinnedCountBuffer;
-    unsigned int countCopies;
-    std::shared_ptr<CountAudit> countAudit;
-    int missedCountReads;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, copyInteractionCountsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;

@@ -28,6 +28,7 @@
 #include "MetalKernels.h"
 #include "MetalPlatform.h"
 #include "openmm/common/CommonKernels.h"
+#include "openmm/common/ContextSelector.h"
 #include "openmm/common/CommonCalcCustomHbondForceKernel.h"
 #include "openmm/common/CommonCalcCustomManyParticleForceKernel.h"
 #include "openmm/common/CommonCalcCustomNonbondedForceKernel.h"
@@ -40,13 +41,31 @@
 
 using namespace OpenMM;
 
+namespace {
+// Position downloads resolve device reordering before the common kernel starts workers.
+// A NaN must be reported to the caller, since ThreadPool does not transport exceptions.
+class MetalHostStateDataKernel : public MetalUpdateStateDataKernel {
+public:
+    MetalHostStateDataKernel(std::string name, const Platform& platform, MetalContext& context) :
+            MetalUpdateStateDataKernel(name, platform, context), context(context) {
+    }
+    void getPositions(ContextImpl& impl, std::vector<Vec3>& positions, bool allowPeriodic) override {
+        ContextSelector selector(context);
+        context.getAtomIndex();
+        MetalUpdateStateDataKernel::getPositions(impl, positions, allowPeriodic);
+    }
+private:
+    MetalContext& context;
+};
+}
+
 KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platform& platform, ContextImpl& context) const {
     MetalPlatform::PlatformData& data = *static_cast<MetalPlatform::PlatformData*>(context.getPlatformData());
     MetalContext& cu = *data.contexts[0];
     if (name == CalcForcesAndEnergyKernel::Name())
         return new MetalCalcForcesAndEnergyKernel(name, platform, cu);
     if (name == UpdateStateDataKernel::Name())
-        return new MetalUpdateStateDataKernel(name, platform, cu);
+        return new MetalHostStateDataKernel(name, platform, cu);
     if (name == ApplyConstraintsKernel::Name())
         return new CommonApplyConstraintsKernel(name, platform, cu);
     if (name == VirtualSitesKernel::Name())
