@@ -336,6 +336,11 @@ private:
     bool chooseRoleOrder(const System& system);
     class KernelSet;
     class BlockSortTrait;
+    struct CountSnapshots;
+    std::shared_ptr<CountSnapshots> countSnapshots;
+    unsigned long long reorderEpoch = 0;
+    unsigned int adaptiveReorderCount = 0;
+    void sampleInteractionCounts(KernelSet& kernels);
     void initParamArgs();
     MetalContext& context;
     std::unique_ptr<MetalAtomReorder> atomReorder;

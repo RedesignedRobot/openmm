@@ -62,6 +62,22 @@ static const int NumSizeBins = 20;
 // interactingAtoms uses a 32-bit unsigned tile offset.
 static const uint64_t MaxNeighborTiles = numeric_limits<unsigned int>::max()/MetalContext::TileSize;
 
+struct MetalNonbondedUtilities::CountSnapshots {
+    // A slot cannot be reused until its completion handler has copied both counts.
+    // If callbacks lag behind, skip sampling instead of waiting or allocating more slots.
+    static const int NumSlots = 4;
+    metalDeviceptr_t buffers[NumSlots] = {};
+    bool busy[NumSlots] = {};
+    mutex lock;
+    unsigned long long nextSequence = 0, sequence = 0, epoch = 0;
+    unsigned int counts[2] = {};
+    ~CountSnapshots() {
+        for (auto buffer : buffers)
+            if (buffer != NULL)
+                buffer->release();
+    }
+};
+
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
     BlockSortTrait() {}
@@ -306,8 +322,12 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(int2);
         long long unusedMemory = (long long) context.getDevice()->recommendedMaxWorkingSetSize()-(long long) context.getDevice()->currentAllocatedSize();
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
-        if (!waitForCount)
+        if (!waitForCount) {
+            countSnapshots = make_shared<CountSnapshots>();
+            for (auto& buffer : countSnapshots->buffers)
+                buffer = context.createBuffer(2*sizeof(unsigned int), "interactionCountSnapshot");
             context.getCurrentStream().commitWhenIdle();
+        }
         uint64_t initialTiles = max<uint64_t>(1, waitForCount ? min<uint64_t>(20ULL*numAtomBlocks, numTiles) : numTiles);
         uint64_t initialPairs = waitForCount ? 5ULL*numAtoms : max<uint64_t>(5ULL*numAtoms, maxPossiblePairs);
         // Leave room for the signed single-pair loop index's final stride.
@@ -651,11 +671,47 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // With the indirect rebuild, findBlockBounds already copied a count, at most one list old,
     // which is all a step without the wait needs.
     bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
+    if (context.getStepsSinceReorder() == 0)
+        ++reorderEpoch;
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
     // too.  computeInteractions() commits it before waiting for the count.
     if (wait || !useIndirectRebuild) {
         context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
     }
+    if (!wait && context.getStepsSinceReorder()%StepsPerCommandBuffer == 0)
+        sampleInteractionCounts(kernels);
+}
+
+void MetalNonbondedUtilities::sampleInteractionCounts(KernelSet& kernels) {
+    auto snapshots = countSnapshots;
+    int slot = 0;
+    unsigned long long sequence;
+    {
+        lock_guard<mutex> guard(snapshots->lock);
+        while (slot < CountSnapshots::NumSlots && snapshots->busy[slot])
+            ++slot;
+        if (slot == CountSnapshots::NumSlots)
+            return;
+        snapshots->busy[slot] = true;
+        sequence = ++snapshots->nextSequence;
+    }
+    MetalQueue& queue = context.getCurrentStream();
+    // Keep idle commits from separating the GPU copy from its completion handler.
+    lock_guard<recursive_mutex> guard(queue.getLock());
+    void* args[] = {&interactionCount.getDevicePointer(), &snapshots->buffers[slot]};
+    context.executeKernelFlat(kernels.copyInteractionCountsKernel, args, 1, 1);
+    unsigned long long epoch = reorderEpoch;
+    queue.addCompletedHandler([snapshots, slot, sequence, epoch](MTL::CommandBuffer* buffer) {
+        lock_guard<mutex> guard(snapshots->lock);
+        if (buffer->status() == MTL::CommandBufferStatusCompleted && sequence > snapshots->sequence) {
+            const unsigned int* counts = (const unsigned int*) snapshots->buffers[slot]->contents();
+            snapshots->counts[0] = counts[0];
+            snapshots->counts[1] = counts[1];
+            snapshots->sequence = sequence;
+            snapshots->epoch = epoch;
+        }
+        snapshots->busy[slot] = false;
+    });
 }
 
 void MetalNonbondedUtilities::initParamArgs() {
@@ -683,7 +739,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
-        // guides reordering once the queue drains.  Exact counts require command-buffer completion.
+        // guides reordering through completed snapshots.  Exact counts require queue completion.
         // Steps without the wait share a command buffer, up to StepsPerCommandBuffer of them,
         // unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
@@ -702,14 +758,29 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
 }
 
 bool MetalNonbondedUtilities::updateNeighborListSize() {
-    // The allocation-proven path can skip the heuristic while work is in flight.
-    // isIdle() alone is insufficient: an open buffer can still write these counts.
-    if (!useCutoff || !context.getCurrentStream().isDrained())
+    if (!useCutoff)
         return false;
-    if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
+    bool drained = context.getCurrentStream().isDrained();
+    if (drained && (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0))
         tilesAfterReorder = pinnedCountBuffer[0];
-    else if (context.getStepsSinceReorder() > 25 && pinnedCountBuffer[0] > 1.1*tilesAfterReorder)
-        context.forceReorder();
+    else if (context.getStepsSinceReorder() > 25) {
+        unsigned int tiles = 0;
+        if (waitForCount && drained)
+            tiles = pinnedCountBuffer[0];
+        else if (countSnapshots) {
+            lock_guard<mutex> guard(countSnapshots->lock);
+            if (countSnapshots->epoch == reorderEpoch)
+                tiles = countSnapshots->counts[0];
+        }
+        if (tiles > 1.1*tilesAfterReorder) {
+            context.forceReorder();
+            ++adaptiveReorderCount;
+        }
+    }
+    // Overflow decisions still require the exact counts after finish().  Snapshots are
+    // only for the heuristic; an open buffer can still write the shared exact counts.
+    if (!drained)
+        return false;
     if (pinnedCountBuffer[0] <= maxTiles && pinnedCountBuffer[1] <= maxSinglePairs)
         return false;
 

@@ -1,4 +1,4 @@
-/* Tests overflow recovery, per-operation NaN reporting, and retained device memory. */
+/* Tests overflow recovery, NaN reporting, retained memory, and batched adaptive reordering. */
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 #include "openmm/internal/AssertionUtilities.h"
@@ -8,6 +8,7 @@
 #include "MetalPlatform.h"
 #include "MetalQueue.h"
 #include "openmm/Context.h"
+#include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/VerletIntegrator.h"
@@ -42,6 +43,19 @@ public:
     static void rebuild(MetalContext& cc) {
         cc.getNonbondedUtilities().forceRebuildNeighborList = true;
         cc.forceReorder();
+    }
+    static unsigned int adaptiveReorders(MetalContext& cc) {
+        return cc.getNonbondedUtilities().adaptiveReorderCount;
+    }
+    static unsigned int baseline(MetalContext& cc) {
+        auto& nb = cc.getNonbondedUtilities();
+        ASSERT(nb.useNeighborList && nb.useRoleOrder && !nb.waitForCount);
+        return nb.tilesAfterReorder;
+    }
+    static unsigned int downloadTileCount(MetalContext& cc) {
+        vector<unsigned int> counts;
+        cc.getNonbondedUtilities().interactionCount.download(counts);
+        return counts[0];
     }
 };
 }
@@ -209,12 +223,53 @@ static void testMemory() {
     ASSERT_EQUAL(before, after);
 }
 
+static void testAdaptiveReorder() {
+    System system;
+    vector<Vec3> positions;
+    makeWater(system, positions);
+    LangevinMiddleIntegrator integrator(300, 1, 0.0001);
+    integrator.setRandomNumberSeed(2029);
+    Context context(system, integrator, platform);
+    MetalContext& cc = platform.metal(context);
+    cc.getCurrentStream().commitWhenIdle();
+    context.setPositions(positions);
+    context.setVelocities(vector<Vec3>(positions.size(), Vec3()));
+    context.getState(State::Forces | State::Energy);
+    unsigned int baseline = MetalHostRobustnessAccess::baseline(cc);
+    ASSERT(baseline > 0);
+    integrator.step(8);
+
+    // Permute whole waters without changing the physical configuration.  The old
+    // atom order now has wide bounding boxes and a much larger interaction list.
+    vector<Vec3> scrambled(positions.size());
+    int waters = positions.size()/4;
+    for (int i = 0; i < waters; ++i)
+        for (int site = 0; site < 4; ++site)
+            scrambled[4*i+site] = positions[4*((37*i)%waters)+site];
+    context.setPositions(scrambled);
+    context.getState(State::Forces | State::Energy);
+    unsigned int grown = MetalHostRobustnessAccess::downloadTileCount(cc);
+    ASSERT(grown > 1.1*baseline);
+    ASSERT(cc.getStepsSinceReorder() < 25);
+    ASSERT_EQUAL(0, MetalHostRobustnessAccess::adaptiveReorders(cc));
+
+    // FAH batching: no state downloads or finishes in these 200 integration steps.
+    // This ends before the fixed 251-step reorder could repair the poor atom order.
+    integrator.step(200);
+    unsigned int reorders = MetalHostRobustnessAccess::adaptiveReorders(cc);
+    cout << "adaptive reorder: baseline=" << baseline << " grown=" << grown
+         << " requests=" << reorders << " stepsSinceReorder=" << cc.getStepsSinceReorder() << endl;
+    ASSERT_EQUAL(1, reorders);
+    ASSERT(cc.getStepsSinceReorder() < 200);
+    ASSERT(isfinite(context.getState(State::Energy).getPotentialEnergy()));
+}
+
 int main(int argc, char* argv[]) {
     string precision = argc > 1 ? argv[1] : "single";
     platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
     platform.setPropertyDefaultValue("DeterministicForces", "true");
     int failures = 0;
-    for (auto test : vector<pair<string, function<void()>>>{{"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}}) {
+    for (auto test : vector<pair<string, function<void()>>>{{"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"adaptive reorder", testAdaptiveReorder}}) {
         try {
             test.second();
             cout << "PASS " << precision << " " << test.first << endl;
