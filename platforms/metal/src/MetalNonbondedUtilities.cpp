@@ -557,14 +557,15 @@ bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
         return false;
 
     int paddedNumAtoms = context.getPaddedNumAtoms();
-    vector<int> order, orderedRoles(paddedNumAtoms, 0), position(numAtoms);
+    vector<int> order, orderedRoles(paddedNumAtoms, 0), position(paddedNumAtoms);
     for (vector<int>& region : regions)
         order.insert(order.end(), region.begin(), region.end());
     for (int i = numAtoms; i < paddedNumAtoms; i++)
         order.push_back(i);
-    for (int i = 0; i < numAtoms; i++) {
+    for (int i = 0; i < paddedNumAtoms; i++) {
         position[order[i]] = i;
-        orderedRoles[i] = roles[order[i]];
+        if (i < numAtoms)
+            orderedRoles[i] = roles[order[i]];
     }
     vector<vector<int> > orderedExclusions(numAtoms);
     for (int i = 0; i < numAtoms; i++) {
@@ -581,6 +582,8 @@ bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
     orderedForces.initialize<unsigned long long>(context, 3*paddedNumAtoms, "orderedForces");
     orderedForces.upload(vector<unsigned long long>(3*paddedNumAtoms, 0));
     atomOrder.upload(order);
+    inverseAtomOrder.initialize<int>(context, paddedNumAtoms, "inverseRoleAtomOrder");
+    inverseAtomOrder.upload(position);
     atomRoles.upload(orderedRoles);
     return true;
 }

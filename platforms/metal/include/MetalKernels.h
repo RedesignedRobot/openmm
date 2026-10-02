@@ -176,8 +176,19 @@ private:
 };
 
 /**
- * This kernel is invoked by LangevinMiddleIntegrator to take one time step.
+ * Materialize ordered force words before any barostat saves the context force buffer.
  */
+class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
+public:
+    MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
+    }
+    void saveCoordinates(ContextImpl& context) override;
+private:
+    MetalContext& cu;
+};
+
+/** This kernel takes one LangevinMiddle step. */
 class MetalIntegrateLangevinMiddleStepKernel : public CommonIntegrateLangevinMiddleStepKernel {
 public:
     MetalIntegrateLangevinMiddleStepKernel(std::string name, const Platform& platform, MetalContext& cu) :

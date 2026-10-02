@@ -1,10 +1,46 @@
 /**
+ * Scatter's unsigned 64 bit addition, read through the inverse role permutation.  Cast the sum back to
+ * signed fixed point only after adding the words, before either the kick or the virtual-site conversion.
+ */
+inline mm_long combinedForceWord(int atom, int component, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms,
+        GLOBAL const mm_ulong* RESTRICT orderedForces, GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces) {
+    mm_ulong word = (mm_ulong) force[atom+component*paddedNumAtoms];
+#ifdef FOLD_ORDERED_FORCES
+    if (readOrderedForces)
+        word += orderedForces[inverseAtomOrder[atom]+component*paddedNumAtoms];
+#endif
+    return (mm_long) word;
+}
+
+inline real3 combinedVsiteForce(int atom, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms,
+        GLOBAL const mm_ulong* RESTRICT orderedForces, GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces) {
+    real scale = 1/((real) 0x100000000);
+    return make_real3(
+            scale*combinedForceWord(atom, 0, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces),
+            scale*combinedForceWord(atom, 1, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces),
+            scale*combinedForceWord(atom, 2, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces));
+}
+
+inline void clearOrderedForce(int atom, int paddedNumAtoms, GLOBAL mm_ulong* RESTRICT orderedForces,
+        GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces) {
+#ifdef FOLD_ORDERED_FORCES
+    if (readOrderedForces) {
+        int index = inverseAtomOrder[atom];
+        orderedForces[index] = 0;
+        orderedForces[index+paddedNumAtoms] = 0;
+        orderedForces[index+2*paddedNumAtoms] = 0;
+    }
+#endif
+}
+
+/**
  * Load an atom's position and velocity, remove the center of mass velocity if removeCM is set, and apply the velocity
  * step.
  */
 inline void kickAtom(int atom, GLOBAL const real4* RESTRICT posq, GLOBAL const real4* RESTRICT posqCorrection,
         GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms, mixed fscale,
-        int removeCM, float4 cm, PRIVATE mixed4& pos, PRIVATE mixed4& vel, mm_long shareX, mm_long shareY, mm_long shareZ) {
+        int removeCM, float4 cm, PRIVATE mixed4& pos, PRIVATE mixed4& vel, mm_long shareX, mm_long shareY, mm_long shareZ,
+        GLOBAL const mm_ulong* RESTRICT orderedForces, GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces) {
     pos = loadPos(posq, posqCorrection, atom);
     vel = velm[atom];
     if (removeCM) {
@@ -16,9 +52,9 @@ inline void kickAtom(int atom, GLOBAL const real4* RESTRICT posq, GLOBAL const r
     }
     if (vel.w != 0.0) {
         // share is the atom's part of a virtual site's force, in the fixed point distributeVirtualSiteForces adds.
-        vel.x += fscale*vel.w*(force[atom]+shareX);
-        vel.y += fscale*vel.w*(force[atom+paddedNumAtoms]+shareY);
-        vel.z += fscale*vel.w*(force[atom+paddedNumAtoms*2]+shareZ);
+        vel.x += fscale*vel.w*(combinedForceWord(atom, 0, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces)+shareX);
+        vel.y += fscale*vel.w*(combinedForceWord(atom, 1, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces)+shareY);
+        vel.z += fscale*vel.w*(combinedForceWord(atom, 2, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces)+shareZ);
     }
 }
 
@@ -349,7 +385,8 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
         GLOBAL const float4* RESTRICT cmVelocity, int clearBuffers, int numAtoms, GLOBAL int* clear0, GLOBAL int* clear1,
-        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4
+        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4,
+        GLOBAL mm_ulong* RESTRICT orderedForces, GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces
 #ifdef FOLD_VSITES
         , GLOBAL const int* RESTRICT settleVsites, GLOBAL const float4* RESTRICT settleVsiteWeights, int applyVsiteShare
 #endif
@@ -378,7 +415,7 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
                 atoms.w = vsite;
                 vsiteWeights = settleVsiteWeights[unit];
                 if (applyVsiteShare) {
-                    real3 f = loadForce(vsite, force);
+                    real3 f = combinedVsiteForce(vsite, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces);
                     share[0][0] = realToFixedPoint(f.x*vsiteWeights.x);
                     share[0][1] = realToFixedPoint(f.y*vsiteWeights.x);
                     share[0][2] = realToFixedPoint(f.z*vsiteWeights.x);
@@ -404,9 +441,11 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             oldDelta[i] = make_mixed4(0);
             if (atoms[i] != -1) {
                 kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos[i], vel[i],
-                        share[i][0], share[i][1], share[i][2]);
+                        share[i][0], share[i][1], share[i][2], orderedForces, inverseAtomOrder, readOrderedForces);
                 if (clearBuffers)
                     clearAtomForce(force, atoms[i], paddedNumAtoms);
+                // A SETTLE site's force was read for its shares before this loop; its massless kick reads no force.
+                clearOrderedForce(atoms[i], paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces);
             }
         }
         if (isSettle)
@@ -431,7 +470,10 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             placeVsite(vsite, posq, posqCorrection, vsiteWeights, storedPos(finalPos[0]), storedPos(finalPos[1]),
                     storedPos(finalPos[2]), pos[3]);
 #endif
-    }    if (clearBuffers)
+    }
+    for (int atom = numAtoms+GLOBAL_ID; atom < paddedNumAtoms; atom += GLOBAL_SIZE)
+        clearOrderedForce(atom, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces);
+    if (clearBuffers)
         clearOtherBuffers(force, numAtoms, paddedNumAtoms, clear0, clear1, clear2, clear3, clearWords4, GLOBAL_ID, GLOBAL_SIZE);
 }
 
@@ -611,7 +653,8 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
         GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int removeCM,
         GLOBAL const float4* RESTRICT cmVelocity, int clearBuffers, int numAtoms, GLOBAL int* clear0, GLOBAL int* clear1,
-        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4
+        GLOBAL int* clear2, GLOBAL int* clear3, int4 clearWords4,
+        GLOBAL mm_ulong* RESTRICT orderedForces, GLOBAL const int* RESTRICT inverseAtomOrder, int readOrderedForces
 #ifdef FOLD_VSITES
         , GLOBAL const int* RESTRICT settleVsites, GLOBAL const float4* RESTRICT settleVsiteWeights, int applyVsiteShare
 #endif
@@ -642,7 +685,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
                 atoms.w = vsite;
                 vsiteWeights = settleVsiteWeights[unit];
                 if (applyVsiteShare) {
-                    real3 f = (lane == 3 ? loadForce(vsite, force) : make_real3(0));
+                    real3 f = (lane == 3 ? combinedVsiteForce(vsite, force, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces) : make_real3(0));
                     f = make_real3(quad_shuffle(f.x, 3), quad_shuffle(f.y, 3), quad_shuffle(f.z, 3));
                     real w = (lane == 0 ? vsiteWeights.x : (lane == 1 ? vsiteWeights.y : (lane == 2 ? vsiteWeights.z : 0)));
                     if (lane < 3) {
@@ -666,9 +709,11 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         mixed4 delta = make_mixed4(0);
         mixed4 oldDelta = make_mixed4(0);
         if (atom != -1) {
-            kickAtom(atom, posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos, vel, shareX, shareY, shareZ);
+            kickAtom(atom, posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos, vel, shareX, shareY, shareZ, orderedForces, inverseAtomOrder, readOrderedForces);
             if (clearBuffers)
                 clearAtomForce(force, atom, paddedNumAtoms);
+            // Lane 3 has already broadcast the site's combined force before it clears that entry.
+            clearOrderedForce(atom, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces);
         }
 #ifdef EMULATED_MIXED_PRECISION
         // A SETTLE cluster's constraints run spread over the quad's lanes instead of four times over: see
@@ -722,6 +767,9 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
                 placeVsite(vsite, posq, posqCorrection, vsiteWeights, pos1, pos2, pos3, pos);
         }
 #endif
-    }    if (clearBuffers)
+    }
+    for (int atom = numAtoms+GLOBAL_ID; atom < paddedNumAtoms; atom += GLOBAL_SIZE)
+        clearOrderedForce(atom, paddedNumAtoms, orderedForces, inverseAtomOrder, readOrderedForces);
+    if (clearBuffers)
         clearOtherBuffers(force, numAtoms, paddedNumAtoms, clear0, clear1, clear2, clear3, clearWords4, GLOBAL_ID, GLOBAL_SIZE);
 }

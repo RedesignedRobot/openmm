@@ -79,6 +79,8 @@ void MetalCalcForcesAndEnergyKernel::initialize(const System& system) {
 void MetalCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
+    // A new evaluation supersedes any deferred result.  Drain its private words before the clear.
+    cu.getNonbondedUtilities().scatterRoleForces();
     cu.clearAutoclearBuffersIfNeeded();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
@@ -124,7 +126,11 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
     cu.executeAfterForcePass();
-    cu.getNonbondedUtilities().scatterRoleForces();
+    // Only the prepared fused LangevinMiddle consumer can read the private words.  Energy evaluations,
+    // other integrators (including CompoundIntegrator), and unfused virtual sites keep materialization.
+    if (!includeForces || includeEnergy || dynamic_cast<LangevinMiddleIntegrator*>(&context.getIntegrator()) == NULL ||
+            !cu.getIntegrationUtilities().canFoldOrderedForces())
+        cu.getNonbondedUtilities().scatterRoleForces();
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
@@ -318,6 +324,11 @@ void MetalUpdateStateDataKernel::initialize(const System& system) {
         unwrapKernel->addArg(nullptr);
     unwrapKernel->addArg(cellOffsets);
     unwrapKernel->addArg(boxVectors);
+}
+
+void MetalApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context) {
+    cu.getNonbondedUtilities().scatterRoleForces();
+    CommonApplyMonteCarloBarostatKernel::saveCoordinates(context);
 }
 
 void MetalUpdateStateDataKernel::getForces(ContextImpl& context, vector<Vec3>& forces) {
