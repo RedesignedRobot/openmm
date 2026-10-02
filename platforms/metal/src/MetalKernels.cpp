@@ -123,12 +123,8 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         }
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
-<<<<<<< 9a7ccd4d4ec2c4cb2ec8282802c6a6035cc8abee
-    cu.getNonbondedUtilities().scatterRoleForces();
-||||||| 734ce92d5
-=======
     cu.executeAfterForcePass();
->>>>>>> 5e58f521a
+    cu.getNonbondedUtilities().scatterRoleForces();
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
