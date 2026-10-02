@@ -30,8 +30,22 @@
 
 #include "MetalAmoebaTests.h"
 #include "TestAmoebaMultipoleForce.h"
+#include "MetalDeterministicForces.h"
+
+void testDeterministicPmeForces() {
+    System system;
+    AmoebaMultipoleForce* multipoles = new AmoebaMultipoleForce();
+    setupMultipoleAmmonia(system, multipoles, AmoebaMultipoleForce::PME, AmoebaMultipoleForce::Mutual, 0.3, 24);
+    assertDeterministicForces(system, platform, [](Context& context) {
+        vector<Vec3> forces;
+        double energy;
+        getForcesEnergyMultipoleAmmonia(context, forces, energy);
+        return forces;
+    });
+}
 
 void runPlatformTests() {
     testNoQuadrupoles(false);
     testNoQuadrupoles(true);
+    testDeterministicPmeForces();
 }

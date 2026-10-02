@@ -30,5 +30,36 @@
 
 #include "MetalAmoebaTests.h"
 #include "TestHippoNonbondedForce.h"
+#include "MetalDeterministicForces.h"
 
-void runPlatformTests() {}
+void testDeterministicPmeForces() {
+    System system;
+    HippoNonbondedForce* hippo = new HippoNonbondedForce();
+    const int gridSize = 4;
+    const double spacing = 0.31;
+    const double boxSize = gridSize*spacing;
+    buildWaterSystem(system, gridSize*gridSize*gridSize, hippo);
+    system.setDefaultPeriodicBoxVectors(Vec3(boxSize, 0, 0), Vec3(0, boxSize, 0), Vec3(0, 0, boxSize));
+    hippo->setNonbondedMethod(HippoNonbondedForce::PME);
+    hippo->setCutoffDistance(0.5);
+    hippo->setSwitchingDistance(0.4);
+    hippo->setPMEParameters(3.85037, 24, 24, 24);
+    hippo->setDPMEParameters(3.85037, 20, 20, 20);
+    vector<Vec3> positions;
+    for (int x = 0; x < gridSize; x++)
+        for (int y = 0; y < gridSize; y++)
+            for (int z = 0; z < gridSize; z++) {
+                Vec3 oxygen = Vec3(x, y, z)*spacing;
+                positions.push_back(oxygen);
+                positions.push_back(oxygen+Vec3(0.09572, 0, 0));
+                positions.push_back(oxygen+Vec3(-0.02399872, 0.09266272, 0));
+            }
+    assertDeterministicForces(system, platform, [&](Context& context) {
+        context.setPositions(positions);
+        return context.getState(State::Forces).getForces();
+    });
+}
+
+void runPlatformTests() {
+    testDeterministicPmeForces();
+}
