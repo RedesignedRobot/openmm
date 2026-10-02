@@ -140,6 +140,9 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         Vec3 box[3];
         before.getPeriodicBoxVectors(box[0], box[1], box[2]);
         context.setPeriodicBoxVectors(box[0]*1.015, box[1]*1.015, box[2]*1.015);
+        // Sampled count snapshots can trigger an optional reorder in one context and not the other.
+        // Reorder both here so the flag-on and flag-off energies sum in the same atom order.
+        platform.metal(context).forceReorder();
         results.push_back(context.getState(State::Energy | State::Forces));
         vector<State> groups;
         for (int group = 0; group < 3; group++)
