@@ -90,12 +90,14 @@ void createSystem(System& system, vector<Vec3>& positions, NonbondedForce::Nonbo
     system.addForce(bonds);
 }
 
-double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
+double measureCommitsPerStep(NonbondedForce::NonbondedMethod method, bool usePmeQueue = false) {
     System system;
     vector<Vec3> positions;
     createSystem(system, positions, method);
     LangevinMiddleIntegrator integrator(300.0, 1.0, 0.002);
-    Context context(system, integrator, platform);
+    map<string, string> properties;
+    properties[MetalPlatform::MetalDisablePmeStream()] = (usePmeQueue ? "false" : "true");
+    Context context(system, integrator, platform, properties);
     ASSERT_EQUAL(precision, platform.getPropertyValue(context, MetalPlatform::MetalPrecision()));
     context.setPositions(positions);
     integrator.step(10);
@@ -108,17 +110,25 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
 }
 
 void testCommitsPerStep() {
-    // The host submits each step at most once.  With a neighbor list, the buffer holds the neighbor list
-    // and the force kernels, and is submitted before the host waits for the interaction count, if it has
+    // With PME on the main queue, the host submits each step at most once.  The buffer holds the neighbor
+    // list and force kernels, and is submitted before the host waits for the interaction count, if it has
     // to.  The rest of the step goes with the next step's neighbor list.  Steps without the wait can share
     // a buffer, and the idle commit can split a step when the GPU runs out of work.  Without a neighbor list, the step
     // is submitted after the forces, so the GPU doesn't wait for the host to ask for a result.
 
     double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
     double pme = measureCommitsPerStep(NonbondedForce::PME);
-    cout << "Commits per step: NoCutoff " << noCutoff << ", PME " << pme << endl;
+    // The separate PME queue needs two main-queue submissions per force-only step: SyncQueuePreComputation
+    // submits the positions PME reads, and SyncQueuePostComputation flushes the force pass before encoding
+    // the reciprocal-force wait at the head of the next buffer.  MetalEvent::queueWait() encodes a device
+    // event wait, with no host wait for PME, so reciprocal work can overlap the main force pass.  The PME
+    // queue's own submission is not counted here.  Force both paths regardless of the device's auto default.
+    double pmeQueue = measureCommitsPerStep(NonbondedForce::PME, true);
+    cout << "Commits per step: NoCutoff " << noCutoff << ", PME (main queue) " << pme
+         << ", PME (separate queue) " << pmeQueue << endl;
     ASSERT(noCutoff >= 0.9 && noCutoff <= 1.1);
     ASSERT(pme <= 1.1);
+    ASSERT(pmeQueue >= 1.9 && pmeQueue <= 2.1);
 }
 
 void testWorkLeftOpenAfterStep() {
