@@ -675,6 +675,20 @@ public:
         work();
     }
     /**
+     * Get how many partial sums setDeferredEnergy() stores per energy, or 0 if the platform can't leave the energy on
+     * the device.  The partial sums are doubles in double and mixed precision and floats in single.
+     */
+    virtual int getNumEnergyPartialSums() const {
+        return 0;
+    }
+    /**
+     * Make the force evaluations that follow copy the partial sums of the device part of the potential energy into
+     * dest, starting at element index*getNumEnergyPartialSums(), instead of downloading them, so the host doesn't wait
+     * for the device.  They return only the part computed on the host.  Pass NULL to download energies again.
+     */
+    virtual void setDeferredEnergy(ArrayInterface* dest, int index) {
+    }
+    /**
      * Register a global parameter whose value should be stored in the array returned by
      * getGlobalParamValues().  This may safely be called multiple times with the same
      * parameter name, and it returns the same index each time.

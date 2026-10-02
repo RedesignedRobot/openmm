@@ -556,6 +556,13 @@ public:
      * Run the work given to addAfterForcePass() since the last call, in order.
      */
     void executeAfterForcePass();
+    int getNumEnergyPartialSums() const {
+        return energySum.getSize();
+    }
+    void setDeferredEnergy(ArrayInterface* dest, int index) {
+        deferredEnergy = dest;
+        deferredEnergyIndex = index;
+    }
 private:
     friend class MetalSort;
     void releaseResources();
@@ -607,6 +614,8 @@ private:
     metalDevice_t device;
     void* pinnedBuffer;
     MetalArray energyBuffer;
+    ArrayInterface* deferredEnergy = NULL;
+    int deferredEnergyIndex = 0;
     MetalIntegrationUtilities* integration;
     MetalExpressionUtilities* expression;
     MetalBondedUtilities* bonded;

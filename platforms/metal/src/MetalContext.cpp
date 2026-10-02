@@ -908,6 +908,17 @@ double MetalContext::reduceEnergy() {
     reduceEnergyKernel->setArg(2, energyBuffer.getSize());
     reduceEnergyKernel->setArg(3, workGroupSize);
     reduceEnergyKernel->execute(workGroupSize*energySum.getSize(), workGroupSize);
+    if (deferredEnergy != NULL) {
+        size_t bytes = energySum.getSize()*energySum.getElementSize();
+        MetalQueue& queue = getCurrentStream();
+        lock_guard<recursive_mutex> guard(queue.getLock());
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::BlitCommandEncoder* blit = queue.getCommandBuffer()->blitCommandEncoder();
+        blit->copyFromBuffer(unwrap(energySum).getDevicePointer(), 0, unwrap(*deferredEnergy).getDevicePointer(), deferredEnergyIndex*bytes, bytes);
+        blit->endEncoding();
+        pool->release();
+        return 0;
+    }
     energySum.download(pinnedBuffer);
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
