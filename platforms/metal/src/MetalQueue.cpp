@@ -25,6 +25,7 @@
 #include "MetalQueue.h"
 #include "MetalContext.h"
 #include "openmm/OpenMMException.h"
+#include <unistd.h>
 
 using namespace OpenMM;
 using namespace std;
@@ -35,7 +36,7 @@ static const int MaxBuffersInFlight = 8;
 
 atomic<long long> MetalQueue::workCount(0);
 
-MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false) {
+MetalQueue::MetalQueue(metalStream_t stream) : stream(stream), openBuffer(NULL), encoder(NULL), concurrentDispatch(false), commitCount(0), stopCommitter(false), finishEvent(NULL), finishValue(0), finishedCommits(-1) {
 }
 
 MetalQueue::~MetalQueue() {
@@ -52,6 +53,8 @@ MetalQueue::~MetalQueue() {
         openBuffer->release();
     for (MTL::CommandBuffer* buffer : pending)
         buffer->release();
+    if (finishEvent != NULL)
+        finishEvent->release();
     stream->release();
 }
 
@@ -128,15 +131,34 @@ void MetalQueue::submit() {
 
 void MetalQueue::finish() {
     lock_guard<recursive_mutex> guard(lock);
+    if (openBuffer == NULL && isIdle()) {
+        commit();
+        return;
+    }
+    // A command buffer's completion wakes a waiting host 90 to 110 us after the GPU finishes on the M3 Ultra, and
+    // a download waits for that every time.  An event signaled at the end of the queue and polled every 10 us is
+    // seen within about 22 us (MetalEvent::poll).  The queue runs its command buffers in order, so the signal
+    // follows every kernel committed before it.
+    if (finishEvent == NULL)
+        finishEvent = stream->device()->newSharedEvent();
+    MTL::CommandBuffer* last = getCommandBuffer()->retain();
+    last->encodeSignalEvent(finishEvent, ++finishValue);
     commit();
-    for (MTL::CommandBuffer* buffer : pending)
-        buffer->waitUntilCompleted();
+    while (finishEvent->signaledValue() < finishValue && last->status() < MTL::CommandBufferStatusCompleted)
+        usleep(10);
+    MTL::CommandBufferStatus status = last->status();
+    string error = (status == MTL::CommandBufferStatusError ? string(last->error()->localizedDescription()->utf8String()) : "");
+    last->release();
+    if (status == MTL::CommandBufferStatusError)
+        throw OpenMMException("Error executing METAL command buffer: "+error);
+    atomic_thread_fence(memory_order_acquire);
     commit();
+    finishedCommits = commitCount;
 }
 
 bool MetalQueue::isIdle() {
     lock_guard<recursive_mutex> guard(lock);
-    return pending.empty() || pending.back()->status() >= MTL::CommandBufferStatusCompleted;
+    return pending.empty() || commitCount == finishedCommits || pending.back()->status() >= MTL::CommandBufferStatusCompleted;
 }
 
 bool MetalQueue::isDrained() {
