@@ -178,8 +178,8 @@ vector<Vec3> forces(const string& precision, bool owner, bool deterministic, boo
             ASSERT(memcmp(result.data(),next.data(),result.size()*sizeof(Vec3)) == 0);
         }
     }
-    // Energy evaluations use the default queue; the next force-only evaluation
-    // returns to the PME queue.  Both transitions must leave the same grid.
+    // Requesting energy changes the FFT path and, when enabled, the PME queue.
+    // Both transitions must preserve forces, including tilted even-grid boxes.
     auto energy=context.getState(State::Forces|State::Energy);
     ASSERT(isfinite(energy.getPotentialEnergy()));
     for (int i=0; i<(int)result.size(); i++) ASSERT_EQUAL_VEC(result[i],energy.getForces()[i],1e-5);
@@ -199,6 +199,32 @@ void testForces(const string& precision) {
         double err=0, norm=0;
         for (int i=0; i<(int)ref.size(); i++) { Vec3 d=ref[i]-owned[i]; err+=d.dot(d); norm+=ref[i].dot(ref[i]); }
         ASSERT(sqrt(err/max(norm,1e-30)) < (deterministic ? 1e-6 : 1e-4));
+    }
+}
+
+void testReferenceForces(const string& precision) {
+    // Nyquist modes in a tilted box must match the full complex Reference PME
+    // convolution, with or without energy and without owner spreading.
+    OwnerSwitch flag(false);
+    for (int gridSize : {8,12,16,20,48,64}) {
+        System system;
+        system.setDefaultPeriodicBoxVectors(Vec3(3,0,0),Vec3(0.2,3,0),Vec3(-0.1,0.3,3));
+        auto* nb=new NonbondedForce(); system.addForce(nb);
+        nb->setNonbondedMethod(NonbondedForce::PME); nb->setCutoffDistance(0.9);
+        nb->setEwaldErrorTolerance(1e-5);
+        nb->setPMEParameters(3,gridSize,gridSize,gridSize); nb->setIncludeDirectSpace(false);
+        for (double charge : {1.0,-1.0}) { system.addParticle(1); nb->addParticle(charge,1,0); }
+        vector<Vec3> positions={Vec3(0.31,0.53,0.79),Vec3(1.13,1.37,1.71)};
+        VerletIntegrator referenceIntegrator(0.001), metalIntegrator(0.001);
+        Context reference(system,referenceIntegrator,Platform::getPlatformByName("Reference"));
+        Context metal(system,metalIntegrator,platform,{{"Precision",precision},{"DeterministicForces","true"},{"DisablePmeStream","true"}});
+        reference.setPositions(positions); metal.setPositions(positions);
+        State expected=reference.getState(State::Forces|State::Energy);
+        for (bool energy : {false,true,false}) {
+            State actual=metal.getState(State::Forces|(energy ? State::Energy : 0));
+            for (int i=0; i<2; i++) ASSERT_EQUAL_VEC(expected.getForces()[i],actual.getForces()[i],1e-4);
+            if (energy) ASSERT_EQUAL_TOL(expected.getPotentialEnergy(),actual.getPotentialEnergy(),1e-5);
+        }
     }
 }
 
@@ -270,7 +296,7 @@ int main(int argc, char** argv) {
     try {
         string precision=argc > 1 ? argv[1] : "single";
         if (argc == 4 && string(argv[2]) == "--kill") return kill(precision,argv[3]);
-        testGrid(precision); testForces(precision);
+        testGrid(precision); testForces(precision); testReferenceForces(precision);
         cout << "Done" << endl;
     }
     catch (const exception& e) { cerr << e.what() << endl; return 1; }
