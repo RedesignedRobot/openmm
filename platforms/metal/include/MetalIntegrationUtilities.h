@@ -82,6 +82,8 @@ public:
      * @param tol      the constraint tolerance
      */
     bool integrateLangevinMiddle(ComputeArray& params, double tol);
+    /** Whether the prepared fused kernel can consume role forces, including all virtual sites. */
+    bool canFoldOrderedForces() const;
     /**
      * Get whether integrateLangevinMiddle() can remove center of mass motion for a CMMotionRemover.  That holds in
      * single and mixed precision when the fused kernel runs.
@@ -151,6 +153,7 @@ private:
     ComputeArray settleVsites, settleVsiteWeights;
     int numThreeParticleAverageSites;
     bool foldsVsites, vsiteForcesDistributed, vsitesPlacedByStep;
+    bool foldsOrderedForces = false;
 };
 
 } // namespace OpenMM

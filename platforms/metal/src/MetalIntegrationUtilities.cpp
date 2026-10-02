@@ -24,12 +24,14 @@
  * -------------------------------------------------------------------------- */
 
 #include "MetalIntegrationUtilities.h"
+#include "MetalNonbondedUtilities.h"
 #include "MetalContext.h"
 #include "MetalQueue.h"
 #include "MetalKernelSources.h"
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
 #include "openmm/VirtualSite.h"
+#include <cstdlib>
 
 using namespace OpenMM;
 using namespace std;
@@ -39,9 +41,10 @@ using namespace std;
 // comes two arguments before them, followed by the atom count.
 static const int MaxClearedBuffers = 4;
 static const int ClearArgument = 22;
-// With the virtual sites folded in, the SETTLE clusters' sites and weights follow the clear arguments, then the flag
-// that tells the kick to add each site's force to its atoms.
-static const int VsiteShareArgument = ClearArgument+MaxClearedBuffers+3;
+// Three ordered-force arguments follow the clear sizes.  With virtual sites folded in, the sites, weights,
+// and share flag follow those arguments.
+static const int OrderedForceArgument = ClearArgument+MaxClearedBuffers+1;
+static const int VsiteShareArgument = OrderedForceArgument+5;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
         ccmaConvergedMemory(NULL), numClearThreads(0), numBoundAutoclearBuffers(-1), clearsAutoclearBuffers(false),
@@ -151,10 +154,13 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
         vsiteForcesDistributed = false;
         return;
     }
+    if (numVsites > 0)
+        dynamic_cast<MetalContext&>(context).getNonbondedUtilities().scatterRoleForces();
     runVsiteForceKernels();
 }
 
 void MetalIntegrationUtilities::ensureVirtualSiteForcesDistributed() {
+    dynamic_cast<MetalContext&>(context).getNonbondedUtilities().scatterRoleForces();
     if (vsiteForcesDistributed)
         return;
     runVsiteForceKernels();
@@ -232,10 +238,15 @@ void MetalIntegrationUtilities::calcPendingCenterOfMassMomentum() {
     pendingCMCalc.reset();
 }
 
+bool MetalIntegrationUtilities::canFoldOrderedForces() const {
+    return langevinMiddleKernel && foldsOrderedForces && (numVsites == 0 || foldsVsites);
+}
+
 bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
     if (ccmaConstraintAtoms.isInitialized() || context.getUseDoublePrecision())
         return false;
     ContextSelector selector(context);
+    MetalNonbondedUtilities& nb = dynamic_cast<MetalContext&>(context).getNonbondedUtilities();
     if (!langevinMiddleKernel) {
         // Each unit is a SETTLE cluster, a SHAKE cluster, or free atoms: one per thread, or four per quad of threads.
 
@@ -334,6 +345,10 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        const char* fold = getenv("OPENMM_METAL_FOLD_ORDERED_FORCES");
+        foldsOrderedForces = nb.getUseRoleOrder() && (fold == NULL || string(fold) != "0");
+        if (foldsOrderedForces)
+            fusedDefines["FOLD_ORDERED_FORCES"] = "1";
         if (foldsVsites)
             fusedDefines["FOLD_VSITES"] = "1";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
@@ -369,12 +384,24 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         for (int i = 0; i < MaxClearedBuffers; i++)
             langevinMiddleKernel->addArg(nullptr);
         langevinMiddleKernel->addArg(mm_int4(0, 0, 0, 0));
+        if (foldsOrderedForces) {
+            langevinMiddleKernel->addArg(nb.getOrderedForces());
+            langevinMiddleKernel->addArg(nb.getInverseAtomOrder());
+        }
+        else {
+            langevinMiddleKernel->addArg(nullptr);
+            langevinMiddleKernel->addArg(nullptr);
+        }
+        langevinMiddleKernel->addArg(0); // Whether this force pass left role forces pending.
         if (foldsVsites) {
             langevinMiddleKernel->addArg(settleVsites);
             langevinMiddleKernel->addArg(settleVsiteWeights);
             langevinMiddleKernel->addArg(0); // Whether the kick adds the sites' forces: set just before it is executed.
         }
     }
+    if (!canFoldOrderedForces())
+        nb.scatterRoleForces();
+    langevinMiddleKernel->setArg(OrderedForceArgument+2, nb.getRoleForcesPending() ? 1 : 0);
     bool clearBuffers = bindAutoclearBuffers();
     if (context.getUseMixedPrecision())
         langevinMiddleKernel->setArg(4, tol);
@@ -393,6 +420,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         vsitesPlacedByStep = true;
     }
     langevinMiddleKernel->execute(max(numLangevinMiddleThreads, numClearThreads));
+    nb.consumeRoleForces();
     if (clearBuffers)
         dynamic_cast<MetalContext&>(context).markAutoclearBuffersCleared();
     pendingCMVelocity = NULL;
