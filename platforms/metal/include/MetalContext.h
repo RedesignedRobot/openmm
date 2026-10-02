@@ -552,6 +552,7 @@ public:
      * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
      */
     void clearAutoclearBuffersIfNeeded();
+    /**
      * Run the work given to addAfterForcePass() since the last call, in order.
      */
     void executeAfterForcePass();
