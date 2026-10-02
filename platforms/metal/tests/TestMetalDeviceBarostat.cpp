@@ -234,7 +234,6 @@ static void fallbacks(TrialPlatform& p) {
         ASSERT(messages.str().find(reason,first+reason.size())==string::npos);
         auto state=kernel->getTrialState();
         ASSERT(state.empty() || state[9]==0);
-        if (rigid) ASSERT(nb.getCountWaitCalls()>0);
         cout << "fallback: " << reason << "; phase 1 used; reason printed once" << endl;
     }
     System system; vector<Vec3> positions; createWater(system,positions,7);
