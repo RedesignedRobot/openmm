@@ -44,7 +44,14 @@ MetalAtomReorder::MetalAtomReorder(MetalContext& context) : context(context), ta
     map<string, string> defines;
     defines["LARGE_MOLECULE"] = context.intToString(LargeMolecule);
     defines["LARGE_BLOCK_SIZE"] = context.intToString(LargeBlockSize);
+    if (context.getUseDeviceBox())
+        defines["DEVICE_BOX_ENERGY"] = "1";
     ComputeProgram program = context.compileProgram(MetalKernelSources::reorderAtoms, defines);
+    if (context.getUseDeviceBox()) {
+        scaleKernel = program->createKernel("scaleMoleculeCenters");
+        for (int i = 0; i < 5; i++)
+            scaleKernel->addArg();
+    }
     bool mixed = context.getUseMixedPrecision();
     keysKernel = program->createKernel("computeMoleculeKeys");
     for (int i = 0; i < 15; i++)
@@ -64,6 +71,11 @@ MetalAtomReorder::MetalAtomReorder(MetalContext& context) : context(context), ta
     scratchOffsets.reset(new MetalArray(context, paddedNumAtoms, sizeof(mm_int4), "reorderScratchOffsets"));
     nanFlag.reset(new MetalArray(context, 1, sizeof(int), "reorderNaNFlag"));
     *(int*) nanFlag->getDevicePointer()->contents() = 0;
+    if (context.getUseDeviceBox()) {
+        cellOffsets.reset(new MetalArray(context, context.getNumAtoms(), sizeof(mm_int4), "reorderCellOffsets"));
+        memset(cellOffsets->getDevicePointer()->contents(), 0, context.getNumAtoms()*sizeof(mm_int4));
+        deviceOffsetsStale = false;
+    }
 }
 
 bool MetalAtomReorder::buildTables() {
@@ -144,35 +156,38 @@ bool MetalAtomReorder::apply() {
 
     // Bins as in ComputeContext::findAtomOrder() for a periodic system, whose range is the box.
 
-    Vec3 box[3];
-    context.getPeriodicBoxVectors(box[0], box[1], box[2]);
-    float boxSize[3] = {(float) box[0][0], (float) box[1][1], (float) box[2][2]};
-    float hilbertWidth = (float) (max(max(boxSize[0], boxSize[1]), boxSize[2])/255.0);
-    float invHilbertWidth = (float) (1.0/hilbertWidth);
     float zigzagWidth = (float) (0.2*context.getNonbondedUtilities().getMaxCutoffDistance());
     float invZigzagWidth = (float) (1.0/zigzagWidth);
-    int zigzagBins[3];
-    for (int i = 0; i < 3; i++)
-        zigzagBins[i] = 1+(int) (boxSize[i]*invZigzagWidth);
-    if ((long long) zigzagBins[0]*zigzagBins[1]*(zigzagBins[2]+1) >= MaxBins)
-        return false;
+    float invHilbertWidth = 0;
+    int zigzagBins[3] = {};
+    mm_float4 hi[3] = {}, lo[3] = {}, invBoxSize = {};
+    if (!context.getUseDeviceBox()) {
+        Vec3 box[3];
+        context.getPeriodicBoxVectors(box[0], box[1], box[2]);
+        float boxSize[3] = {(float) box[0][0], (float) box[1][1], (float) box[2][2]};
+        float hilbertWidth = (float) (max(max(boxSize[0], boxSize[1]), boxSize[2])/255.0);
+        invHilbertWidth = (float) (1.0/hilbertWidth);
+        for (int i = 0; i < 3; i++)
+            zigzagBins[i] = 1+(int) (boxSize[i]*invZigzagWidth);
+        if ((long long) zigzagBins[0]*zigzagBins[1]*(zigzagBins[2]+1) >= MaxBins)
+            return false;
+        for (int i = 0; i < 3; i++) {
+            float h[3], l[3];
+            for (int j = 0; j < 3; j++) {
+                h[j] = (float) box[i][j];
+                l[j] = (float) (box[i][j]-h[j]);
+            }
+            hi[i] = mm_float4(h[0], h[1], h[2], 0);
+            lo[i] = mm_float4(l[0], l[1], l[2], 0);
+        }
+        invBoxSize = mm_float4((float) (1.0/box[0][0]), (float) (1.0/box[1][1]), (float) (1.0/box[2][2]), 0);
+    }
     if (deviceOffsetsStale)
         uploadCellOffsets();
     int numMolecules = molecules->getSize();
     int numAtoms = context.getNumAtoms();
     int paddedNumAtoms = context.getPaddedNumAtoms();
     bool mixed = context.getUseMixedPrecision();
-    mm_float4 hi[3], lo[3];
-    for (int i = 0; i < 3; i++) {
-        float h[3], l[3];
-        for (int j = 0; j < 3; j++) {
-            h[j] = (float) box[i][j];
-            l[j] = (float) (box[i][j]-h[j]);
-        }
-        hi[i] = mm_float4(h[0], h[1], h[2], 0);
-        lo[i] = mm_float4(l[0], l[1], l[2], 0);
-    }
-    mm_float4 invBoxSize((float) (1.0/box[0][0]), (float) (1.0/box[1][1]), (float) (1.0/box[2][2]), 0);
     int arg = 0;
     keysKernel->setArg(arg++, numMolecules);
     keysKernel->setArg(arg++, *molecules);
@@ -269,4 +284,31 @@ void MetalAtomReorder::hostChanged() {
     // is clear keeps the workers from fighting over one cache line.
     if (!deviceOffsetsStale.load(memory_order_relaxed))
         deviceOffsetsStale.store(true, memory_order_relaxed);
+}
+
+MetalArray& MetalAtomReorder::getCellOffsets() {
+    if (deviceOffsetsStale)
+        uploadCellOffsets();
+    return *cellOffsets;
+}
+
+void MetalAtomReorder::deviceOffsetsChanged() {
+    deviceOffsetsStale = false;
+    hostStale = true;
+}
+
+void MetalAtomReorder::prepareScale() {
+    if (tablesVersion != context.getMoleculeGroupsVersion())
+        buildTables();
+    if (!tablesUsable)
+        throw OpenMMException("Device box scaling does not support this molecule layout");
+}
+
+void MetalAtomReorder::scaleCoordinates(MetalArray& scaleFactor) {
+    scaleKernel->setArg(0, molecules->getSize());
+    scaleKernel->setArg(1, *molecules);
+    scaleKernel->setArg(2, *templateAtoms);
+    scaleKernel->setArg(3, context.getPosq());
+    scaleKernel->setArg(4, scaleFactor);
+    scaleKernel->execute(molecules->getSize());
 }

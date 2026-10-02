@@ -335,9 +335,20 @@ void MetalApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context) {
 void MetalUpdateStateDataKernel::getForces(ContextImpl& context, vector<Vec3>& forces) {
     cu.getIntegrationUtilities().ensureVirtualSiteForcesDistributed();
     CommonUpdateStateDataKernel::getForces(context, forces);
+    cu.resolveDeviceBox();
 }
 
 void MetalUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c) {
+    if (cu.getUseDeviceBox()) {
+        if (!cu.getBoxIsTriclinic() && (b[0] != 0 || c[0] != 0 || c[1] != 0))
+            throw OpenMMException("The box shape has changed from rectangular to triclinic.  Reinitialize the Context with a triclinic default box.");
+        ContextSelector selector(cu);
+        // Context construction stages the default box before the reorder object exists.
+        if (cu.getNonbondedUtilities().getAtomReorder() != nullptr)
+            cu.unwrapDevicePositions();
+        cu.setPeriodicBoxVectors(a, b, c);
+        return;
+    }
     vector<mm_int4>& offsets = cu.getPosCellOffsets();
     bool wrapped = any_of(offsets.begin(), offsets.end(), [] (const mm_int4& o) { return o.x != 0 || o.y != 0 || o.z != 0; });
     if (wrapped) {

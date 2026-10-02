@@ -614,7 +614,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
     KernelSet& kernels = groupKernels[forceGroups];
-    if (useCutoff && usePeriodic) {
+    if (useCutoff && usePeriodic && !context.getUseDeviceBox()) {
         double4 box = context.getPeriodicBoxSize();
         double minAllowedSize = 1.999999*maxCutoff;
         if (box.x < minAllowedSize || box.y < minAllowedSize || box.z < minAllowedSize)

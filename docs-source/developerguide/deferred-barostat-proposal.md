@@ -341,76 +341,71 @@ the barostat and cache entries in `lanes/r3-step.md`; and
 `/tmp/openmm-metal-bench/ultra-lead/STATE.md` core-team list. The third-force-pass
 cache, keep-alive and integrator/PME changes are not part of this proposal.
 
-### Phase 2a host-controlled prerequisite
+### Phase 2a device box
 
-`OPENMM_METAL_DEVICE_BOX=1` now selects a Metal buffer for periodic kernel
-arguments. The switch defaults off. The current scope is the host-controlled
-subset of phase 2a. It does not expose device scaling or claim device-authoritative
-host observations. The isotropic barostat still proposes, accepts and rejects
-moves on the host. Phase 1 deferred energies and the ordered-force save remain
-in place.
+`OPENMM_METAL_DEVICE_BOX=1` selects a Metal buffer as the periodic box authority.
+The flag defaults off. Unsupported force types, CPU PME and non-PME
+NonbondedForce methods disable it for the whole context. CUDA and OpenCL keep
+their existing behavior. The host barostat still proposes, accepts and rejects
+moves, including the phase-1 deferred energy transaction. Device Metropolis and
+RNG remain phase 2b.
 
-The buffer contains float box vectors, size and inverse size, reciprocal
-vectors, reorder high/low words and bin parameters, full host vectors for mixed
-unwrapping, and volume. Metal argument reflection binds named periodic values
-to byte offsets in this buffer. Both separate arguments and packed scalar
-arguments use this route. It covers neighbor bounds and pair construction,
-direct-space nonbonded and periodic bonded interactions, PME index/spread,
-energy/convolution/interpolation, fused FFT convolution, molecule wrapping and
-reordering, and barostat coordinate scaling. Dispersion and neutralizing-plasma
-volume corrections read the same state. The volume and coefficient enter the
-kernel as host double values, including in single mode; Metal's df64 arithmetic
-evaluates their ratio. The result occupies a separate reduction slot before the
-host double sum. Deferred barostat snapshots include that slot.
+The buffer stores float box vectors, size and inverse size, reciprocal vectors,
+reorder high/low words and bin parameters, IEEE double vectors, and volume.
+Argument reflection binds periodic kernel parameters to this buffer, including
+packed arguments. Forces, PME, virtual sites, bonded terms, reordering and
+volume corrections therefore consume the same queued box state.
 
-Each host `setPeriodicBoxVectors()` stages one 320-byte copy per Metal context.
-The source allocation stays alive through the command buffer's retained
-resources. The copy is ordered after previously encoded consumers. It does not
-wait for the queue and never overwrites the live buffer from the CPU. An accepted
-barostat trial stages one box copy. A rejected trial stages two, one for the
-proposal and one for the restored box. Initialization also refreshes the buffer
-after the nonbonded cutoff is known, so reorder bin counts are correct.
+`MetalContext::scaleDeviceBox(MetalArray&)` accepts one IEEE double scale factor
+in a device buffer. The caller must supply a positive finite isotropic scale.
+The entry point prepares the molecule tables, unwraps positions using the old
+box and device cell offsets, clears those offsets, translates each rigid
+molecule by its center times `(scale-1)`, scales the box and rebuilds every
+force consumer's derived field. It marks the host box dirty, invalidates forces
+and the neighbor list, and notifies the integrator's cached force state. These
+operations enter the same command stream with no explicit host wait. The
+coordinate translation matches `scaleCoordinates`: it modifies float position
+words and preserves mixed corrections. Large molecules use a serial sum in the
+new kernel, so rounding can differ from the host barostat's parallel reduction.
+Layouts outside GPU reorder's group and molecule limits reject scaling before
+positions change. CPU reorder fallback resolves the box through its existing
+box getter on that rare path.
 
-The flag-off signature rewriting, reflected argument sizes and encoded scalar
-bytes stay on the original path. Unsupported force types, CPU PME and non-PME
-NonbondedForce methods disable the switch for the entire context and print the
-reason. CUDA and OpenCL keep their original volume corrections.
+Reorder bin widths and counts are computed on the device after each box change.
+A zigzag range that cannot fit the packed key selects the existing bounded
+Hilbert curve on the GPU. Cutoff validation also runs on the device after each
+box update. It records an error for the next host observation, with no wait in
+plain stepping or scaling. The error survives intervening box updates until
+an observation reports it.
 
-Device scaling remains blocked on CPU reorder fallback and bin-overflow checks,
-host cutoff validation, host box getters and checkpoint serialization, and host
-cell-offset ownership. The enabled Metal path now skips common periodic argument
-setup, PME host reciprocal construction, and parameter-offset plasma host volume
-calculation. Host box updates also skip the unused old-box read and upload for
-unwrapping. Those arguments bind directly to the device box. Other host readers
-must stop resolving the box during stepping before any lazy getter is added.
-A future device update must rebuild every derived buffer field and preserve the
-exact host vectors for observations. It must also order updates across the PME
-queue, handle saved barostat state, invalidate forces and neighbor lists, and
-provide device cutoff error reporting. No partially implemented scale entry
-point is available.
+Host `setPeriodicBoxVectors()` unwraps positions and clears cell offsets on the
+device, then stages one ordered 320-byte box copy. The live buffer is never
+written from the CPU while queued consumers can read it. Reorder owns the
+current device cell offsets; explicit host changes upload a fresh allocation.
+Box getters lazily resolve the IEEE vectors and pending cutoff error. Kernel
+pointer getters never resolve. `getState` and checkpoints use the existing
+common observation paths, which now reach the lazy box getters and synchronized
+atom order and offsets. Loading a checkpoint restores those mirrors and uploads
+the restored box. The host barostat save and restore implementation is unchanged.
 
-`TestMetalDeviceBox [single|mixed|all [system.xml state.xml integrator.xml]]` checks packed and
-unpacked buffer binding with poisoned host scalars, 19,652-atom TIP4P-Ew PME water with
-role ordering, neutral and charged volume terms including parameter offsets, scaled host box updates,
-checkpoint reload, unsupported-force fallback, and 1000 LangevinMiddle steps
-with a barostat every 25 steps. The optional XML files add the FAH unit and its
-integrator to the host-update checks. The test compares the switch unset with the switch set in
-each precision. Device scaling and checkpoints after device scaling are not
-covered because the entry point is intentionally absent.
+The flag-on path skips host periodic argument calculations in the common
+kernel helper, PME setup, bonded dispatch, virtual-site position updates and
+virtual-site force redistribution. These skips prevent dirty box resolution
+inside normal stepping. The source audit finds zero waits in the enabled GPU
+reorder path and zero in the scale entry point. Host observations and the
+existing host barostat transaction may wait.
 
-The round-2 stage-1 batch passed in single and mixed precision: neutral and
-charged water, the 1000-step barostat trajectories, and the 38,876-particle FAH
-unit. Under DeterministicForces, total and group forces match bitwise. Each group
-energy must agree within 1e-7 times its flag-off magnitude, and total energy must
-agree within 1e-8 times the sum of flag-off group magnitudes. Checkpoint reload
-reproduces forces and energy exactly. Round 1's 7.6e-9 direct-space relative
-energy delta passes this corrected criterion and likely reflects compiler
-code-shape differences in energy accumulation.
-
-The phase-1 deferred-energy test passes with the device-box flag both off and on
-in both precisions. The FAH ordered-force fold also matches positions, velocities,
-and boxes bitwise at all 50 checked steps with the device-box flag on. Its synthetic
-CutoffPeriodic fixture exercises the unsupported-context fallback instead.
-These results validate the host-controlled subset; device scaling, lazy host
-observations, and the fresh Reference comparison remain unfinished. The flag
-stays off by default. The handoff report records the remaining CPU dependencies.
+`TestMetalDeviceBox [single|mixed|all [system.xml state.xml integrator.xml]]`
+retains the round-2 host-update, binding, charged PME, parameter-offset,
+checkpoint and 1000-step host-barostat coverage. It adds bin overflow, device
+scale versus host box update plus `scaleCoordinates`, reported coordinate
+rounding deltas, bitwise Metal forces on identical copied inputs, Reference
+forces and energy, checkpoint restoration into a fresh context, deferred cutoff
+errors, and 200 LangevinMiddle steps with eight device scales and no intervening
+host observations. Group energy tolerance is `1e-7` of group magnitude; total
+Metal energy tolerance is `1e-8` of summed group magnitudes. Reference tolerance
+is `1e-4` force relative RMS in both precisions, keeping automatic PME grids.
+Device scaling must be no worse than host scaling against Reference on the same
+box; the bitwise Metal force comparison establishes that condition. Energy tolerance is
+`1e-5` of summed group magnitudes. The round-3 handoff records runtime results
+and any remaining limitations; the implementation alone is not validation.

@@ -71,6 +71,8 @@ class OPENMM_EXPORT_COMMON MetalNonbondedUtilities : public NonbondedUtilities  
 public:
     MetalNonbondedUtilities(MetalContext& context);
     ~MetalNonbondedUtilities();
+    MetalAtomReorder* getAtomReorder() { return atomReorder.get(); }
+    void invalidateNeighborList() { forceRebuildNeighborList = true; }
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *

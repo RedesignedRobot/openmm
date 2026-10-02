@@ -27,6 +27,7 @@
   #define _USE_MATH_DEFINES // Needed to get M_PI
 #endif
 #include "MetalContext.h"
+#include "MetalAtomReorder.h"
 #include "MetalArray.h"
 #include "MetalBondedUtilities.h"
 #include "MetalEvent.h"
@@ -542,10 +543,31 @@ void MetalContext::initialize() {
     findMoleculeGroups();
     nonbonded->initialize(system);
     if (useDeviceBox) {
+        auto program = compileProgram(MetalKernelSources::deviceBox, {{"DEVICE_BOX_ENERGY", "1"}});
+        deviceBoxReorderBins = program->createKernel("updateBoxReorderBins");
+        deviceBoxReorderBins->addArg(deviceBox);
+        float zigzagWidth = (float) (0.2*nonbonded->getMaxCutoffDistance());
+        deviceBoxReorderBins->addArg((float) (1.0/zigzagWidth));
+        deviceBoxError.initialize<int>(*this, 1, "deviceBoxError");
+        *(int*) deviceBoxError.getDevicePointer()->contents() = 0;
+        deviceBoxReorderBins->addArg(deviceBoxError);
+        deviceBoxReorderBins->addArg(1.999999*nonbonded->getMaxCutoffDistance());
+        deviceBoxScale = program->createKernel("scaleBox");
+        deviceBoxScale->addArg(deviceBox);
+        deviceBoxScale->addArg();
+        deviceBoxUnwrap = compileProgram(MetalKernelSources::unwrapPositions)->createKernel("unwrapPositions");
+        deviceBoxUnwrap->addArg(numAtoms);
+        deviceBoxUnwrap->addArg(posq);
+        if (useMixedPrecision)
+            deviceBoxUnwrap->addArg(posqCorrection);
+        else
+            deviceBoxUnwrap->addArg(nullptr);
+        deviceBoxUnwrap->addArg();
+        deviceBoxUnwrap->addArg(nullptr); // Replaced by the authoritative box binding.
         Vec3 a, b, c;
         getPeriodicBoxVectors(a, b, c);
         uploadDeviceBox(a, b, c);
-        deviceBoxEnergy = compileProgram(MetalKernelSources::deviceBox, {{"DEVICE_BOX_ENERGY", "1"}})->createKernel("addBoxEnergy");
+        deviceBoxEnergy = program->createKernel("addBoxEnergy");
         deviceBoxEnergyBuffer.initialize(*this, 4, energyBuffer.getElementSize(), "deviceBoxEnergy");
         addAutoclearBuffer(deviceBoxEnergyBuffer);
         deviceBoxEnergy->addArg(deviceBox);
@@ -573,14 +595,6 @@ void MetalContext::uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c) 
         put(208+32*i, make_double4(v[0], v[1], v[2], 0));
     }
     put(176, make_float4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0));
-    float width = (float) (max(max((float) a[0], (float) b[1]), (float) c[2])/255.0);
-    put(192, (float) (1.0/width));
-    if (nonbonded != nullptr && nonbonded->getMaxCutoffDistance() > 0) {
-        float zigzagWidth = (float) (0.2*nonbonded->getMaxCutoffDistance());
-        float invWidth = (float) (1.0/zigzagWidth);
-        put(196, 1+(int) ((float) a[0]*invWidth));
-        put(200, 1+(int) ((float) b[1]*invWidth));
-    }
     put(204, (float) (a[0]*b[1]*c[2]));
     put(304, a[0]*b[1]*c[2]);
     auto staging = NS::TransferPtr(device->newBuffer(bytes, sizeof(bytes), MTL::ResourceStorageModeShared));
@@ -591,6 +605,67 @@ void MetalContext::uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c) 
     auto blit = queue.getCommandBuffer()->blitCommandEncoder();
     blit->copyFromBuffer(staging.get(), 0, deviceBox.getDevicePointer(), 0, sizeof(bytes));
     blit->endEncoding();
+    if (deviceBoxReorderBins) {
+        deviceBoxReorderBins->execute(1, 1);
+        boxValidationPending = true;
+    }
+}
+
+void MetalContext::resolveDeviceBox() const {
+    if (!useDeviceBox || (!boxHostStale && !boxValidationPending))
+        return;
+    MetalContext& self = const_cast<MetalContext&>(*this);
+    self.getCurrentStream().finish();
+    if (boxHostStale) {
+        double4 vectors[3];
+        memcpy(vectors, (char*) self.deviceBox.getDevicePointer()->contents()+208, sizeof(vectors));
+        self.updateHostBox(Vec3(vectors[0].x, vectors[0].y, vectors[0].z),
+                           Vec3(vectors[1].x, vectors[1].y, vectors[1].z),
+                           Vec3(vectors[2].x, vectors[2].y, vectors[2].z));
+        self.boxHostStale = false;
+    }
+    self.boxValidationPending = false;
+    int& error = *(int*) self.deviceBoxError.getDevicePointer()->contents();
+    if (error) {
+        error = 0;
+        throw OpenMMException("The periodic box size has decreased to less than twice the nonbonded cutoff.");
+    }
+}
+
+MetalArray& MetalContext::getDeviceCellOffsets() {
+    auto reorder = nonbonded->getAtomReorder();
+    if (!reorder)
+        throw OpenMMException("Device box updates require periodic GPU atom reordering");
+    return reorder->getCellOffsets();
+}
+
+void MetalContext::deviceCellOffsetsChanged() {
+    nonbonded->getAtomReorder()->deviceOffsetsChanged();
+}
+
+void MetalContext::unwrapDevicePositions() {
+    deviceBoxUnwrap->setArg(3, getDeviceCellOffsets());
+    deviceBoxUnwrap->execute(numAtoms);
+    deviceCellOffsetsChanged();
+}
+
+void MetalContext::scaleDeviceBox(MetalArray& scaleFactor) {
+    if (!useDeviceBox || !nonbonded->getAtomReorder())
+        throw OpenMMException("Device box scaling requires OPENMM_METAL_DEVICE_BOX and periodic GPU reordering");
+    if (scaleFactor.getSize() != 1 || scaleFactor.getElementSize() != sizeof(double))
+        throw OpenMMException("Device box scale factor must contain one IEEE double");
+    // Prepare tables before modifying positions, so unsupported molecule layouts fail without a partial scale.
+    nonbonded->getAtomReorder()->prepareScale();
+    unwrapDevicePositions();
+    nonbonded->getAtomReorder()->scaleCoordinates(scaleFactor);
+    deviceBoxScale->setArg(1, scaleFactor);
+    deviceBoxScale->execute(1, 1);
+    deviceBoxReorderBins->execute(1, 1);
+    boxHostStale = true;
+    boxValidationPending = true;
+    nonbonded->invalidateNeighborList();
+    setForcesValid(false);
+    getContextImpl()->systemChanged();
 }
 
 void MetalContext::addDeviceBoxEnergy(double coefficient) {
@@ -1075,6 +1150,7 @@ void MetalContext::enqueueEnergy(MetalArray& result, int groups, double& forceEn
 
 double MetalContext::readEnergy(MetalArray& buffer) {
     buffer.download(pinnedBuffer);
+    resolveDeviceBox();
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
         for (int i = 0; i < buffer.getSize(); i++)

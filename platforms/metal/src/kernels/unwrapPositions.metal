@@ -4,12 +4,15 @@
  * common setPeriodicBoxVectors() does on the host through a download and an upload of every position.
  */
 KERNEL void unwrapPositions(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection,
-        GLOBAL const int4* RESTRICT cellOffsets,
+        GLOBAL int4* RESTRICT cellOffsets,
         GLOBAL const mixed4* RESTRICT deviceBoxVectors) {
     GLOBAL const mixed4* box = deviceBoxVectors;
     const mixed4 a = box[0], b = box[1], c = box[2];
     for (int atom = GLOBAL_ID; atom < numAtoms; atom += GLOBAL_SIZE) {
         const int4 offset = cellOffsets[atom];
+#ifdef USE_DEVICE_BOX
+        cellOffsets[atom] = make_int4(0, 0, 0, 0);
+#endif
         if (offset.x == 0 && offset.y == 0 && offset.z == 0)
             continue;
         const mixed ox = (mixed) offset.x, oy = (mixed) offset.y, oz = (mixed) offset.z;

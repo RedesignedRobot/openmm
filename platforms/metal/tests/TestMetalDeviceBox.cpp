@@ -4,6 +4,7 @@
 #include "MetalContext.h"
 #include "MetalPlatform.h"
 #include "openmm/Context.h"
+#include "openmm/kernels.h"
 #include "openmm/CustomExternalForce.h"
 #include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/MonteCarloBarostat.h"
@@ -28,6 +29,7 @@ using namespace std;
 
 class BoxPlatform : public MetalPlatform {
 public:
+    ContextImpl& impl(Context& context) const { return getContextImpl(context); }
     MetalContext& metal(Context& context) const {
         return *static_cast<PlatformData*>(getContextImpl(context).getPlatformData())->contexts[0];
     }
@@ -88,9 +90,7 @@ static void createWater(System& system, vector<Vec3>& positions, int side) {
             }
 }
 
-static void compare(const State& expected, const State& found, double energyTolerance) {
-    double energy = expected.getPotentialEnergy();
-    ASSERT(isfinite(found.getPotentialEnergy()));
+static void compareForces(const State& expected, const State& found) {
     ASSERT_EQUAL(expected.getForces().size(), found.getForces().size());
     for (int i = 0; i < expected.getForces().size(); i++) {
         for (int j = 0; j < 3; j++) {
@@ -98,6 +98,12 @@ static void compare(const State& expected, const State& found, double energyTole
             ASSERT(memcmp(&a, &b, sizeof(double)) == 0);
         }
     }
+}
+
+static void compare(const State& expected, const State& found, double energyTolerance) {
+    double energy = expected.getPotentialEnergy();
+    ASSERT(isfinite(found.getPotentialEnergy()));
+    compareForces(expected, found);
     cout << "energy expected=" << energy << " found=" << found.getPotentialEnergy()
          << " absolute delta=" << abs(energy-found.getPotentialEnergy())
          << " tolerance=" << energyTolerance << " forces=bitwise" << endl;
@@ -112,7 +118,7 @@ template<class T> static unique_ptr<T> readXml(const string& path) {
 
 static void testHostUpdate(BoxPlatform& platform, System& system, const State* initial, const vector<Vec3>& positions,
         const string& integratorPath = "") {
-    vector<State> results;
+    vector<State> results, initialResults;
     vector<vector<State>> groupStates;
     for (int i = 0; i < system.getNumForces(); i++) {
         auto* nb = dynamic_cast<NonbondedForce*>(&system.getForce(i));
@@ -129,6 +135,7 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         context.computeVirtualSites();
         // This first evaluation wraps and reorders the molecules before the host changes the box.
         State before = context.getState(State::Energy | State::Forces);
+        initialResults.push_back(before);
         ASSERT(platform.metal(context).getNonbondedUtilities().getUseRoleOrder());
         Vec3 box[3];
         before.getPeriodicBoxVectors(box[0], box[1], box[2]);
@@ -148,6 +155,8 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         restored.getPeriodicBoxVectors(found[0], found[1], found[2]);
         for (int i = 0; i < 3; i++) ASSERT_EQUAL_VEC(box[i]*1.015, found[i], 1e-12);
     }
+    compareForces(initialResults[0], initialResults[1]);
+    cout << "Initial context forces=bitwise" << endl;
     double magnitude = 0;
     for (int group = 0; group < 3; group++) {
         double off = groupStates[0][group].getPotentialEnergy();
@@ -156,6 +165,122 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         compare(groupStates[0][group], groupStates[1][group], 1e-7*abs(off));
     }
     compare(results[0], results[1], 1e-8*magnitude);
+}
+
+static void testDeviceScale(BoxPlatform& platform, System& system, const State* initial,
+        const vector<Vec3>& positions, bool trajectory) {
+    setDeviceBox(true);
+    LangevinMiddleIntegrator integrator(300, 1, 0.001);
+    integrator.setRandomNumberSeed(2026);
+    Context device(system, integrator, platform);
+    auto& metal = platform.metal(device);
+    ASSERT(metal.getUseDeviceBox());
+    if (initial) device.setState(*initial);
+    else device.setPositions(positions);
+    device.computeVirtualSites();
+    device.getState(State::Energy); // Reorder and wrap before scaling.
+    stringstream original;
+    device.createCheckpoint(original);
+
+    setDeviceBox(false);
+    LangevinMiddleIntegrator hostIntegrator(300, 1, 0.001);
+    Context host(system, hostIntegrator, platform);
+    host.loadCheckpoint(original);
+    Kernel barostat = platform.createKernel(ApplyMonteCarloBarostatKernel::Name(), platform.impl(host));
+    MonteCarloBarostat thermostat(1, 300);
+    auto& hostScale = barostat.getAs<ApplyMonteCarloBarostatKernel>();
+    hostScale.initialize(system, thermostat, 1, true);
+    hostScale.saveCoordinates(platform.impl(host));
+    Vec3 box[3];
+    device.getState(0).getPeriodicBoxVectors(box[0], box[1], box[2]);
+    const double scale = 1.015;
+    MetalArray factor(metal, 1, sizeof(double), "scaleFactor");
+    factor.upload(vector<double>{scale});
+    metal.scaleDeviceBox(factor);
+    host.setPeriodicBoxVectors(box[0]*scale, box[1]*scale, box[2]*scale);
+    hostScale.scaleCoordinates(platform.impl(host), scale, scale, scale, 0, 0, 0);
+    State scaled = device.getState(State::Positions);
+    State hostScaled = host.getState(State::Positions);
+    Vec3 scaledBox[3];
+    scaled.getPeriodicBoxVectors(scaledBox[0], scaledBox[1], scaledBox[2]);
+    for (int i = 0; i < 3; i++) ASSERT_EQUAL_VEC(box[i]*scale, scaledBox[i], 1e-12);
+    double maxDelta = 0;
+    for (int i = 0; i < system.getNumParticles(); i++)
+        for (int j = 0; j < 3; j++)
+            maxDelta = max(maxDelta, abs(scaled.getPositions()[i][j]-hostScaled.getPositions()[i][j]));
+    cout << "device scale max coordinate delta=" << maxDelta << endl;
+    ASSERT(maxDelta < 2e-5);
+
+    // Normalize both coordinate representations to identical copied inputs before force comparisons.
+    host.setPeriodicBoxVectors(scaledBox[0], scaledBox[1], scaledBox[2]);
+    host.setPositions(scaled.getPositions());
+    device.setPositions(scaled.getPositions());
+    double magnitude = 0;
+    for (int group = 0; group < 3; group++) {
+        State expected = host.getState(State::Energy | State::Forces, false, 1<<group);
+        magnitude += abs(expected.getPotentialEnergy());
+        compare(expected, device.getState(State::Energy | State::Forces, false, 1<<group),
+                1e-7*abs(expected.getPotentialEnergy()));
+    }
+    State expected = host.getState(State::Energy | State::Forces);
+    compare(expected, device.getState(State::Energy | State::Forces), 1e-8*magnitude);
+    VerletIntegrator referenceIntegrator(0.001);
+    Context reference(system, referenceIntegrator, Platform::getPlatformByName("Reference"));
+    if (initial) reference.setState(*initial);
+    reference.setPeriodicBoxVectors(scaledBox[0], scaledBox[1], scaledBox[2]);
+    reference.setPositions(scaled.getPositions());
+    State ref = reference.getState(State::Energy | State::Forces);
+    double error2 = 0, force2 = 0;
+    for (int i = 0; i < system.getNumParticles(); i++) {
+        Vec3 delta = expected.getForces()[i]-ref.getForces()[i];
+        error2 += delta.dot(delta);
+        force2 += ref.getForces()[i].dot(ref.getForces()[i]);
+    }
+    double relativeRms = sqrt(error2/force2);
+    cout << "scaled Reference force relative RMS=" << relativeRms
+         << " energy delta/group magnitude=" << abs(expected.getPotentialEnergy()-ref.getPotentialEnergy())/magnitude << endl;
+    // Bitwise equality above makes both Metal paths equally accurate against Reference with automatic PME grids.
+    ASSERT(relativeRms < 1e-4);
+    ASSERT(abs(expected.getPotentialEnergy()-ref.getPotentialEnergy()) < 1e-5*magnitude);
+
+    // Save with a dirty host box, then restore the device-scaled state into a fresh context.
+    metal.scaleDeviceBox(factor);
+    stringstream checkpoint;
+    device.createCheckpoint(checkpoint);
+    State saved = device.getState(State::Energy | State::Forces | State::Positions);
+    setDeviceBox(true);
+    LangevinMiddleIntegrator restoredIntegrator(300, 1, 0.001);
+    Context restored(system, restoredIntegrator, platform);
+    restored.loadCheckpoint(checkpoint);
+    double checkpointMagnitude = 0;
+    for (int group = 0; group < 3; group++)
+        checkpointMagnitude += abs(device.getState(State::Energy, false, 1<<group).getPotentialEnergy());
+    compare(saved, restored.getState(State::Energy | State::Forces), 1e-8*checkpointMagnitude);
+    Vec3 savedBox[3], restoredBox[3];
+    saved.getPeriodicBoxVectors(savedBox[0], savedBox[1], savedBox[2]);
+    State restoredState = restored.getState(State::Positions);
+    restoredState.getPeriodicBoxVectors(restoredBox[0], restoredBox[1], restoredBox[2]);
+    for (int i = 0; i < 3; i++) ASSERT_EQUAL_VEC(savedBox[i], restoredBox[i], 0);
+    for (int i = 0; i < system.getNumParticles(); i++)
+        ASSERT_EQUAL_VEC(saved.getPositions()[i], restoredState.getPositions()[i], 0);
+
+    if (trajectory) {
+        device.setVelocitiesToTemperature(300, 2026);
+        factor.upload(vector<double>{1.0002});
+        for (int i = 0; i < 8; i++) {
+            integrator.step(25);
+            metal.scaleDeviceBox(factor);
+        }
+        ASSERT(isfinite(device.getState(State::Energy).getPotentialEnergy()));
+        cout << "200 steps with eight device scales and no intermediate observations passed" << endl;
+    }
+    // A bad cutoff is detected on the device and reported only when the host observes it.
+    factor.upload(vector<double>{0.1});
+    metal.scaleDeviceBox(factor);
+    bool caught = false;
+    try { device.getState(State::Positions); }
+    catch (const OpenMMException& e) { caught = string(e.what()).find("twice the nonbonded cutoff") != string::npos; }
+    ASSERT(caught);
 }
 
 // Poison the encoded scalar so this fails if an argument is silently copied with setBytes.
@@ -184,6 +309,25 @@ static void testBinding(BoxPlatform& platform) {
             vector<float> values;
             result.download(values);
             ASSERT_EQUAL_TOL(enabled ? 6*0.31 : 7.0, values[0], 1e-7);
+        }
+        if (enabled) {
+            vector<Vec3> positive = positions;
+            for (auto& p : positive) p[1] += 6*0.31;
+            context.setPositions(positive);
+            context.setPeriodicBoxVectors(Vec3(1e6, 0, 0), Vec3(0, 1e6, 0), Vec3(0, 0, 1e6));
+            auto probe = metal.compileProgram("KERNEL void probeBins(GLOBAL int* result, int zigzagXBins) { result[0] = zigzagXBins; }")->createKernel("probeBins");
+            MetalArray result(metal, 1, sizeof(int), "overflowProbe");
+            probe->addArg(result);
+            probe->addArg(0);
+            probe->execute(1, 1);
+            vector<int> bins;
+            result.download(bins);
+            ASSERT_EQUAL(-1, bins[0]);
+            metal.forceReorder();
+            metal.reorderAtoms();
+            State reordered = context.getState(State::Positions);
+            for (int i = 0; i < positions.size(); i++)
+                ASSERT_EQUAL_VEC(positive[i], reordered.getPositions()[i], 2e-6);
         }
     }
     setDeviceBox(true);
@@ -244,6 +388,7 @@ int main(int argc, char* argv[]) {
             createWater(water, positions, 17);
             cout << "PME water atoms=" << water.getNumParticles() << endl;
             testHostUpdate(platform, water, nullptr, positions);
+            testDeviceScale(platform, water, nullptr, positions, true);
             // Nonzero net charge exercises the volume correction as well as neutral water.
             auto& nb = dynamic_cast<NonbondedForce&>(water.getForce(0));
             nb.setParticleParameters(3, -0.94844, 1, 0);
@@ -259,6 +404,7 @@ int main(int argc, char* argv[]) {
                 auto initial = readXml<State>(argv[3]);
                 cout << "FAH XML atoms=" << system->getNumParticles() << endl;
                 testHostUpdate(platform, *system, initial.get(), {}, argv[4]);
+                testDeviceScale(platform, *system, initial.get(), {}, false);
             }
         }
         cout << "Done" << endl;

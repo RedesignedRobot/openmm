@@ -74,7 +74,7 @@ void writeMoleculeKey(int m, int4 mol, float cx, float cy, float cz, float4 boxX
     cx -= xcell*boxX.x;
     moleculeCells[m] = make_int4(xcell, ycell, zcell, 0);
     uint bin;
-    if (mol.y & 1) {
+    if ((mol.y & 1) || zigzagXBins < 0) {
         uint x = (uint) clamp((int) (cx*invHilbertWidth), 0, 255);
         uint y = (uint) clamp((int) (cy*invHilbertWidth), 0, 255);
         uint z = (uint) clamp((int) (cz*invHilbertWidth), 0, 255);
@@ -241,3 +241,26 @@ KERNEL void storeAtoms(int numAtoms, int paddedNumAtoms, GLOBAL const float4* RE
         }
     }
 }
+
+#ifdef USE_DEVICE_BOX
+/** Match the host barostat's rigid translation of molecule centers, preserving mixed corrections. */
+KERNEL void scaleMoleculeCenters(int numMolecules, GLOBAL const int4* RESTRICT molecules,
+        GLOBAL const int* RESTRICT templateAtoms, GLOBAL float4* RESTRICT posq,
+        GLOBAL const double* RESTRICT scaleFactor) {
+    float scale = (float) scaleFactor[0];
+    for (int m = GLOBAL_ID; m < numMolecules; m += GLOBAL_SIZE) {
+        int4 mol = molecules[m];
+        float3 center = make_float3(0, 0, 0);
+        for (int j = 0; j < mol.w; j++)
+            center += posq[mol.x+templateAtoms[mol.z+j]].xyz;
+        center *= RECIP((float) mol.w);
+        float3 delta = center*(scale-1.0f);
+        for (int j = 0; j < mol.w; j++) {
+            int atom = mol.x+templateAtoms[mol.z+j];
+            float4 pos = posq[atom];
+            pos.xyz += delta;
+            posq[atom] = pos;
+        }
+    }
+}
+#endif
