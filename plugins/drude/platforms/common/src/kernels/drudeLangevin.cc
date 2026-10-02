@@ -14,7 +14,7 @@ KERNEL void integrateDrudeLangevinPart1(GLOBAL mixed4s* RESTRICT velm, GLOBAL co
         mixed4 velocity = velm[index];
         if (velocity.w != 0) {
             mixed sqrtInvMass = SQRT(velocity.w);
-            float4 rand = random[randomIndex+index];
+            float4 rand = random[randomIndex+i];
             velocity.x = vscale*velocity.x + fscale*velocity.w*force[index] + noisescale*sqrtInvMass*rand.x;
             velocity.y = vscale*velocity.y + fscale*velocity.w*force[index+PADDED_NUM_ATOMS] + noisescale*sqrtInvMass*rand.y;
             velocity.z = vscale*velocity.z + fscale*velocity.w*force[index+PADDED_NUM_ATOMS*2] + noisescale*sqrtInvMass*rand.z;
