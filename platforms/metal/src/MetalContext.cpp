@@ -67,6 +67,10 @@
 using namespace OpenMM;
 using namespace std;
 
+#ifdef OPENMM_METAL_TEST_HOOKS
+std::function<void(const vector<NS::Object*>&)> MetalContext::constructionHook;
+#endif
+
 const int MetalContext::ThreadBlockSize = 64;
 const int MetalContext::TileSize = 32;
 const int MetalContext::SpreadBlockSize = 128;
@@ -409,6 +413,16 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     integration = new MetalIntegrationUtilities(*this, system);
     expression = new MetalExpressionUtilities(*this);
     clearBuffer(posq);
+#ifdef OPENMM_METAL_TEST_HOOKS
+    if (constructionHook) {
+        vector<NS::Object*> objects = {device, unwrap(posq).getDevicePointer()};
+        for (auto module : loadedModules)
+            objects.push_back(module);
+        for (auto& kernel : kernelArguments)
+            objects.push_back(kernel.first);
+        constructionHook(objects);
+    }
+#endif
     constructionGuard.release();
 }
 

@@ -42,6 +42,10 @@
 using namespace OpenMM;
 using namespace std;
 
+#ifdef OPENMM_METAL_TEST_HOOKS
+void (*MetalNonbondedUtilities::exactCountHook)(MetalContext&) = nullptr;
+#endif
+
 // Steps without a host wait share a command buffer, up to this many.  Fewer buffers mean fewer boundaries
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
 // it doesn't wait for MetalQueue's idle commit.
@@ -753,6 +757,10 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         commitCountAfterLastStep = queue.getCommitCount();
         if (wait)
             queue.finish();
+#ifdef OPENMM_METAL_TEST_HOOKS
+        if (wait && exactCountHook)
+            exactCountHook(context);
+#endif
         updateNeighborListSize();
     }
 }

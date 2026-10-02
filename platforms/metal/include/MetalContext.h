@@ -570,6 +570,10 @@ public:
 private:
     MetalArray* barostatEnergy = nullptr;   // set only inside enqueueEnergy()
     friend class MetalSort;
+    friend class MetalHostRobustnessAccess;
+#ifdef OPENMM_METAL_TEST_HOOKS
+    static std::function<void(const std::vector<NS::Object*>&)> constructionHook;
+#endif
     void releaseResources();
     void releaseModule(metalModule_t module);
     void releaseKernel(metalFunction_t kernel);

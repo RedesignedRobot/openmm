@@ -329,6 +329,9 @@ public:
     void setKernelSource(const std::string& source);
 private:
     friend class MetalHostRobustnessAccess;
+#ifdef OPENMM_METAL_TEST_HOOKS
+    static void (*exactCountHook)(MetalContext&);
+#endif
     /**
      * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
      * atomOrder, atomRoles and the exclusions in that order.  See initialize().

@@ -38,6 +38,7 @@ public:
     void syncHost();
     void hostChanged();
 private:
+    friend class MetalHostRobustnessAccess;
     bool buildTables();
     void uploadCellOffsets();
     void checkForNaN();
