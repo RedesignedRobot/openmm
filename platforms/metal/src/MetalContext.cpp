@@ -288,6 +288,8 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     compilationDefines["SPREAD_SPAN"] = "16";
     compilationDefines["SPREAD_SLAB"] = "1024";
     compilationDefines["SPREAD_GROUPS"] = intToString(SpreadBlockSize/32);
+    if (getUsePmeInterpolationLanes())
+        compilationDefines["PME_INTERP_LANES"] = "1";
     if (simdWidth == 32)
         compilationDefines["AMD_RDNA"] = "1";
     if (useDoublePrecision) {
@@ -947,4 +949,8 @@ void MetalContext::clearAutoclearBuffersIfNeeded() {
     autoclearWorkCount = -1;
     if (!cleared)
         clearAutoclearBuffers();
+void MetalContext::executeAfterForcePass() {
+    for (auto& work : afterForcePass)
+        work();
+    afterForcePass.clear();
 }

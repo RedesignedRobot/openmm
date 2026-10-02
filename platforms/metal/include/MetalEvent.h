@@ -66,6 +66,7 @@ private:
     void checkBufferStatus();
     MetalContext& context;
     MTL::SharedEvent* event;
+    MTL::Event* deviceEvent;
     MTL::CommandBuffer* buffer;
     uint64_t value;
 };

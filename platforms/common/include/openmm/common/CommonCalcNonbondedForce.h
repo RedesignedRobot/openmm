@@ -117,6 +117,11 @@ private:
     class PmePostComputation;
     class SyncQueuePreComputation;
     class SyncQueuePostComputation;
+    /**
+     * Run the reciprocal space kernels that follow charge spreading: the forward FFT, the convolution (and the energy
+     * on energy steps), the inverse FFT and force interpolation.
+     */
+    void computeReciprocalFromGrid(bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
     ComputeContext& cc;
     ForceInfo* info;
     bool hasInitializedKernel;
@@ -141,7 +146,7 @@ private:
     ComputeArray pmeDispersionBsplineModuliY;
     ComputeArray pmeDispersionBsplineModuliZ;
     ComputeArray pmeAtomGridIndex;
-    ComputeArray pmeEnergyBuffer;
+    ComputeArray pmeForces;
     ComputeArray chargeBuffer;
     ComputeSort sort;
     ComputeQueue pmeQueue;
@@ -157,7 +162,7 @@ private:
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
     ComputeKernel pmeEvalEnergyKernel, pmeDispersionEvalEnergyKernel;
-    ComputeKernel pmeInterpolateForceKernel, pmeDispersionInterpolateForceKernel;
+    ComputeKernel pmeInterpolateForceKernel, pmeInterpolateForceQueueKernel, pmeDispersionInterpolateForceKernel;
     std::map<std::string, std::string> pmeDefines;
     std::vector<std::pair<int, int> > exceptionAtoms;
     std::vector<std::string> paramNames;
@@ -169,7 +174,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deferPmeInterpolation, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
+    bool usePmeQueue, reciprocalOnQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;

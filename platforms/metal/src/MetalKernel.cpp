@@ -62,6 +62,12 @@ void MetalKernel::execute(int threads, int blockSize) {
     // SIMD groups in flight to hide the slab latency.
     if (blockSize == -1 && name == "gridSpreadCharge" && !context.getUseFixedPointChargeSpreading())
         blockSize = MetalContext::SpreadBlockSize;
+    // PME interpolation with PME_ORDER lanes per atom (pme.cc) gets 32 threads per 6 atoms at order 5, past the
+    // numThreadBlocks cap.  The kernel loops over atoms, so any launch size stays correct.
+    if (name == "gridInterpolateForce" && context.getUsePmeInterpolationLanes()) {
+        context.executeKernelFlat(kernel, argPointers.data(), 32*((threads+5)/6), blockSize);
+        return;
+    }
     context.executeKernel(kernel, argPointers.data(), threads, blockSize);
 }
 

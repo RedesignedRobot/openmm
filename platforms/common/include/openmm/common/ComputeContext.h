@@ -43,6 +43,7 @@
 #include "openmm/Vec3.h"
 #include "openmm/internal/ContextImpl.h"
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -653,8 +654,9 @@ public:
      */
     virtual void flushQueue() = 0;
     /**
-     * Get whether addForcePassKernel() defers kernels.  A kernel given to it must add to the force buffers only with
-     * integer atomics, since it may run at the same time as the bonded and nonbonded kernels.
+     * Get whether addForcePassKernel() and addAfterForcePass() defer work.  A kernel given to addForcePassKernel()
+     * may run at the same time as the bonded and nonbonded kernels, so it must not write any buffer they use, except
+     * to add to the force buffers with integer atomics.
      */
     virtual bool getSupportsForcePassKernels() const {
         return false;
@@ -664,6 +666,13 @@ public:
      * getSupportsForcePassKernels() returns true.
      */
     virtual void addForcePassKernel(ComputeKernel kernel, int workUnits) {
+    }
+    /**
+     * Run work right after the pass that computes bonded and nonbonded forces, before the post computations, on
+     * platforms where getSupportsForcePassKernels() returns true.  Other platforms run it now.
+     */
+    virtual void addAfterForcePass(std::function<void()> work) {
+        work();
     }
     /**
      * Register a global parameter whose value should be stored in the array returned by

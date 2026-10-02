@@ -101,9 +101,11 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
     // boundaries on either side order them against the clear before and the readers after.  A pending
     // calcCenterOfMassVelocity joins the pass, since it only reads the velocities, which no force kernel
     // writes.  It goes first so its single thread group starts before the force kernels fill the GPU.  Force
-    // pass kernels (PME interpolation) also add to the force buffer only with integer atomics and write
-    // nothing else.  A refill of the random number pool joins too: it writes only the pool and its seeds,
-    // which only the integrator reads, after the pass.
+    // pass kernels either write only a buffer no other pass kernel touches (PME charge spreading into its
+    // grid) or add to the force buffer only with integer atomics (PME interpolation).  Work that reads what the
+    // pass wrote (the rest of the PME chain after spreading) runs right after it, before the post computations
+    // and virtual site force distribution.  A refill of the random number pool joins too: it writes only the
+    // pool and its seeds, which only the integrator reads, after the pass.
 
     {
         bool overlap = (includeForces && !includeEnergy && cu.getEnergyParamDerivNames().empty());
@@ -121,7 +123,12 @@ double MetalCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, b
         }
         cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     }
+<<<<<<< 9a7ccd4d4ec2c4cb2ec8282802c6a6035cc8abee
     cu.getNonbondedUtilities().scatterRoleForces();
+||||||| 734ce92d5
+=======
+    cu.executeAfterForcePass();
+>>>>>>> 5e58f521a
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);

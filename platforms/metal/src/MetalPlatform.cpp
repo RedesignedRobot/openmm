@@ -137,7 +137,7 @@ MetalPlatform::MetalPlatform() {
     setPropertyDefaultValue(MetalUseBlockingSync(), "true");
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
-    setPropertyDefaultValue(MetalDisablePmeStream(), "true");
+    setPropertyDefaultValue(MetalDisablePmeStream(), "auto");
     setPropertyDefaultValue(MetalDeterministicForces(), "false");
 #ifdef _MSC_VER
     setPropertyDefaultValue(MetalTempDirectory(), string(getenv("TEMP")));
@@ -305,7 +305,9 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
     }
 
     useCpuPme = (cpuPmeProperty == "true" && !contexts[0]->getUseDoublePrecision());
-    disablePmeStream = (pmeStreamProperty == "true");
+    // "auto" keeps the PME queue on Apple9, where a second queue's work runs beside the force pass (r3-pme flagmb
+    // arm 8).  On Apple8 the queues take turns, so the queue only adds two event hops per step.
+    disablePmeStream = (pmeStreamProperty == "true" || (pmeStreamProperty != "false" && !contexts[0]->getSupportsForcePassKernels()));
     deterministicForces = (deterministicForcesProperty == "true");
     propertyValues[MetalPlatform::MetalDeviceIndex()] = deviceIndex.str();
     propertyValues[MetalPlatform::MetalDeviceName()] = deviceName.str();

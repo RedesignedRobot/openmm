@@ -27,6 +27,7 @@
  * -------------------------------------------------------------------------- */
 
 
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -380,6 +381,13 @@ public:
         return useDoublePrecision || !supportsHardwareFloatGlobalAtomicAdd || platformData.deterministicForces;
     }
     /**
+     * Get whether gridInterpolateForce gives each atom PME_ORDER lanes (pme.cc, PME_INTERP_LANES).  MetalKernel
+     * then launches 32 threads per 32/PME_ORDER atoms.  Only Apple9 does.
+     */
+    bool getUsePmeInterpolationLanes() const {
+        return !useDoublePrecision && supportsHardwareFloatGlobalAtomicAdd;
+    }
+    /**
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
@@ -507,10 +515,17 @@ public:
     bool getSupportsForcePassKernels() const;
     /**
      * Run a kernel at the start of the next force pass (MetalCalcForcesAndEnergyKernel::finishComputation).  It
-     * must add to the force buffers only with integer atomics.
+     * must not write any buffer the bonded or nonbonded kernels use, except to add to the force buffers with
+     * integer atomics.
      */
     void addForcePassKernel(ComputeKernel kernel, int workUnits) {
         forcePassKernels.push_back(std::make_pair(kernel, workUnits));
+    }
+    /**
+     * Run work right after the next force pass, before the post computations.
+     */
+    void addAfterForcePass(std::function<void()> work) {
+        afterForcePass.push_back(work);
     }
     /**
      * Execute the kernels given to addForcePassKernel() since the last call, in order.
@@ -537,6 +552,9 @@ public:
      * Call clearAutoclearBuffers() unless markAutoclearBuffersCleared() says the buffers are already zero.
      */
     void clearAutoclearBuffersIfNeeded();
+     * Run the work given to addAfterForcePass() since the last call, in order.
+     */
+    void executeAfterForcePass();
 private:
     friend class MetalSort;
     void releaseResources();
@@ -577,6 +595,7 @@ private:
     std::vector<std::pair<ComputeKernel, int> > forcePassKernels;
     long long autoclearWorkCount;
     int autoclearBufferCount;
+    std::vector<std::function<void()> > afterForcePass;
     std::string tempDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
