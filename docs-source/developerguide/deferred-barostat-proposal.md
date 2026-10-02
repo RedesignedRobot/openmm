@@ -340,3 +340,65 @@ Evidence read: `/Users/mas/.cdx/reports/m029-tip4pew-next-r1.md` item 2;
 the barostat and cache entries in `lanes/r3-step.md`; and
 `/tmp/openmm-metal-bench/ultra-lead/STATE.md` core-team list. The third-force-pass
 cache, keep-alive and integrator/PME changes are not part of this proposal.
+
+### Phase 2a host-controlled prerequisite
+
+`OPENMM_METAL_DEVICE_BOX=1` now selects a Metal buffer for periodic kernel
+arguments. The switch defaults off. The current scope is the host-controlled
+subset of phase 2a. It does not expose device scaling or claim device-authoritative
+host observations. The isotropic barostat still proposes, accepts and rejects
+moves on the host. Phase 1 deferred energies and the ordered-force save remain
+in place.
+
+The buffer contains float box vectors, size and inverse size, reciprocal
+vectors, reorder high/low words and bin parameters, full host vectors for mixed
+unwrapping, and volume. Metal argument reflection binds named periodic values
+to byte offsets in this buffer. Both separate arguments and packed scalar
+arguments use this route. It covers neighbor bounds and pair construction,
+direct-space nonbonded and periodic bonded interactions, PME index/spread,
+energy/convolution/interpolation, fused FFT convolution, molecule wrapping and
+reordering, and barostat coordinate scaling. Dispersion and neutralizing-plasma
+volume corrections read the same state. The volume and coefficient enter the
+kernel as host double values, including in single mode; Metal's df64 arithmetic
+evaluates their ratio. The result occupies a separate reduction slot before the
+host double sum. Deferred barostat snapshots include that slot.
+
+Each host `setPeriodicBoxVectors()` stages one 320-byte copy per Metal context.
+The source allocation stays alive through the command buffer's retained
+resources. The copy is ordered after previously encoded consumers. It does not
+wait for the queue and never overwrites the live buffer from the CPU. An accepted
+barostat trial stages one box copy. A rejected trial stages two, one for the
+proposal and one for the restored box. Initialization also refreshes the buffer
+after the nonbonded cutoff is known, so reorder bin counts are correct.
+
+The flag-off signature rewriting, reflected argument sizes and encoded scalar
+bytes stay on the original path. Unsupported force types, CPU PME and non-PME
+NonbondedForce methods disable the switch for the entire context and print the
+reason. CUDA and OpenCL keep their original volume corrections.
+
+Device scaling remains blocked on CPU reorder fallback and bin-overflow checks,
+host cutoff validation, host box getters and checkpoint serialization, and host
+cell-offset ownership. PME still calculates unused host reciprocal arguments.
+Those calls must stop resolving the host box before any lazy getter is added.
+A future device update must rebuild every derived buffer field and preserve the
+exact host vectors for observations. It must also order updates across the PME
+queue, handle saved barostat state, invalidate forces and neighbor lists, and
+provide device cutoff error reporting. No partially implemented scale entry
+point is available.
+
+`TestMetalDeviceBox [single|mixed|all [system.xml state.xml]]` checks packed and
+unpacked buffer binding with poisoned host scalars, 19,652-atom TIP4P-Ew PME water with
+role ordering, neutral and charged volume terms, scaled host box updates,
+checkpoint reload, unsupported-force fallback, and 1000 LangevinMiddle steps
+with a barostat every 25 steps. The optional XML pair adds the FAH unit to the
+host-update checks. The test compares the switch unset with the switch set in
+each precision. Device scaling and checkpoints after device scaling are not
+covered because the entry point is intentionally absent.
+
+The current implementation does not pass the correctness gate. With deterministic
+forces, the single precision water test finds identical forces and reciprocal
+energy but a total energy delta of 0.0156268596 kJ/mol, or 5.79456649e-6 relative.
+This exceeds the required 1e-6. Mixed precision, the trajectory test and the FAH
+XML case were not reached. The switch must remain off and this change needs
+further diagnosis before integration. The complete handoff records the group
+energies and the remaining host dependencies.

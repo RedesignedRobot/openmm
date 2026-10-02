@@ -397,6 +397,9 @@ public:
     bool getSupportsDoublePrecision() const {
         return useMixedPrecision;
     }
+    bool getUseDeviceBox() const { return useDeviceBox; }
+    /** Add a coefficient divided by the current device volume to the energy buffer. */
+    void addDeviceBoxEnergy(double coefficient);
     /**
      * Get the vectors defining the periodic box.
      */
@@ -419,6 +422,8 @@ public:
         invPeriodicBoxSize = make_double4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0.0);
         periodicBoxSizeFloat = make_float4((float) a[0], (float) b[1], (float) c[2], 0.0f);
         invPeriodicBoxSizeFloat = make_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f);
+        if (useDeviceBox)
+            uploadDeviceBox(a, b, c);
     }
     /**
      * Get the size of the periodic box.
@@ -579,8 +584,9 @@ private:
      * each value goes in one struct bound at index 0, and packedSize is that struct's size.  layouts
      * holds the layout each buffer argument reads.
      */
+    void uploadDeviceBox(const Vec3& a, const Vec3& b, const Vec3& c);
     struct KernelArguments {
-        std::vector<int> sizes, offsets;
+        std::vector<int> sizes, offsets, boxOffsets;
         std::vector<BufferLayout> layouts;
         int packedSize = 0;
     };
@@ -618,6 +624,9 @@ private:
     std::map<metalFunction_t, KernelArguments> kernelArguments;
     metalDevice_t device;
     void* pinnedBuffer;
+    bool useDeviceBox = false;
+    MetalArray deviceBox, deviceBoxEnergyBuffer;
+    ComputeKernel deviceBoxEnergy;
     MetalArray energyBuffer;
     ArrayInterface* deferredEnergy = NULL;
     int deferredEnergyIndex = 0;
