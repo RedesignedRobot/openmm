@@ -32,6 +32,7 @@
 #include "openmm/common/ArrayInterface.h"
 #include "openmm/common/ComputeKernel.h"
 #include <vector>
+#include <functional>
 
 namespace OpenMM {
 
@@ -102,6 +103,10 @@ public:
      */
     static int findLegalDimension(int minimum, int maxFactor=13);
 private:
+    friend class MetalHostRobustnessAccess;
+#ifdef OPENMM_METAL_TEST_HOOKS
+    static std::function<void(const std::vector<NS::Object*>&)> constructionHook;
+#endif
     void createPmeConvolution();
     MetalContext& context;
     int xsize, ysize, zsize;

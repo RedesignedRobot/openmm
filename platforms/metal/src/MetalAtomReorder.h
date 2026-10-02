@@ -43,6 +43,7 @@ public:
     void prepareScale();
     void scaleCoordinates(MetalArray& scaleFactor);
 private:
+    friend class MetalHostRobustnessAccess;
     bool buildTables();
     void uploadCellOffsets();
     void checkForNaN();

@@ -336,6 +336,9 @@ public:
 private:
     friend class MetalHostRobustnessAccess;
     long long countWaitCalls = 0;
+#ifdef OPENMM_METAL_TEST_HOOKS
+    static void (*exactCountHook)(MetalContext&);
+#endif
     /**
      * Decide whether the neighbor list and the nonbonded kernel work on atoms in role order, and if so build
      * atomOrder, atomRoles and the exclusions in that order.  See initialize().

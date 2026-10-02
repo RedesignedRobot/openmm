@@ -18,7 +18,9 @@ FOREACH(framework Metal Foundation QuartzCore IOKit CoreFoundation)
 ENDFOREACH(framework)
 
 SET(OPENMM_BUILD_METAL_TESTS TRUE CACHE BOOL "Whether to build Metal test cases")
+# Fault checkpoints exist only in builds that include the Metal regression tests.
 IF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
+    ADD_DEFINITIONS(-DOPENMM_METAL_TEST_HOOKS)
     SUBDIRS(tests)
 ENDIF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
 

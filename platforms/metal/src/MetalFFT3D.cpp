@@ -36,6 +36,10 @@
 using namespace OpenMM;
 using namespace std;
 
+#ifdef OPENMM_METAL_TEST_HOOKS
+std::function<void(const vector<NS::Object*>&)> MetalFFT3D::constructionHook;
+#endif
+
 struct MetalFFT3D::VkFFTApp : VkFFTApplication {
 };
 
@@ -116,6 +120,22 @@ MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, b
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing initializeVkFFT: "+context.intToString(fftResult));
     }
+#ifdef OPENMM_METAL_TEST_HOOKS
+    if (constructionHook) {
+        vector<NS::Object*> objects;
+        for (auto plan : {pendingApp->localFFTPlan, pendingApp->localFFTPlan_inverse})
+            if (plan != nullptr)
+                for (int axis = 0; axis < 3; axis++)
+                    for (int upload = 0; upload < plan->numAxisUploads[axis]; upload++) {
+                        const auto& fft = plan->axes[axis][upload];
+                        for (NS::Object* object : {static_cast<NS::Object*>(fft.library),
+                                static_cast<NS::Object*>(fft.pipeline), static_cast<NS::Object*>(fft.bufferLUT)})
+                            if (object != nullptr)
+                                objects.push_back(object);
+                    }
+        constructionHook(objects);
+    }
+#endif
     app = pendingApp.release();
 }
 

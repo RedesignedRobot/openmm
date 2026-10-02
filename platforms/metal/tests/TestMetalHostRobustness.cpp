@@ -4,6 +4,8 @@
 #include "openmm/internal/AssertionUtilities.h"
 #include "openmm/internal/ContextImpl.h"
 #include "MetalContext.h"
+#include "MetalFFT3D.h"
+#include "../src/MetalAtomReorder.h"
 #include "MetalNonbondedUtilities.h"
 #include "MetalPlatform.h"
 #include "MetalQueue.h"
@@ -18,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <set>
 
 using namespace OpenMM;
 using namespace std;
@@ -39,6 +42,33 @@ public:
         auto& nb = cc.getNonbondedUtilities();
         ASSERT(nb.maxTiles > 1 || nb.maxSinglePairs > 1);
         ASSERT(cc.getForcesValid());
+    }
+    static pair<size_t, size_t> compiledObjects(MetalContext& cc) {
+        return {cc.loadedModules.size(), cc.kernelArguments.size()};
+    }
+    static MetalAtomReorder& reorder(MetalContext& cc) {
+        auto* reorder = dynamic_cast<MetalAtomReorder*>(cc.deviceReorder);
+        ASSERT(reorder != nullptr);
+        return *reorder;
+    }
+    static bool deviceOrderPending(MetalContext& cc) {
+        return reorder(cc).hostStale;
+    }
+    static int tablesVersion(MetalContext& cc) {
+        return reorder(cc).tablesVersion;
+    }
+    static void countHook(void (*hook)(MetalContext&)) {
+        MetalNonbondedUtilities::exactCountHook = hook;
+    }
+    static void constructionHook(bool fft, function<void(const vector<NS::Object*>&)> hook) {
+        if (fft)
+            MetalFFT3D::constructionHook = hook;
+        else
+            MetalContext::constructionHook = hook;
+    }
+    static unique_ptr<MetalContext> construct(MetalContext& cc, const System& system) {
+        return unique_ptr<MetalContext>(new MetalContext(system, -1, false,
+                cc.getUseMixedPrecision() ? "mixed" : "single", "/tmp", cc.platformData, nullptr));
     }
     static void rebuild(MetalContext& cc) {
         cc.getNonbondedUtilities().forceRebuildNeighborList = true;
@@ -129,42 +159,66 @@ static double compareForces(const State& actual, const State& expected) {
     return maxError;
 }
 
+// This observer runs before the host reads the exact count and before integration can consume forces.
+static int exactCounts = 0;
+static void observeExactCount(MetalContext& cc) {
+    ASSERT(cc.getCurrentStream().isDrained());
+    ++exactCounts;
+}
+
 static void testOverflow() {
     System system;
     vector<Vec3> positions;
     makeWater(system, positions);
-    VerletIntegrator integrator(0.0001);
-    Context context(system, integrator, platform);
+    VerletIntegrator integrator(0.0001), oracleIntegrator(0.0001);
+    Context context(system, integrator, platform), oracle(system, oracleIntegrator, platform);
     context.setPositions(positions);
     context.setVelocities(vector<Vec3>(positions.size()));
     MetalContext& cc = platform.metal(context);
-    cout << "device=" << cc.getDevice()->name()->utf8String() << ", Apple9=" << cc.getDevice()->supportsFamily(MTL::GPUFamilyApple9) << endl;
-    unique_ptr<VerletIntegrator> oracleIntegrator;
-    unique_ptr<Context> oracle;
-    double maxError = 0;
-    for (int step = 0; step < 1000; step++) {
-        if (step%250 == 0) {
-            // Start a fresh context for each forced overflow.  It has never seen an undersized list.
-            oracle.reset();
-            oracleIntegrator.reset(new VerletIntegrator(0.0001));
-            oracle.reset(new Context(system, *oracleIntegrator, platform));
+    cout << "device=" << cc.getDevice()->name()->utf8String() << endl;
+    struct Observer {
+        Observer() { exactCounts = 0; MetalHostRobustnessAccess::countHook(observeExactCount); }
+        ~Observer() { MetalHostRobustnessAccess::countHook(nullptr); }
+    } observer;
+    double maxError = 0, maxVelocityError = 0;
+    for (int step = 0; step < 2048; step++) {
+        // Overflow first occurs inside step(), with no intervening force or energy download.
+        bool overflow = (step%256 == 0);
+        State before = context.getState(State::Positions | State::Velocities);
+        if (overflow) {
+            oracle.setPositions(before.getPositions());
+            oracle.setVelocities(before.getVelocities());
             MetalHostRobustnessAccess::undersize(cc);
         }
+        int observations = exactCounts;
         auto countBefore = cc.getNonbondedUtilities().getCountWaitCalls();
+        integrator.step(1);
+        if (overflow) {
+            ASSERT(exactCounts >= observations+2); // rejected overflow, then the valid retry
+            ASSERT(cc.getNonbondedUtilities().getCountWaitCalls() > countBefore);
+            MetalHostRobustnessAccess::assertRecovered(cc);
+            oracleIntegrator.step(1);
+            State actual = context.getState(State::Positions | State::Velocities);
+            State expected = oracle.getState(State::Positions | State::Velocities);
+            for (int i = 0; i < system.getNumParticles(); i++) {
+                ASSERT_EQUAL_VEC(expected.getPositions()[i], actual.getPositions()[i], 2e-5);
+                Vec3 delta = actual.getVelocities()[i]-expected.getVelocities()[i];
+                maxVelocityError = max(maxVelocityError, sqrt(delta.dot(delta)));
+                ASSERT_EQUAL_VEC(expected.getVelocities()[i], actual.getVelocities()[i], 2e-4);
+            }
+        }
         State actual = context.getState(State::Positions | State::Forces | State::Energy);
-        ASSERT(cc.getNonbondedUtilities().getCountWaitCalls() > countBefore);
-        MetalHostRobustnessAccess::assertRecovered(cc);
-        oracle->setPositions(actual.getPositions());
+        oracle.setPositions(actual.getPositions());
         try {
-            maxError = max(maxError, compareForces(actual, oracle->getState(State::Forces | State::Energy)));
+            maxError = max(maxError, compareForces(actual, oracle.getState(State::Forces | State::Energy)));
         }
         catch (const exception& e) {
             throw OpenMMException("Step "+to_string(step)+": "+e.what());
         }
-        integrator.step(1);
     }
-    ASSERT(isfinite(context.getState(State::Energy).getPotentialEnergy()));
-    cout << "overflow: 19652 sites, role order, 4 forced overflows, 1000 force comparisons and steps, max scaled force error=" << maxError << endl;
+    cout << "overflow: 19652 sites, role order, 8 forced integration overflows, 2048 steps and force comparisons"
+         << ", exact completed counts=" << exactCounts << ", max scaled force error=" << maxError
+         << ", max overflow-step velocity error=" << maxVelocityError << endl;
 }
 
 static void testNaNRecovery() {
@@ -189,8 +243,20 @@ static void testNaNRecovery() {
         caught = true;
     }
     ASSERT(caught);
-    platform.metal(context).forceReorder();
+    MetalContext& cc = platform.metal(context);
+    vector<int> oldOrder = cc.getAtomIndex();
+    // Reverse whole waters so recovery must produce a different spatial order.
+    for (int water = 0; water < (int) positions.size()/8; water++)
+        for (int site = 0; site < 4; site++)
+            swap(positions[4*water+site], positions[positions.size()-4*(water+1)+site]);
     context.setPositions(positions);
+    cc.forceReorder();
+    cc.reorderAtoms();
+    ASSERT(MetalHostRobustnessAccess::deviceOrderPending(cc));
+    cc.getCurrentStream().finish();
+    vector<int> deviceOrder;
+    cc.getAtomIndexArray().download(deviceOrder);
+    ASSERT(!equal(oldOrder.begin(), oldOrder.end(), deviceOrder.begin()));
     context.setVelocities(vector<Vec3>(positions.size()));
     State recovered = context.getState(State::Forces | State::Energy);
     ASSERT(isfinite(recovered.getPotentialEnergy()));
@@ -198,7 +264,7 @@ static void testNaNRecovery() {
         ASSERT(isfinite(f.dot(f)));
     integrator.step(100);
     ASSERT(isfinite(context.getState(State::Positions | State::Energy).getPotentialEnergy()));
-    cout << "NaN recovery: finite forces and 100 steps" << endl;
+    cout << "NaN recovery: device reorder submitted, device permutation changed, finite forces and 100 steps" << endl;
 }
 
 static void testMemory() {
@@ -209,20 +275,112 @@ static void testMemory() {
     Context context(system, integrator, platform);
     context.setPositions(positions);
     MetalContext& cc = platform.metal(context);
+    auto& nb = dynamic_cast<NonbondedForce&>(system.getForce(0));
+    context.getState(State::Forces);
+    int iteration = 0;
     auto rebuild = [&]() {
+        auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+        int version = cc.getMoleculeGroupsVersion();
+        // Move the distinct oxygen between two waters.  Each update invalidates a molecule group.
+        nb.setParticleParameters(0, 0, 0.316435, iteration%2 ? 0.680946 : 0.7);
+        nb.setParticleParameters(4, 0, 0.316435, iteration%2 ? 0.7 : 0.680946);
+        nb.updateParametersInContext(context);
+        ++iteration;
         MetalHostRobustnessAccess::rebuild(cc);
         context.setPositions(positions);
         ASSERT(isfinite(context.getState(State::Forces | State::Energy).getPotentialEnergy()));
         cc.getCurrentStream().finish();
+        ASSERT(cc.getMoleculeGroupsVersion() > version);
+        ASSERT_EQUAL(cc.getMoleculeGroupsVersion(), MetalHostRobustnessAccess::tablesVersion(cc));
     };
     for (int i = 0; i < 10; i++)
         rebuild();
-    size_t before = cc.getDevice()->currentAllocatedSize();
+    auto before = MetalHostRobustnessAccess::compiledObjects(cc);
+    size_t bytesBefore = cc.getDevice()->currentAllocatedSize();
+    int version = cc.getMoleculeGroupsVersion();
     for (int i = 0; i < 50; i++)
         rebuild();
-    size_t after = cc.getDevice()->currentAllocatedSize();
-    cout << "memory: 50 reorders and rebuilds, before=" << before << " after=" << after << " bytes" << endl;
-    ASSERT_EQUAL(before, after);
+    auto after = MetalHostRobustnessAccess::compiledObjects(cc);
+    cout << "memory: 50 parameter table rebuilds, versions=" << version << "->" << cc.getMoleculeGroupsVersion()
+         << ", libraries=" << before.first << "->" << after.first
+         << ", pipelines=" << before.second << "->" << after.second
+         << ", device bytes=" << bytesBefore << "->" << cc.getDevice()->currentAllocatedSize() << endl;
+    ASSERT_EQUAL(before.first, after.first);
+    ASSERT_EQUAL(before.second, after.second);
+}
+
+static void testConstructorCleanup(bool fft) {
+    System system;
+    system.addParticle(1);
+    VerletIntegrator integrator(0.001);
+    Context context(system, integrator, platform);
+    MetalContext& cc = platform.metal(context);
+    {
+        size_t observed = 0;
+        for (int iteration = 0; iteration < 10; iteration++) {
+            auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+            struct Checkpoint {
+                bool fft;
+                vector<pair<NS::Object*, NS::UInteger>> retained;
+                Checkpoint(bool fft) : fft(fft) {
+                    MetalHostRobustnessAccess::constructionHook(fft, [&](const vector<NS::Object*>& objects) {
+                        set<NS::Object*> unique(objects.begin(), objects.end());
+                        for (auto object : unique) {
+                            object->retain();
+                            retained.push_back({object, object->retainCount()});
+                        }
+                        throw OpenMMException("host-test construction failure");
+                    });
+                }
+                ~Checkpoint() {
+                    MetalHostRobustnessAccess::constructionHook(fft, {});
+                    for (auto entry : retained)
+                        entry.first->release();
+                }
+            } checkpoint(fft);
+            bool caught = false;
+            try {
+                if (fft)
+                    MetalFFT3D failed(cc, 28, 25, 30, false);
+                else
+                    MetalHostRobustnessAccess::construct(cc, system);
+            }
+            catch (const OpenMMException& e) {
+                ASSERT_EQUAL(string("host-test construction failure"), string(e.what()));
+                caught = true;
+            }
+            MetalHostRobustnessAccess::constructionHook(fft, {});
+            ASSERT(caught);
+            ASSERT(checkpoint.retained.size() >= 3);
+            for (auto entry : checkpoint.retained) {
+                if (entry.first->retainCount() >= entry.second)
+                    throw OpenMMException(string(fft ? "FFT" : "Context")+" did not release an owned device object");
+                ++observed;
+            }
+            // Retry the same constructor and execute GPU work with the recovered object.
+            if (fft) {
+                const int size = 28*25*30;
+                MetalArray input(cc, size, sizeof(mm_float2), "retryInput");
+                MetalArray output(cc, size, sizeof(mm_float2), "retryOutput");
+                vector<mm_float2> values(size, mm_float2(0, 0));
+                values[0].x = 1;
+                input.upload(values);
+                MetalFFT3D retry(cc, 28, 25, 30, false);
+                retry.execFFT(input, output, true);
+                output.download(values);
+                for (auto value : values) {
+                    ASSERT_EQUAL_TOL(1, value.x, 1e-5);
+                    ASSERT_EQUAL_TOL(0, value.y, 1e-5);
+                }
+            }
+            else {
+                auto retry = MetalHostRobustnessAccess::construct(cc, system);
+                retry->getCurrentStream().finish();
+            }
+        }
+        cout << (fft ? "FFT" : "Context") << " cleanup: 10 injected failures and successful retries, "
+             << observed << " owned device references released" << endl;
+    }
 }
 
 static void testAdaptiveReorder() {
@@ -271,7 +429,9 @@ int main(int argc, char* argv[]) {
     platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
     platform.setPropertyDefaultValue("DeterministicForces", "true");
     int failures = 0;
-    for (auto test : vector<pair<string, function<void()>>>{{"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"adaptive reorder", testAdaptiveReorder}}) {
+    for (auto test : vector<pair<string, function<void()>>>{{"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", testAdaptiveReorder}}) {
+        if (argc > 2 && (string(argv[2]) == "audit" ? test.first == "adaptive reorder" : string(argv[2]) != test.first))
+            continue;
         try {
             test.second();
             cout << "PASS " << precision << " " << test.first << endl;
