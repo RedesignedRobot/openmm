@@ -668,13 +668,42 @@ bool MetalApplyMonteCarloBarostatKernel::executeTrial(ContextImpl& context, int 
 // marker's first byte differs from Common's version (3) on either byte order.
 static const int DeviceCheckpointVersion = 0xDBA0002, OldDeviceCheckpointVersion = 0xDBA0001;
 
+// Mixed velocities are float pairs on Metal.  Converting them to doubles can round away
+// low bits, even when downloading the restored velocities produces the same doubles.
+// This prefix distinguishes raw pairs from the doubles in older checkpoints.
+static const int RawVelocityCheckpointVersion = 0x4D564C04;
+
+class RawCheckpointVelocities {
+public:
+    RawCheckpointVelocities(MetalContext& cu, bool raw) : velm(cu.unwrap(cu.getVelm())), pairs(velm.getPairStorage()) {
+        if (raw)
+            velm.setPairStorage(false);
+    }
+    ~RawCheckpointVelocities() {
+        velm.setPairStorage(pairs);
+    }
+private:
+    MetalArray& velm;
+    bool pairs;
+};
+
 void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
     if (cu.deviceBarostatKernel != nullptr)
         cu.deviceBarostatKernel->prepareDeviceBarostat();
+    // The neighbor list is not checkpointed.  Rebuild it in both continuations: the
+    // direct kernel rounds each tile's force sum, so different tile partitions can
+    // produce different forces even with deterministic PME charge spreading.
+    cu.getNonbondedUtilities().invalidateNeighborList();
+    bool rawVelocities = cu.unwrap(cu.getVelm()).getPairStorage();
+    if (rawVelocities)
+        stream.write((const char*) &RawVelocityCheckpointVersion, sizeof(RawVelocityCheckpointVersion));
     if (cu.deviceBarostatState != nullptr) {
         stream.write((const char*) &DeviceCheckpointVersion, sizeof(DeviceCheckpointVersion));
     }
-    CommonUpdateStateDataKernel::createCheckpoint(context, stream);
+    {
+        RawCheckpointVelocities raw(cu, rawVelocities);
+        CommonUpdateStateDataKernel::createCheckpoint(context, stream);
+    }
     if (cu.deviceBarostatState != nullptr) {
         vector<double> state;
         cu.deviceBarostatState->download(state);
@@ -692,6 +721,14 @@ void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& s
         cu.deviceBarostatKernel->prepareDeviceBarostat();
     // Peek so ordinary checkpoints also work with non-seekable input streams.
     int first = stream.peek();
+    bool rawVelocities = (first == *(const unsigned char*) &RawVelocityCheckpointVersion);
+    if (rawVelocities) {
+        int version = 0;
+        stream.read((char*) &version, sizeof(version));
+        if (version != RawVelocityCheckpointVersion)
+            throw OpenMMException("Unsupported Metal velocity checkpoint version");
+        first = stream.peek();
+    }
     if (cu.deviceBarostatState == nullptr && (first == *(const unsigned char*) &DeviceCheckpointVersion ||
             first == *(const unsigned char*) &OldDeviceCheckpointVersion))
         throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
@@ -703,7 +740,10 @@ void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& s
         if (version != DeviceCheckpointVersion)
             throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
     }
-    CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
+    {
+        RawCheckpointVelocities raw(cu, rawVelocities);
+        CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
+    }
     if (cu.deviceBarostatState != nullptr) {
         vector<double> state(16);
         stream.read((char*) state.data(), state.size()*sizeof(double));
@@ -713,4 +753,5 @@ void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& s
         cu.deviceBarostatState->upload(state);
         cu.restoreDeviceBox(box.data());
     }
+    cu.getNonbondedUtilities().invalidateNeighborList();
 }
