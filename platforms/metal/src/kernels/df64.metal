@@ -481,11 +481,68 @@ inline int df64_sincos_reduced(df64 x, thread df64& s, thread df64& c) {
     return ((int) k) & 3;
 }
 
+// Payne-Hanek reduction of one float limb.  Multiplying its 24-bit significand by
+// floor((2/pi)*2^256) keeps the quadrant and 64 fractional bits without ever
+// converting a large floating-point quotient to an integer.  Even at FLT_MAX,
+// truncating the table contributes less than 2^-128 to the quotient.
+inline int df64_reduce_float_pio2(float x, thread df64& r) {
+    if (fabs(x) < 1.0f) {
+        r = df64(x);
+        return 0;
+    }
+    const uint twoOverPi[8] = {
+        0xdebbc561u, 0xfe5163abu, 0x3c439041u, 0xdb629599u,
+        0xf534ddc0u, 0xfc2757d1u, 0x4e441529u, 0xa2f9836eu
+    };
+    ulong significand;
+    int exponent;
+    df64_decompose(x, significand, exponent);
+    uint product[9];
+    ulong carry = 0;
+    for (int i = 0; i < 8; i++) {
+        ulong p = significand*twoOverPi[i] + carry;
+        product[i] = (uint) p;
+        carry = p >> 32;
+    }
+    product[8] = (uint) carry;
+    // For |x| >= 1 the binary point is at bit 152 through 279 of the product.
+    int shift = 256-exponent;
+    int quadrant = ((product[shift/32] >> (shift%32)) & 1u)
+            | (((product[(shift+1)/32] >> ((shift+1)%32)) & 1u) << 1);
+    int word = (shift-64)/32;
+    int offset = (shift-64)%32;
+    ulong fraction = (ulong) product[word] | ((ulong) product[word+1] << 32);
+    if (offset != 0)
+        fraction = (fraction >> offset) | ((ulong) product[word+2] << (64-offset));
+    bool roundUp = (fraction >> 63) != 0;
+    if (roundUp) {
+        fraction = 0ul-fraction;
+        quadrant = (quadrant+1)&3;
+    }
+    df64 residual = df64(fraction)*0x1p-64f;
+    if (roundUp)
+        residual = -residual;
+    r = residual*df64(0x1.921fb6p+0f, -0x1.777a5cp-25f);
+    if (x < 0.0f) {
+        r = -r;
+        quadrant = (-quadrant)&3;
+    }
+    return quadrant;
+}
+
+inline int df64_sincos_large(df64 x, thread df64& s, thread df64& c) {
+    df64 hi, lo;
+    int quadrant = df64_reduce_float_pio2(x.hi, hi);
+    quadrant += df64_reduce_float_pio2(x.lo, lo);
+    // Reduce each limb separately so a large low limb cannot lose its phase.
+    return (quadrant + df64_sincos_reduced(hi+lo, s, c))&3;
+}
+
 inline df64 sin(df64 x) {
     if (!isfinite(x.hi))
         return df64(NAN, 0.0f);
     df64 s, c;
-    int quadrant = df64_sincos_reduced(x, s, c);
+    int quadrant = (fabs(x.hi) > 20000.0f ? df64_sincos_large(x, s, c) : df64_sincos_reduced(x, s, c));
     return quadrant == 0 ? s : (quadrant == 1 ? c : (quadrant == 2 ? -s : -c));
 }
 
@@ -493,7 +550,7 @@ inline df64 cos(df64 x) {
     if (!isfinite(x.hi))
         return df64(NAN, 0.0f);
     df64 s, c;
-    int quadrant = df64_sincos_reduced(x, s, c);
+    int quadrant = (fabs(x.hi) > 20000.0f ? df64_sincos_large(x, s, c) : df64_sincos_reduced(x, s, c));
     return quadrant == 0 ? c : (quadrant == 1 ? -s : (quadrant == 2 ? -c : s));
 }
 
