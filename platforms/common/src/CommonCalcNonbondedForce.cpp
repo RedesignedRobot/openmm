@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 
@@ -226,6 +227,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
     this->reciprocalOnQueue = false;
     this->deferPmeInterpolation = false;
     this->deferPmeSpread = false;
+    this->usePmeOwnerSpread = false;
     this->deviceIsCpu = deviceIsCpu;
     this->useFixedPointChargeSpreading = useFixedPointChargeSpreading;
     this->useCpuPme = useCpuPme;
@@ -448,6 +450,18 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
             if (pmeio == NULL) {
                 // Create required data structures.
 
+                const char* ownerSpread = getenv("OPENMM_METAL_PME_OWNER");
+                usePmeOwnerSpread = (getPlatform().getName() == "Metal" && ownerSpread != NULL &&
+                        string(ownerSpread) == "1" && !doLJPME && !cc.getUseDoublePrecision() &&
+                        gridSizeX >= PmeOrder && gridSizeY >= PmeOrder && gridSizeZ >= PmeOrder);
+                if (usePmeOwnerSpread) {
+                    pmeDefines["PME_OWNER_SPREAD"] = "1";
+                    pmeDefines["OWNER_CHARGE"] = (usePosqCharges ? "pos.w" : "charges[atom]");
+                    this->sortPmeAtoms = false;
+                    pmeOwnerHeads.initialize<int>(cc, ((gridSizeX+3)/4)*((gridSizeY+3)/4)*((gridSizeZ+3)/4), "pmeOwnerHeads");
+                    pmeOwnerAtoms.initialize<mm_int4>(cc, numParticles, "pmeOwnerAtoms");
+                    pmeOwnerSplines.initialize<mm_float4>(cc, numParticles*PmeOrder, "pmeOwnerSplines");
+                }
                 int elementSize = (cc.getUseDoublePrecision() ? sizeof(double) : sizeof(float));
                 int gridElements = gridSizeX*gridSizeY*gridSizeZ;
                 if (doLJPME) {
@@ -455,10 +469,13 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 }
                 pmeGrid1.initialize(cc, gridElements, 2*elementSize, "pmeGrid1");
                 pmeGrid2.initialize(cc, gridElements, 2*elementSize, "pmeGrid2");
-                if (useFixedPointChargeSpreading)
-                    cc.addAutoclearBuffer(pmeGrid2);
-                else
-                    cc.addAutoclearBuffer(pmeGrid1);
+                // Owners overwrite every grid point, including empty tiles.
+                if (!usePmeOwnerSpread) {
+                    if (useFixedPointChargeSpreading)
+                        cc.addAutoclearBuffer(pmeGrid2);
+                    else
+                        cc.addAutoclearBuffer(pmeGrid1);
+                }
                 pmeBsplineModuliX.initialize(cc, gridSizeX, elementSize, "pmeBsplineModuliX");
                 pmeBsplineModuliY.initialize(cc, gridSizeY, elementSize, "pmeBsplineModuliY");
                 pmeBsplineModuliZ.initialize(cc, gridSizeZ, elementSize, "pmeBsplineModuliZ");
@@ -468,13 +485,14 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                     pmeDispersionBsplineModuliZ.initialize(cc, dispersionGridSizeZ, elementSize, "pmeDispersionBsplineModuliZ");
                 }
                 pmeAtomGridIndex.initialize<mm_int2>(cc, numParticles, "pmeAtomGridIndex");
-                if (!sortPmeAtoms) {
+                if (!this->sortPmeAtoms) {
                     vector<mm_int2> atomOrder(numParticles);
                     for (int i = 0; i < numParticles; i++)
                         atomOrder[i] = mm_int2(i, 0);
                     pmeAtomGridIndex.upload(atomOrder);
                 }
-                sort = cc.createSort(new SortTrait(), cc.getNumAtoms());
+                if (!usePmeOwnerSpread)
+                    sort = cc.createSort(new SortTrait(), cc.getNumAtoms());
                 fft = cc.createFFT(gridSizeX, gridSizeY, gridSizeZ, true);
                 if (doLJPME)
                     dispersionFft = cc.createFFT(dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ, true);
@@ -485,11 +503,12 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 // Where the platform allows it, one PME kernel runs next to the bonded and nonbonded kernels.  With
                 // float atomics that is charge spreading, a single kernel that needs only the positions, and the
                 // FFT, convolution and interpolation run right after the pass.  The fixed point path spreads with
-                // two kernels, so it keeps spreading in place and sends interpolation to the pass instead.  LJPME
+                // two kernels, and owner spreading needs bins before its gather.  Both keep spreading in place
+                // and send interpolation to the pass instead.  LJPME
                 // reuses pmeGrid1 for the dispersion grid before that pass, so it keeps everything in place.
 
                 bool forcePass = (!doLJPME && cc.getSupportsForcePassKernels());
-                deferPmeSpread = (forcePass && !useFixedPointChargeSpreading);
+                deferPmeSpread = (forcePass && !useFixedPointChargeSpreading && !usePmeOwnerSpread);
                 deferPmeInterpolation = (forcePass && !deferPmeSpread);
                 if (deferPmeInterpolation)
                     pmeDefines["ATOMIC_PME_FORCES"] = "1";
@@ -864,6 +883,21 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeSpreadChargeKernel->addArg();
             pmeSpreadChargeKernel->addArg(pmeAtomGridIndex);
             pmeSpreadChargeKernel->addArg(charges);
+            if (usePmeOwnerSpread) {
+                pmeOwnerBinKernel = program->createKernel("binPmeOwner");
+                pmeOwnerBinKernel->addArg(cc.getPosq());
+                pmeOwnerBinKernel->addArg(pmeOwnerHeads);
+                pmeOwnerBinKernel->addArg(pmeOwnerAtoms);
+                pmeOwnerBinKernel->addArg(pmeOwnerSplines);
+                pmeOwnerBinKernel->addArg(charges);
+                for (int i = 0; i < 8; i++)
+                    pmeOwnerBinKernel->addArg();
+                pmeOwnerGatherKernel = program->createKernel("gatherPmeOwner");
+                pmeOwnerGatherKernel->addArg(pmeOwnerHeads);
+                pmeOwnerGatherKernel->addArg(pmeOwnerAtoms);
+                pmeOwnerGatherKernel->addArg(pmeOwnerSplines);
+                pmeOwnerGatherKernel->addArg(pmeGrid1);
+            }
             pmeConvolutionKernel->addArg(pmeGrid2);
             pmeConvolutionKernel->addArg(pmeBsplineModuliX);
             pmeConvolutionKernel->addArg(pmeBsplineModuliY);
@@ -1074,7 +1108,16 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeSpreadChargeKernel->setArg(8, recipBoxVectorsFloat[1]);
                 pmeSpreadChargeKernel->setArg(9, recipBoxVectorsFloat[2]);
             }
-            if (deferPmeSpread && !reciprocalOnQueue) {
+            if (usePmeOwnerSpread) {
+                setPeriodicBoxArgs(cc, pmeOwnerBinKernel, 5);
+                for (int i = 0; i < 3; i++)
+                    pmeOwnerBinKernel->setArg(10+i, recipBoxVectorsFloat[i]);
+                cc.clearBuffer(pmeOwnerHeads);
+                pmeOwnerBinKernel->execute(cc.getNumAtoms());
+                pmeOwnerGatherKernel->execute(64*pmeOwnerHeads.getSize(), 64);
+                computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
+            }
+            else if (deferPmeSpread && !reciprocalOnQueue) {
                 cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
                 cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
             }
