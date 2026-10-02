@@ -280,6 +280,13 @@ static void fallbacks(TrialPlatform& p) {
 // with deterministic forces.  The proposal, decision, adaptation and RNG cursor must still match exactly.
 static void sameTrialState(const vector<double>& a, const vector<double>& b) {
     ASSERT(a.size()==b.size() && a.size()==16);
+    if (a!=b) {
+        cout << setprecision(17) << "trial state source/restored:";
+        for (int i=0; i<16; i++)
+            if (a[i]!=b[i])
+                cout << " [" << i << "] " << a[i] << "/" << b[i];
+        cout << endl;
+    }
     for (int i=0; i<16; i++)
         if (i<3 || i>5)
             ASSERT(a[i]==b[i]);
