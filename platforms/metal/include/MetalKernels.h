@@ -161,6 +161,10 @@ public:
     }
     void initialize(const System& system);
     void setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c);
+    /**
+     * The fused LangevinMiddle kernel may have left the virtual sites' forces undistributed; distribute them first.
+     */
+    void getForces(ContextImpl& context, std::vector<Vec3>& forces);
 private:
     MetalContext& cu;
     ComputeArray cellOffsets, boxVectors;
