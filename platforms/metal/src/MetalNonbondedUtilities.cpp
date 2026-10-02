@@ -32,27 +32,15 @@
 #include "MetalKernelSources.h"
 #include "MetalExpressionUtilities.h"
 #include <algorithm>
-#include <atomic>
-#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <unistd.h>
 #include <map>
 #include <set>
 #include <utility>
 
 using namespace OpenMM;
 using namespace std;
-
-// The counts the host acted on for the last 4 copies, and how many of them a re-read after the command buffer
-// completed, when Metal guarantees the GPU's writes are visible, found different from what the host read mid-flight.
-struct MetalNonbondedUtilities::CountAudit {
-    mutex lock;
-    unsigned int acted[4][3] = {};
-    atomic<int> missed{0};
-};
 
 // Steps without a host wait share a command buffer, up to this many.  Fewer buffers mean fewer boundaries
 // where the GPU can idle, and committing every few steps keeps committed work queued ahead of the GPU, so
@@ -88,7 +76,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), countCopies(0), countAudit(make_shared<CountAudit>()), missedCountReads(0), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), tilesAfterReorder(0),
         uncommittedSteps(0), commitCountAfterLastStep(0) {
     // On a step that doesn't rebuild the list, each dispatch of the rebuild chain still costs the Apple9 GPUs
     // a few microseconds, so the GPU sizes that chain itself and skips it.  The Apple8 GPUs gained nothing from
@@ -114,10 +102,10 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(MetalKernelSources::nonbonded);
     // Allocate last so a failure above cannot leak the counts buffer.
-    // The tile count, single pair count, copy counter, and the last four copies use 20 words.
-    pinnedCountDeviceMemory = context.createBuffer(20*sizeof(unsigned int), "pinnedCountDeviceMemory");
+    // The host reads these counts only after all queued writes have completed.
+    pinnedCountDeviceMemory = context.createBuffer(2*sizeof(unsigned int), "pinnedCountDeviceMemory");
     pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
-    memset(pinnedCountBuffer, 0, 20*sizeof(unsigned int));
+    memset(pinnedCountBuffer, 0, 2*sizeof(unsigned int));
 }
 
 MetalNonbondedUtilities::~MetalNonbondedUtilities() {
@@ -624,13 +612,6 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         return;
     if (numTiles == 0)
         return;
-    if (countAudit->missed != missedCountReads) {
-        if (missedCountReads == 0)
-            fprintf(stderr, "OpenMM Metal: a neighbor list count read while the GPU ran differed from the count at completion; rebuilding the list\n");
-        missedCountReads = countAudit->missed;
-        forceRebuildNeighborList = true;
-    }
-
     // Compute the neighbor list.
 
     // With the indirect rebuild findBlockBounds gathers the ordered positions itself and its last threadgroup
@@ -674,7 +655,6 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     // too.  computeInteractions() commits it before waiting for the count.
     if (wait || !useIndirectRebuild) {
         context.executeKernelFlat(kernels.copyInteractionCountsKernel, &copyInteractionCountsArgs[0], 1, 1);
-        countCopies++;
     }
 }
 
@@ -703,60 +683,28 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
-        // guides reordering, which needs the exact count right after a reorder.  Steps without the wait
-        // share a command buffer, up to StepsPerCommandBuffer of them, unless the GPU has run out of work.
+        // guides reordering once the queue drains.  Exact counts require command-buffer completion.
+        // Steps without the wait share a command buffer, up to StepsPerCommandBuffer of them,
+        // unless the GPU has run out of work.
         MetalQueue& queue = context.getCurrentStream();
         bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
         if (queue.getCommitCount() != commitCountAfterLastStep)
             uncommittedSteps = 0;
-        if (wait) {
-            shared_ptr<CountAudit> audit = countAudit;
-            MTL::Buffer* pinned = pinnedCountDeviceMemory->retain();
-            unsigned int copy = countCopies;
-            queue.addCompletedHandler([audit, pinned, copy](MTL::CommandBuffer*) {
-                const unsigned int* slot = (const unsigned int*) pinned->contents()+4+4*(copy%4);
-                lock_guard<mutex> guard(audit->lock);
-                const unsigned int* acted = audit->acted[copy%4];
-                if (slot[2] == copy && acted[2] == copy && (slot[0] != acted[0] || slot[1] != acted[1]))
-                    audit->missed++;
-                pinned->release();
-            });
-        }
         if (wait || ++uncommittedSteps >= StepsPerCommandBuffer || queue.isIdle()) {
             queue.commit();
             uncommittedSteps = 0;
         }
         commitCountAfterLastStep = queue.getCommitCount();
         if (wait)
-            waitForCountCopy();
+            queue.finish();
         updateNeighborListSize();
     }
 }
 
-void MetalNonbondedUtilities::waitForCountCopy() {
-    // The host watches the copy counter in pinned memory instead of waiting on a shared event.  A signal
-    // between the neighbor list and the force kernels stalled the force kernels on the M3 Ultra until the
-    // host's next commit, 47 us per step on apoa1.  The counter usually shows up while the force kernels
-    // run; the idle check covers a buffer that ends without it, which only an error does.
-    volatile unsigned int* copies = pinnedCountBuffer+2;
-    MetalQueue& queue = context.getCurrentStream();
-    for (int i = 1; *copies != countCopies; i++) {
-        usleep(10);
-        if (i%32 == 0 && queue.isIdle() && *copies != countCopies) {
-            queue.finish();
-            throw OpenMMException("The neighbor list count never arrived");
-        }
-    }
-    std::atomic_thread_fence(std::memory_order_acquire);
-    lock_guard<mutex> guard(countAudit->lock);
-    unsigned int* acted = countAudit->acted[countCopies%4];
-    acted[0] = pinnedCountBuffer[0];
-    acted[1] = pinnedCountBuffer[1];
-    acted[2] = countCopies;
-}
-
 bool MetalNonbondedUtilities::updateNeighborListSize() {
-    if (!useCutoff)
+    // The allocation-proven path can skip the heuristic while work is in flight.
+    // isIdle() alone is insufficient: an open buffer can still write these counts.
+    if (!useCutoff || !context.getCurrentStream().isDrained())
         return false;
     if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
         tilesAfterReorder = pinnedCountBuffer[0];

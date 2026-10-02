@@ -751,11 +751,8 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
 
 extern "C" __global__ void copyInteractionCounts(const unsigned int* __restrict__ interactionCount,
         unsigned int* __restrict__ pinnedInteractionCount) {
-    // One 16 byte store, so the host never sees the new copy counter with old counts.  The second copy goes to a
-    // ring the next 3 copies leave alone, for the host's re-read once the command buffer completes.
-    uint4 counts = uint4(interactionCount[0], interactionCount[1], pinnedInteractionCount[2]+1, 0);
-    *((device uint4*) pinnedInteractionCount) = counts;
-    *((device uint4*) (pinnedInteractionCount+4+4*(counts.z%4))) = counts;
+    pinnedInteractionCount[0] = interactionCount[0];
+    pinnedInteractionCount[1] = interactionCount[1];
 }
 
 #if defined(INDIRECT_REBUILD) && !defined(SORT_BLOCKS_BY_BINS)
