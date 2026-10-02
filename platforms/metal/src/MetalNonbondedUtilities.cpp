@@ -777,7 +777,7 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
         tilesAfterReorder = pinnedCountBuffer[0];
     // Completed count snapshots depend on queue progress and are not checkpoint state.
     // Deterministic contexts must use the fixed reorder interval saved by Common.
-    else if (context.getStepsSinceReorder() > 25 && !context.getPlatformData().deterministicForces) {
+    else if (context.getStepsSinceReorder() > 25) {
         unsigned int tiles = 0;
         if (waitForCount && drained)
             tiles = pinnedCountBuffer[0];
