@@ -64,10 +64,10 @@ static const int StepsPerCommandBuffer = 8;
 // size range per threadgroup instead of per block.
 static const int FindBlockBoundsThreadBlockSize = 256;
 
-// prepareRebuildDispatch sorts up to this many blocks in its one threadgroup.  Larger systems sort in
-// three dispatches of BinSortThreadBlockSize threads (at most 256, since a block's rank inside its
-// threadgroup takes 8 bits).
-static const int MaxBlocksSortedInOneGroup = 1024;
+// sortBlocksInOneGroup sorts up to this many blocks in its one threadgroup, one chunk of blocks per pass
+// over its threads.  Larger systems sort in three dispatches of BinSortThreadBlockSize threads (at most 256,
+// since a block's rank inside its threadgroup takes 8 bits), which beat a long serial chunk loop.
+static const int MaxBlocksSortedInOneGroup = 4096;
 static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
@@ -141,6 +141,7 @@ void MetalNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic,
     useCutoff = usesCutoff;
     usePeriodic = usesPeriodic;
     useNeighborList |= (usesNeighborList && useCutoff);
+    numInteractions++;
     groupCutoff[forceGroup] = cutoffDistance;
     groupFlags |= 1<<forceGroup;
     canUsePairList &= supportsPairList;
@@ -230,6 +231,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
     int numAtomBlocks = context.getNumAtomBlocks();
     int numContexts = context.getPlatformData().contexts.size();
     setAtomBlockRange(context.getContextIndex()/(double) numContexts, (context.getContextIndex()+1)/(double) numContexts);
+    useRoleOrder = chooseRoleOrder(system);
 
     // Build a list of tiles that contain exclusions.
 
@@ -346,8 +348,9 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         oldPositions.initialize(context, numAtoms, 4*elementSize, "oldPositions");
         rebuildNeighborList.initialize<int>(context, 1, "rebuildNeighborList");
         if (useIndirectRebuild) {
-            displacementFlags.initialize<unsigned int>(context, numAtomBlocks, "displacementFlags");
-            rebuildDispatch.initialize<unsigned int>(context, 12, "rebuildDispatch");
+            // Five indirect dispatch triples, then findBlockBounds' arrival counter and moved flag, which start at 0.
+            rebuildDispatch.initialize<unsigned int>(context, 20, "rebuildDispatch");
+            rebuildDispatch.upload(vector<unsigned int>(20, 0));
         }
         if (sortBlocksByBins) {
             int binSortGroups = (numAtomBlocks+BinSortThreadBlockSize-1)/BinSortThreadBlockSize;
@@ -369,7 +372,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     // Record arguments for kernels.
 
-    forceArgs.push_back(&context.unwrap(context.getLongForceBuffer()).getDevicePointer());
+    MetalArray& listPosq = (useRoleOrder ? orderedPosq : context.unwrap(context.getPosq()));
+    forceArgs.push_back(useRoleOrder ? &orderedForces.getDevicePointer() : &context.unwrap(context.getLongForceBuffer()).getDevicePointer());
     forceArgs.push_back(&context.unwrap(context.getEnergyBuffer()).getDevicePointer());
     forceArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
     forceArgs.push_back(&exclusions.getDevicePointer());
@@ -390,6 +394,8 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         forceArgs.push_back(&interactingAtoms.getDevicePointer());
         forceArgs.push_back(&maxSinglePairs);
         forceArgs.push_back(&singlePairs.getDevicePointer());
+        if (useRoleOrder)
+            forceArgs.push_back(&atomOrder.getDevicePointer());
     }
     hasInitializedParams = false;
     paramStartIndex = forceArgs.size();
@@ -404,15 +410,21 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findBlockBoundsArgs.push_back(context.getPeriodicBoxVecXPointer());
         findBlockBoundsArgs.push_back(context.getPeriodicBoxVecYPointer());
         findBlockBoundsArgs.push_back(context.getPeriodicBoxVecZPointer());
-        findBlockBoundsArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+        findBlockBoundsArgs.push_back(&listPosq.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockCenter.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockBoundingBox.getDevicePointer());
         findBlockBoundsArgs.push_back(&rebuildNeighborList.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockSizeRange.getDevicePointer());
         if (useIndirectRebuild) {
             findBlockBoundsArgs.push_back(&oldPositions.getDevicePointer());
-            findBlockBoundsArgs.push_back(&displacementFlags.getDevicePointer());
             findBlockBoundsArgs.push_back(&forceRebuildNeighborList);
+            findBlockBoundsArgs.push_back(&interactionCount.getDevicePointer());
+            findBlockBoundsArgs.push_back(&pinnedCountDeviceMemory);
+            findBlockBoundsArgs.push_back(&rebuildDispatch.getDevicePointer());
+            if (useRoleOrder) {
+                findBlockBoundsArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+                findBlockBoundsArgs.push_back(&atomOrder.getDevicePointer());
+            }
         }
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
         computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
@@ -431,7 +443,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
             sortBoxDataArgs.push_back(context.getPeriodicBoxVecYPointer());
             sortBoxDataArgs.push_back(context.getPeriodicBoxVecZPointer());
         }
-        sortBoxDataArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+        sortBoxDataArgs.push_back(&listPosq.getDevicePointer());
         sortBoxDataArgs.push_back(&oldPositions.getDevicePointer());
         sortBoxDataArgs.push_back(&interactionCount.getDevicePointer());
         sortBoxDataArgs.push_back(&rebuildNeighborList.getDevicePointer());
@@ -446,7 +458,7 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&interactingTiles.getDevicePointer());
         findInteractingBlocksArgs.push_back(&interactingAtoms.getDevicePointer());
         findInteractingBlocksArgs.push_back(&singlePairs.getDevicePointer());
-        findInteractingBlocksArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+        findInteractingBlocksArgs.push_back(&listPosq.getDevicePointer());
         findInteractingBlocksArgs.push_back(&maxTiles);
         findInteractingBlocksArgs.push_back(&maxSinglePairs);
         findInteractingBlocksArgs.push_back(&startBlockIndex);
@@ -462,9 +474,123 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&exclusionRowIndices.getDevicePointer());
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        if (useRoleOrder)
+            findInteractingBlocksArgs.push_back(&atomRoles.getDevicePointer());
         copyInteractionCountsArgs.push_back(&interactionCount.getDevicePointer());
         copyInteractionCountsArgs.push_back(&pinnedCountDeviceMemory);
     }
+}
+
+// Role of each particle in a NonbondedForce: 1 if it has LJ, 2 if it has charge, counting parameter offsets.
+static vector<int> nonbondedRoles(const NonbondedForce& force) {
+    vector<int> roles(force.getNumParticles());
+    for (int i = 0; i < force.getNumParticles(); i++) {
+        double charge, sigma, epsilon;
+        force.getParticleParameters(i, charge, sigma, epsilon);
+        roles[i] = (epsilon != 0 ? 1 : 0) | (charge != 0 ? 2 : 0);
+    }
+    for (int i = 0; i < force.getNumParticleParameterOffsets(); i++) {
+        string parameter;
+        int particle;
+        double chargeScale, sigmaScale, epsilonScale;
+        force.getParticleParameterOffset(i, parameter, particle, chargeScale, sigmaScale, epsilonScale);
+        roles[particle] |= (epsilonScale != 0 ? 1 : 0) | (chargeScale != 0 ? 2 : 0);
+    }
+    return roles;
+}
+
+void MetalNonbondedUtilities::checkRoleOrder(const NonbondedForce& force) const {
+    if (!useRoleOrder)
+        return;
+    vector<int> roles = nonbondedRoles(force);
+    for (int i = 0; i < (int) roles.size(); i++)
+        if ((roles[i] & ~contextRoles[i]) != 0)
+            throw OpenMMException("updateParametersInContext: A particle gained charge or Lennard-Jones parameters it did not have when the Context was created");
+}
+
+// A water model whose oxygen has LJ but no charge and whose other sites have charge but no LJ (TIP4P-Ew, TIP5P, OPC)
+// has site pairs that never interact: in a tile of such waters 6 of 16 site pairs do nothing.  Role order puts the
+// atoms of small molecules that have only one role after all other atoms, LJ only first and charge only second,
+// and the neighbor list then lists an atom only for x atoms that share a role with it.  On the FAH tip4pew unit
+// this was priced at 0.68-0.77 of today's nonbonded tile cost (lab lanes/r3-explicit.md).  Pairs of atoms with no
+// shared role contribute nothing to any NonbondedForce term, so their exclusions are dropped too.  The roles come
+// from NonbondedForce's parameters and offsets, so it must be the only interaction.  TIP3P has no LJ-only sites
+// and gets more tiles in this order, so both roles must each hold a tenth of the atoms.
+bool MetalNonbondedUtilities::chooseRoleOrder(const System& system) {
+    if (!useNeighborList || !useIndirectRebuild || numInteractions != 1 || context.getPlatformData().contexts.size() != 1)
+        return false;
+    const NonbondedForce* nonbonded = NULL;
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const NonbondedForce* force = dynamic_cast<const NonbondedForce*>(&system.getForce(i));
+        if (force == NULL)
+            continue;
+        if (nonbonded != NULL)
+            return false;
+        nonbonded = force;
+    }
+    if (nonbonded == NULL || nonbonded->getNonbondedMethod() == NonbondedForce::LJPME || nonbonded->getNumParticles() != numAtoms)
+        return false;
+    vector<int> roles = nonbondedRoles(*nonbonded);
+
+    // Molecules are the groups the exclusions connect.  Only atoms of molecules up to 8 atoms move, so the atoms of
+    // a protein stay together.
+    vector<int> parent(numAtoms);
+    for (int i = 0; i < numAtoms; i++)
+        parent[i] = i;
+    auto root = [&parent](int i) {
+        while (parent[i] != i)
+            i = parent[i] = parent[parent[i]];
+        return i;
+    };
+    for (int i = 0; i < numAtoms; i++)
+        for (int j : atomExclusions[i])
+            parent[root(i)] = root(j);
+    vector<int> moleculeSize(numAtoms, 0);
+    for (int i = 0; i < numAtoms; i++)
+        moleculeSize[root(i)]++;
+    vector<vector<int> > regions(4);
+    for (int i = 0; i < numAtoms; i++) {
+        bool moves = (moleculeSize[root(i)] <= 8 && roles[i] != 3);
+        regions[moves ? (roles[i] == 0 ? 3 : roles[i]) : 0].push_back(i);
+    }
+    if (regions[1].size() < numAtoms/10 || regions[2].size() < numAtoms/10)
+        return false;
+
+    int paddedNumAtoms = context.getPaddedNumAtoms();
+    vector<int> order, orderedRoles(paddedNumAtoms, 0), position(numAtoms);
+    for (vector<int>& region : regions)
+        order.insert(order.end(), region.begin(), region.end());
+    for (int i = numAtoms; i < paddedNumAtoms; i++)
+        order.push_back(i);
+    for (int i = 0; i < numAtoms; i++) {
+        position[order[i]] = i;
+        orderedRoles[i] = roles[order[i]];
+    }
+    vector<vector<int> > orderedExclusions(numAtoms);
+    for (int i = 0; i < numAtoms; i++) {
+        int atom = order[i];
+        for (int j : atomExclusions[atom])
+            if (j == atom || (roles[atom] & roles[j]) != 0)
+                orderedExclusions[i].push_back(position[j]);
+    }
+    atomExclusions = orderedExclusions;
+    contextRoles = roles;
+    atomOrder.initialize<int>(context, paddedNumAtoms, "atomOrder");
+    atomRoles.initialize<int>(context, paddedNumAtoms, "atomRoles");
+    orderedPosq.initialize(context, paddedNumAtoms, context.getPosq().getElementSize(), "orderedPosq");
+    orderedForces.initialize<unsigned long long>(context, 3*paddedNumAtoms, "orderedForces");
+    orderedForces.upload(vector<unsigned long long>(3*paddedNumAtoms, 0));
+    atomOrder.upload(order);
+    atomRoles.upload(orderedRoles);
+    return true;
+}
+
+void MetalNonbondedUtilities::scatterRoleForces() {
+    if (!roleForcesPending)
+        return;
+    roleForcesPending = false;
+    void* args[] = {&orderedForces.getDevicePointer(), &atomOrder.getDevicePointer(), &context.unwrap(context.getLongForceBuffer()).getDevicePointer()};
+    context.executeKernelFlat(scatterOrderedForcesKernel, args, context.getPaddedNumAtoms(), 64);
 }
 
 double MetalNonbondedUtilities::getMaxCutoffDistance() {
@@ -504,15 +630,21 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
 
     // Compute the neighbor list.
 
+    // With the indirect rebuild findBlockBounds gathers the ordered positions itself and its last threadgroup
+    // decides the rebuild and sizes the indirect dispatches below (empty on a step without a rebuild).
+    if (useRoleOrder && !useIndirectRebuild) {
+        void* gatherArgs[] = {&context.unwrap(context.getPosq()).getDevicePointer(), &atomOrder.getDevicePointer(), &orderedPosq.getDevicePointer()};
+        context.executeKernelFlat(kernels.gatherOrderedPositionsKernel, gatherArgs, context.getPaddedNumAtoms(), 64);
+    }
     context.executeKernelFlat(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getPaddedNumAtoms(), FindBlockBoundsThreadBlockSize);
     if (useIndirectRebuild) {
-        void* args[] = {&displacementFlags.getDevicePointer(), &rebuildNeighborList.getDevicePointer(),
-                &interactionCount.getDevicePointer(), &pinnedCountDeviceMemory, &blockSizeRange.getDevicePointer(),
-                &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer(), &rebuildDispatch.getDevicePointer()};
-        int prepareThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.prepareRebuildDispatchKernel->maxTotalThreadsPerThreadgroup());
-        context.executeKernelFlat(kernels.prepareRebuildDispatchKernel, args, prepareThreads, prepareThreads);
         MTL::Buffer* dispatch = rebuildDispatch.getDevicePointer();
-        if (sortBlocksByBins) {
+        if (!sortBlocksByBins) {
+            void* sortArgs[] = {&blockSizeRange.getDevicePointer(), &blockBoundingBox.getDevicePointer(), &sortedBlocks.getDevicePointer()};
+            int sortThreads = min((context.getNumAtomBlocks()+31)/32*32, (int) kernels.sortBlocksKernel->maxTotalThreadsPerThreadgroup());
+            context.executeKernelFlat(kernels.sortBlocksKernel, sortArgs, 0, sortThreads, 0, dispatch, 12*sizeof(unsigned int));
+        }
+        else {
             void* countArgs[] = {&blockBoundingBox.getDevicePointer(), &blockSizeRange.getDevicePointer(),
                     &binRanks.getDevicePointer(), &binCounts.getDevicePointer()};
             void* sumArgs[] = {&binCounts.getDevicePointer(), &binOffsets.getDevicePointer()};
@@ -532,7 +664,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
         context.executeKernelFlat(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtomBlocks() * context.getSIMDWidth() * numTilesInBatch, findInteractingBlocksThreadBlockSize);
     }
     forceRebuildNeighborList = false;
-    // With the indirect rebuild, prepareRebuildDispatch already copied a count, at most one list old,
+    // With the indirect rebuild, findBlockBounds already copied a count, at most one list old,
     // which is all a step without the wait needs.
     bool wait = (waitForCount || context.getStepsSinceReorder() == 0);
     // Each command buffer boundary leaves the GPU idle, so the force kernels go into this buffer
@@ -563,6 +695,8 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         if (!hasInitializedParams)
             initParamArgs();
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        if (useRoleOrder && includeForces)
+            roleForcesPending = true;
     }
     if (useNeighborList && numTiles > 0) {
         // Without the wait, the count comes from an earlier step.  It can't exceed the arrays, so it only
@@ -758,10 +892,12 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["GROUP_SIZE"] = context.intToString(findInteractingBlocksThreadBlockSize);
         if (useIndirectRebuild)
             defines["INDIRECT_REBUILD"] = "1";
+        defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
+        if (useRoleOrder)
+            defines["ROLE_ORDER"] = "1";
         if (sortBlocksByBins) {
             defines["SORT_BLOCKS_BY_BINS"] = "1";
             defines["BIN_SORT_GROUP"] = context.intToString(BinSortThreadBlockSize);
-            defines["NUM_SIZE_BINS"] = context.intToString(NumSizeBins);
         }
         defines["FIND_BLOCK_BOUNDS_GROUP"] = context.intToString(FindBlockBoundsThreadBlockSize);
         int binShift = 1;
@@ -771,8 +907,8 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         metalModule_t interactingBlocksProgram = context.createModule(MetalKernelSources::vectorOps+MetalKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
-        if (useIndirectRebuild)
-            kernels.prepareRebuildDispatchKernel = context.getKernel(interactingBlocksProgram, "prepareRebuildDispatch");
+        if (useIndirectRebuild && !sortBlocksByBins)
+            kernels.sortBlocksKernel = context.getKernel(interactingBlocksProgram, "sortBlocksInOneGroup");
         if (sortBlocksByBins) {
             kernels.countBlockBinsKernel = context.getKernel(interactingBlocksProgram, "countBlockBins");
             kernels.sumBlockBinsKernel = context.getKernel(interactingBlocksProgram, "sumBlockBins");
@@ -782,6 +918,10 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
         kernels.copyInteractionCountsKernel = context.getKernel(interactingBlocksProgram, "copyInteractionCounts");
+        if (useRoleOrder) {
+            kernels.gatherOrderedPositionsKernel = context.getKernel(interactingBlocksProgram, "gatherOrderedPositions");
+            scatterOrderedForcesKernel = context.getKernel(interactingBlocksProgram, "scatterOrderedForces");
+        }
     }
     groupKernels[groups] = kernels;
 }
@@ -828,7 +968,7 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         load1 << " ";
         load1 << param.getName();
         load1 << "1 = ";
-        load1 << loadParameter(param, "atom1");
+        load1 << loadParameter(param, useRoleOrder ? "NB_ATOM(atom1)" : "atom1");
         load1 << ";\n";
     }
     replacements["LOAD_ATOM1_PARAMETERS"] = load1.str();
@@ -859,7 +999,7 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
 
     stringstream loadLocal2;
     for (const ComputeParameterInfo& param : params)
-        loadLocal2<<"shfl"<<param.getName()<<" = "<<loadParameter(param, "j")<<";\n";
+        loadLocal2<<"shfl"<<param.getName()<<" = "<<loadParameter(param, useRoleOrder ? "NB_ATOM(j)" : "j")<<";\n";
     replacements["LOAD_LOCAL_PARAMETERS_FROM_GLOBAL"] = loadLocal2.str();
 
     stringstream load2j;
@@ -910,6 +1050,8 @@ metalFunction_t MetalNonbondedUtilities::createInteractionKernel(const string& s
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    if (useRoleOrder)
+        defines["ROLE_ORDER"] = "1";
     defines["ENABLE_SHUFFLE"] = "1"; // Used only in metalpoNonbonded.cc
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
