@@ -902,12 +902,15 @@ int MetalContext::computeThreadBlockSize(double memory) const {
 }
 
 double MetalContext::reduceEnergy() {
+    MetalArray& result = (barostatEnergy == nullptr ? unwrap(energySum) : *barostatEnergy);
     int workGroupSize = getMaxThreadBlockSize();
     reduceEnergyKernel->setArg(0, energyBuffer);
-    reduceEnergyKernel->setArg(1, energySum);
+    reduceEnergyKernel->setArg(1, result);
     reduceEnergyKernel->setArg(2, energyBuffer.getSize());
     reduceEnergyKernel->setArg(3, workGroupSize);
-    reduceEnergyKernel->execute(workGroupSize*energySum.getSize(), workGroupSize);
+    reduceEnergyKernel->execute(workGroupSize*result.getSize(), workGroupSize);
+    if (barostatEnergy != nullptr)
+        return 0.0;
     if (deferredEnergy != NULL) {
         size_t bytes = energySum.getSize()*energySum.getElementSize();
         MetalQueue& queue = getCurrentStream();
@@ -919,14 +922,34 @@ double MetalContext::reduceEnergy() {
         pool->release();
         return 0;
     }
-    energySum.download(pinnedBuffer);
+    return readEnergy(result);
+}
+
+void MetalContext::enqueueEnergy(MetalArray& result, int groups, double& forceEnergy, double& platformEnergy) {
+    if (barostatEnergy != nullptr || deferredEnergy != NULL)
+        throw OpenMMException("Nested deferred energy evaluation");
+    if (!result.isInitialized())
+        result.initialize(*this, energySum.getSize(), energySum.getElementSize(), "barostatEnergy");
+    barostatEnergy = &result;
+    try {
+        platformEnergy = getContextImpl()->calcForcesAndEnergy(false, true, groups, forceEnergy);
+    }
+    catch (...) {
+        barostatEnergy = nullptr;
+        throw;
+    }
+    barostatEnergy = nullptr;
+}
+
+double MetalContext::readEnergy(MetalArray& buffer) {
+    buffer.download(pinnedBuffer);
     double result = 0;
     if (getUseDoublePrecision() || getUseMixedPrecision()) {
-        for (int i = 0; i < energySum.getSize(); i++)
+        for (int i = 0; i < buffer.getSize(); i++)
             result += ((double*) pinnedBuffer)[i];
     }
     else {
-        for (int i = 0; i < energySum.getSize(); i++)
+        for (int i = 0; i < buffer.getSize(); i++)
             result += ((float*) pinnedBuffer)[i];
     }
     return result;

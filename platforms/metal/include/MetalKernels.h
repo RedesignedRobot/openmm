@@ -271,6 +271,21 @@ public:
     }
 };
 
+/** Isotropic barostat with optional deferred potential energy readbacks. */
+class MetalApplyMonteCarloBarostatKernel : public CommonApplyMonteCarloBarostatKernel {
+public:
+    MetalApplyMonteCarloBarostatKernel(std::string name, const Platform& platform, MetalContext& cu) :
+            CommonApplyMonteCarloBarostatKernel(name, platform, cu), cu(cu) {
+    }
+    void initialize(const System& system, const Force& barostat, int components, bool rigidMolecules=true);
+    bool computeTrialEnergies(ContextImpl& context, int groups, const std::function<void()>& propose,
+                              double& initialEnergy, double& finalEnergy);
+private:
+    MetalContext& cu;
+    bool deferEnergies = false;
+    MetalArray initialEnergySum, finalEnergySum;
+};
+
 } // namespace OpenMM
 
 #endif /*OPENMM_METALKERNELS_H_*/

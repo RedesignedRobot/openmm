@@ -31,6 +31,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/AndersenThermostat.h"
+#include <functional>
 #include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/BrownianIntegrator.h"
 #include "openmm/CMAPTorsionForce.h"
@@ -1785,6 +1786,19 @@ public:
      *                   equal the number of components passed to initialize().
      */
     virtual void computeKineticEnergy(ContextImpl& context, std::vector<double>& ke) = 0;
+    /**
+     * Optionally evaluate the energies around an isotropic barostat proposal.
+     * Return false without side effects to use the existing synchronous path.
+     * An implementation returning true must evaluate the initial energy, invoke
+     * propose exactly once, then evaluate the final energy with the same force
+     * groups and numerical results as Context::getState(State::Energy).
+     * It may defer readback until both evaluations have been submitted.  The
+     * caller retains the Metropolis decision and rejection handling.
+     */
+    virtual bool computeTrialEnergies(ContextImpl& context, int groups, const std::function<void()>& propose,
+                                     double& initialEnergy, double& finalEnergy) {
+        return false;
+    }
 };
 
 /**
