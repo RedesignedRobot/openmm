@@ -343,6 +343,24 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
 #else
         real denom = m2*bx*by*bz;
         real eterm = recipScaleFactor*EXP(-RECIP_EXP_FACTOR*m2)/denom;
+#ifdef USE_METAL
+        // A Nyquist index keeps its sign under conjugation.  In a triclinic box
+        // the conjugate mode can therefore have a different convolution weight.
+        // Average the pair to reproduce the real part of a full complex inverse
+        // and keep the half spectrum Hermitian for either real inverse FFT.
+        if ((GRID_SIZE_X%2 == 0 && kx == GRID_SIZE_X/2) ||
+                (GRID_SIZE_Y%2 == 0 && ky == GRID_SIZE_Y/2) || (GRID_SIZE_Z%2 == 0 && kz == GRID_SIZE_Z/2)) {
+            int cx = (kx == 0 ? 0 : GRID_SIZE_X-kx), cy = (ky == 0 ? 0 : GRID_SIZE_Y-ky), cz = (kz == 0 ? 0 : GRID_SIZE_Z-kz);
+            int nx = (cx < (GRID_SIZE_X+1)/2 ? cx : cx-GRID_SIZE_X);
+            int ny = (cy < (GRID_SIZE_Y+1)/2 ? cy : cy-GRID_SIZE_Y);
+            int nz = (cz < (GRID_SIZE_Z+1)/2 ? cz : cz-GRID_SIZE_Z);
+            real hx = nx*recipBoxVecX.x, hy = nx*recipBoxVecY.x+ny*recipBoxVecY.y;
+            real hz = nx*recipBoxVecZ.x+ny*recipBoxVecZ.y+nz*recipBoxVecZ.z;
+            real norm2 = hx*hx+hy*hy+hz*hz;
+            real conjugateDenom = norm2*pmeBsplineModuliX[cx]*pmeBsplineModuliY[cy]*pmeBsplineModuliZ[cz];
+            eterm = 0.5f*(eterm+recipScaleFactor*EXP(-RECIP_EXP_FACTOR*norm2)/conjugateDenom);
+        }
+#endif
         if (kx != 0 || ky != 0 || kz != 0) {
             pmeGrid[index] = make_real2(grid.x*eterm, grid.y*eterm);
         } else {

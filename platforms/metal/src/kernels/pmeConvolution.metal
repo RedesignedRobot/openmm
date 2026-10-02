@@ -232,6 +232,19 @@ KERNEL void convolveLines(GLOBAL float2* RESTRICT grid, GLOBAL const float2* RES
         float m2 = mhx*mhx+mhy*mhy+mhz*mhz;
         float denom = m2*bx*by*bz;
         float eterm = recipScaleFactor*EXP(-recipExpFactor*m2)/denom;
+        // Match the real part of the full complex convolution on Nyquist modes,
+        // whose conjugates can have different weights in a triclinic box.
+        if ((NX%2 == 0 && kx == NX/2) || (NY%2 == 0 && ky == NY/2) || (NZ%2 == 0 && kz == NZ/2)) {
+            int cx = (kx == 0 ? 0 : NX-kx), cy = (ky == 0 ? 0 : NY-ky), cz = (kz == 0 ? 0 : NZ-kz);
+            int nx = (cx < (NX+1)/2 ? cx : cx-NX);
+            int ny = (cy < (NY+1)/2 ? cy : cy-NY);
+            int nz = (cz < (NZ+1)/2 ? cz : cz-NZ);
+            float hx = nx*recipBoxVecX.x, hy = nx*recipBoxVecY.x+ny*recipBoxVecY.y;
+            float hz = nx*recipBoxVecZ.x+ny*recipBoxVecZ.y+nz*recipBoxVecZ.z;
+            float norm2 = hx*hx+hy*hy+hz*hz;
+            float conjugateDenom = norm2*pmeBsplineModuliX[cx]*pmeBsplineModuliY[cy]*pmeBsplineModuliZ[cz];
+            eterm = 0.5f*(eterm+recipScaleFactor*EXP(-recipExpFactor*norm2)/conjugateDenom);
+        }
         buf[i] = (kx != 0 || ky != 0 || kz != 0) ? buf[i]*eterm : float2(0);
     }
     LOCAL_BARRIER
