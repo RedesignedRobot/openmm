@@ -151,10 +151,11 @@ device decision/restore work: net 15 to 18 us, yielding
 `484.43/469.43 = 1.03195` to `484.43/466.43 = 1.03859`.
 Using the lower 19 us drain estimate broadens the low end to 14 us net,
 `484.43/470.43 = 1.02976`. Phase 1 is already included in those totals.
-Phase 2 also requires authoritative device box state and exact acceptance/RNG
-semantics; copying a host decision into a device restore kernel does not remove
+Phase 2 also requires authoritative device box state and a defined acceptance/RNG
+contract; copying a host decision into a device restore kernel does not remove
 the remaining drain. Host `log`/`exp` cannot simply be replaced by Metal math with
-a bitwise-identity claim.
+a bitwise-identity claim. The phase 2 investigation below records the revised
+contract and the prerequisites. These cost figures remain a model.
 
 After the GPU is free, have the liaison prepare these two isolated build trees:
 `ultra-m029-baro-base` at d670532ac plus only the inherited brace repair, and
@@ -183,6 +184,151 @@ print(f"{'KEEP' if ratio >= 1.01 else 'KILL'}: {ratio:.6f}x, {(ratio-1)*100:.3f}
 raise SystemExit(0 if ratio >= 1.01 else 1)
 PY
 ```
+
+## Phase 2 investigation at c0365efdc
+
+Phase 2 is not implemented. The investigation leaves phase 1 unchanged. There is
+no device-path engagement claim, new switch, or new core API. The phase 2 core
+API delta is zero added and zero removed lines.
+
+The initial brief required bitwise agreement with the host under
+DeterministicForces, including the conditional host RNG draw. In its lane reply
+on 2026-10-02, the liaison changed that requirement to a statistically correct
+device decision with an independent unbiased RNG and energy error well below
+kT. It prohibited host-RNG mirroring, lifted the PME file restriction, and
+authorized implementation only if the Metal device-box plumbing fit about 300
+changed lines without changing CUDA or OpenCL behavior. Otherwise it requested
+this prerequisite design. No statistically correct device path has been proved
+or tested here. The original bitwise acceptance criteria remain unmet.
+
+### Why a direct decision port cannot claim host identity
+
+`MonteCarloBarostatImpl::updateContextState` consumes one SFMT uniform for the
+volume proposal. It computes the following in host double precision:
+
+```cpp
+w = finalEnergy-initialEnergy + pressure*deltaVolume
+    - numberOfScaledParticles*kT*log(newVolume/volume);
+reject = w > 0 && uniform() > exp(-w/kT);
+```
+
+The second draw occurs whenever w is positive, including accepted uphill moves.
+It does not occur for nonpositive w. `SimTKOpenMMUtilities` owns a static SFMT
+state; `genrand_real2` converts a 32-bit integer to `integer * 2^-32`. Drawing two
+uniforms unconditionally shifts the next proposal whenever w is nonpositive.
+A separate device RNG can implement the revised statistical contract but cannot
+prove the original stream identity. DeterministicForces does not change this.
+
+Host precomputation can preserve the volume log term, but the usual threshold
+`-kT*log(uniform)` is not an exact inversion of the rounded host exp predicate.
+A CPU-only check with the local host libm produced this valid SFMT-lattice input:
+
+```text
+kT = 1
+uniform integer = 2
+u = 0x1.0000000000000p-31
+w = -log(u) = 0x1.57cd0e7026820p+4
+exp(-w) = 0x1.ffffffffffff7p-32
+u > exp(-w): true
+w > -log(u): false
+```
+
+This refutes that algebraic replacement, not every possible host-precomputed
+threshold. An exact threshold design would need to locate the boundary of the
+actual host predicate over representable values, establish its monotonicity on
+the supported domain, preserve strict comparisons and special cases such as
+u=0, and reproduce the rounded energy arithmetic feeding the comparison. It
+would also need an unconsumed lookahead draw and conditional ownership of the
+shared SFMT cursor. That design is not implemented and the liaison ruled out
+host-RNG mirroring for this round.
+
+`MetalContext::readEnergy` adds each downloaded reduction element, in index
+order, into a host double. Phase 1 then reconstructs
+`hostForce + (hostPlatform + reduction)`. The device must reproduce these
+roundings as well as the work expression to retain exact host decisions.
+`df64.metal` represents a value with two floats and implements its own exp/log;
+it is not a general IEEE binary64 arithmetic replacement. Reusing it is not an
+exactness proof. Host exp/log precomputation alone does not fix the energy sum.
+
+One-trial-late host evaluation also needs more than coordinate restoration.
+After a wrong speculative decision, subsequent integration has used the wrong
+box, forces and random draws. Correct replay needs snapshots of integrator RNG,
+velocities, force validity, atom order, cell offsets, neighbor data and adaptation
+counters. An observation before validation must wait. No complete speculative
+checkpoint or replay protocol is present in the phase 1 hooks.
+
+### Device box is a prerequisite even under the revised contract
+
+The current call chain has multiple host dependencies:
+
+* `CommonCalcNonbondedForceKernel::execute` reads host box vectors and computes
+  the reciprocal vectors in double precision. It supplies them by value to PME
+  grid indexing and spreading. `computeReciprocalFromGrid` supplies them to
+  convolution, energy evaluation and interpolation, including the FFT hook.
+* The same force implementation adds `dispersionCoefficient/(a[0]*b[1]*c[2])`
+  to the host energy. Updating a device volume does not update that contribution.
+* `MetalContext::executeKernelFlat` copies scalar arguments with `setBytes`, or
+  packs them with memcpy before `setBytes`. Updating a buffer after submission
+  cannot change those encoded values.
+* Direct-space and neighbor kernels receive box-size, inverse-size and vector
+  arguments too. `MetalNonbondedUtilities::prepareInteractions` also checks the
+  box size on the host. A PME-only change would leave these consumers stale.
+* Common barostat restoration copies saved device buffers but also restores
+  host cell offsets and, if necessary, atom ordering. A conditional position
+  copy alone is not a complete rejection.
+
+Changing the host box getter to download the result would restore correctness
+but insert the prohibited dependency at the next force submission. The liaison
+confirmed that no existing device-box mechanism was missed. I did not identify
+a complete implementation within its approximately 300-line limit. This is a
+scope assessment, not a proof that no compact design is possible.
+
+### Prerequisite design and validation
+
+First introduce a Metal-owned box-state buffer with current and trial vectors,
+reciprocal vectors, size/inverse size and volume. Give every periodic Metal
+kernel an explicit binding to that state. Extend the Metal argument path to
+support device-selected values in both packed and unpacked kernels. Cover the
+FFT convolution hook as well as standalone PME kernels. Preserve the existing
+argument path by default on all other platforms. Select the dispersion and
+plasma correction volumes from the same state, with each energy contribution
+included exactly once.
+
+Then add a device trial-state buffer containing the proposal scale, attempt and
+accept counters, outcome and RNG state. Under the revised contract, seed an
+independent stream and define its checkpoint/reinitialization behavior. Move
+proposal generation, volume adaptation, decision and conditional restore into
+an ordered device transaction. The next force submission must consume its
+selected box without first obtaining a host scale or decision. Handle atom
+reordering, cell offsets and force validity explicitly. Host box getters,
+checkpoint operations and counter queries can resolve the pending transaction;
+internal force submission must not use those resolving getters.
+
+The statistical decision still needs an error budget. Reduce initial and trial
+energies with a documented precision and order, bound the error in their
+difference relative to kT on the target systems, and verify the RNG distribution
+and acceptance rule. If a threshold is used, document its rounding contract.
+Do not describe this path as trajectory-identical to phase 1. Keep
+`OPENMM_METAL_DEFER_BAROSTAT_ENERGIES=0` as a host-path fallback. Any additional
+device switch must default off outside the established phase 1 eligibility.
+
+Before integration, test both packing modes, rejection followed by a force
+evaluation, current-box reporting, dispersion correction, checkpoint/resume,
+reordering and counter adaptation. Require an engagement counter and both
+accepts and rejects. Keep the existing phase 1 bitwise test. A separate phase 2
+test must reflect the revised statistical contract, including single and mixed
+precision and at least 100 mixed trials on fah-tip4pew and fah-tip3p-hmr.
+Those tests and TestMetalMonteCarloBarostat were not run in this investigation.
+All future GPU correctness commands must use the lane's correctness lease.
+
+The original cost model omits this prerequisite machinery. At frequency 25,
+write the modeled total phase 2 saving as `(D-R-B)/25` per step, where D is the
+removed drain cost per trial, R is decision/restore cost and B is all additional
+box, RNG, reduction and bookkeeping cost amortized per trial. The old estimates
+used D=500 microseconds, R=50 to 125 and B=0, giving 15 to 18 microseconds per
+step in total, including phase 1. B is unknown, so that range is not established
+for this design. With no phase 2 implementation, incremental saving over phase
+1 is zero. No timing command or GPU execution ran for this investigation.
 
 Kill below 1.0% whole-step throughput gain. At the reference clock, 1.01x requires
 `484.43 - 484.43/1.01 = 4.79634 us/step` saved. Inspect each round and the recorded
