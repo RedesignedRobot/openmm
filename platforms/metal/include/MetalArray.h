@@ -102,6 +102,10 @@ public:
      */
     void resize(size_t size);
     /**
+     * Exchange storage and metadata without allocating.
+     */
+    void swap(MetalArray& other) noexcept;
+    /**
      * Get whether this array has been initialized.
      */
     bool isInitialized() const {

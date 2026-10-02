@@ -834,9 +834,6 @@ KERNEL void computeCCMAConstraintDirectionsKernel(GLOBAL const int2* RESTRICT co
 DEVICE void computeCCMAPositionConstraintForce(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
         GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         mixed tol, int iteration, LOCAL_ARG int* groupConverged) {
-    if (LOCAL_ID == 0)
-        *groupConverged = 1;
-    SYNC_THREADS;
     mixed lowerTol = 1-2*tol+tol*tol;
     mixed upperTol = 1+2*tol+tol*tol;
     bool threadConverged = true;
@@ -857,14 +854,22 @@ DEVICE void computeCCMAPositionConstraintForce(GLOBAL const int2* RESTRICT const
         delta1[index] = (rrpr > d_ij2*1e-6f ? reducedMass[index]*diff/rrpr : (mixed) 0);
         threadConverged &= (rp2 > lowerTol*dist2 && rp2 < upperTol*dist2);
     }
-    if (*groupConverged && !threadConverged)
-        *groupConverged = 0;
+    // Each thread owns its slot until the barrier.  Only the leader reduces it.
+    groupConverged[LOCAL_ID] = threadConverged;
+    SYNC_THREADS;
+    if (LOCAL_ID == 0) {
+        int converged = groupConverged[0];
+        for (unsigned int i = 1; i < LOCAL_SIZE; i++)
+            converged &= groupConverged[i];
+        groupConverged[0] = converged;
+    }
 }
 
 KERNEL void computeCCMAPositionConstraintForceKernel(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
         GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         GLOBAL int* RESTRICT converged, GLOBAL int* RESTRICT hostConvergedFlag, mixed tol, int iteration) {
-    LOCAL int groupConverged;
+    // Separate dispatches use the default block size (64); the fused kernel uses 128.
+    LOCAL int groupConverged[128];
     if (converged[1-iteration%2]) {
         if (GLOBAL_ID == 0) {
             converged[iteration%2] = 1;
@@ -873,9 +878,9 @@ KERNEL void computeCCMAPositionConstraintForceKernel(GLOBAL const int2* RESTRICT
         return; // The constraint iteration has already converged.
     }
     computeCCMAPositionConstraintForce(constraintAtoms, constraintDistance, atomPositions, reducedMass,
-            delta1, tol, iteration, &groupConverged);
+            delta1, tol, iteration, groupConverged);
     SYNC_THREADS;
-    if (LOCAL_ID == 0 && !groupConverged)
+    if (LOCAL_ID == 0 && !groupConverged[0])
         converged[iteration%2] = 0;
 }
 
@@ -885,9 +890,6 @@ KERNEL void computeCCMAPositionConstraintForceKernel(GLOBAL const int2* RESTRICT
 DEVICE void computeCCMAVelocityConstraintForce(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
         GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         mixed tol, int iteration, LOCAL_ARG int* groupConverged) {
-    if (LOCAL_ID == 0)
-        *groupConverged = 1;
-    SYNC_THREADS;
     bool threadConverged = true;
     for (int index = GLOBAL_ID; index < NUM_CCMA_CONSTRAINTS; index += GLOBAL_SIZE) {
         // Compute the force due to this constraint.
@@ -900,14 +902,22 @@ DEVICE void computeCCMAVelocityConstraintForce(GLOBAL const int2* RESTRICT const
         delta1[index] = -2*reducedMass[index]*rrpr/d_ij2;
         threadConverged &= (fabs(delta1[index]) <= tol);
     }
-    if (*groupConverged && !threadConverged)
-        *groupConverged = 0;
+    // Each thread owns its slot until the barrier.  Only the leader reduces it.
+    groupConverged[LOCAL_ID] = threadConverged;
+    SYNC_THREADS;
+    if (LOCAL_ID == 0) {
+        int converged = groupConverged[0];
+        for (unsigned int i = 1; i < LOCAL_SIZE; i++)
+            converged &= groupConverged[i];
+        groupConverged[0] = converged;
+    }
 }
 
 KERNEL void computeCCMAVelocityConstraintForceKernel(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
         GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         GLOBAL int* RESTRICT converged, GLOBAL int* RESTRICT hostConvergedFlag, mixed tol, int iteration) {
-    LOCAL int groupConverged;
+    // Separate dispatches use the default block size (64); the fused kernel uses 128.
+    LOCAL int groupConverged[128];
     if (converged[1-iteration%2]) {
         if (GROUP_ID == 0 && LOCAL_ID == 0) {
             converged[iteration%2] = 1;
@@ -916,8 +926,9 @@ KERNEL void computeCCMAVelocityConstraintForceKernel(GLOBAL const int2* RESTRICT
         return; // The constraint iteration has already converged.
     }
     computeCCMAVelocityConstraintForce(constraintAtoms, constraintDistance, atomPositions, reducedMass,
-            delta1, tol, iteration, &groupConverged);
-    if (LOCAL_ID == 0 && !groupConverged)
+            delta1, tol, iteration, groupConverged);
+    SYNC_THREADS;
+    if (LOCAL_ID == 0 && !groupConverged[0])
         converged[iteration%2] = 0;
 }
 
@@ -1002,7 +1013,8 @@ KERNEL void runCCMA(int constrainVelocities, GLOBAL const int* RESTRICT atoms, G
         , GLOBAL const real4* RESTRICT posqCorrection
 #endif
         ) {
-    LOCAL int groupConverged;
+    // Separate dispatches use the default block size (64); the fused kernel uses 128.
+    LOCAL int groupConverged[128];
 #ifdef USE_MIXED_PRECISION
     computeCCMAConstraintDirections(constraintAtoms, constraintDistance, atomPositions, posqCorrection);
 #else
@@ -1012,10 +1024,10 @@ KERNEL void runCCMA(int constrainVelocities, GLOBAL const int* RESTRICT atoms, G
         SYNC_THREADS
         if (constrainVelocities)
             computeCCMAVelocityConstraintForce(constraintAtoms, constraintDistance, velm, reducedMass,
-                    delta1, tol, iteration, &groupConverged);
+                    delta1, tol, iteration, groupConverged);
         else
             computeCCMAPositionConstraintForce(constraintAtoms, constraintDistance, posDelta, reducedMass,
-                    delta1, tol, iteration, &groupConverged);
+                    delta1, tol, iteration, groupConverged);
         SYNC_THREADS
         multiplyByCCMAConstraintMatrix(delta1, delta2, constraintMatrixColumn, constraintMatrixValue, iteration);
         SYNC_THREADS
@@ -1026,7 +1038,7 @@ KERNEL void runCCMA(int constrainVelocities, GLOBAL const int* RESTRICT atoms, G
             updateCCMAAtomPositions(atoms, numAtomConstraints, atomConstraints, constraintDistance, posDelta, velm,
                     delta1, delta2, iteration);
         SYNC_THREADS
-        if (groupConverged)
+        if (groupConverged[0])
             return;
     }
 }

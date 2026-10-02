@@ -87,6 +87,7 @@ public:
      */
     void sort(ArrayInterface& data);
 private:
+    void releaseResources();
     MetalContext& context;
     ComputeSortImpl::SortTrait* trait;
     MetalArray counters;
@@ -95,6 +96,7 @@ private:
     MetalArray offsetInBucket;
     MetalArray bucketOffset;
     MetalArray buckets;
+    metalModule_t module;
     metalFunction_t shortListKernel, shortList2Kernel, copyShortListKernel, computeRangeKernel, assignElementsKernel, computeBucketPositionsKernel, copyToBucketsKernel, sortBucketsKernel;
     unsigned int dataLength, rangeKernelBlocks, rangeKernelSize, positionsKernelSize, sortKernelSize;
     bool isShortList, uniform;

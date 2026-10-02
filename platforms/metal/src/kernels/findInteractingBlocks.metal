@@ -664,17 +664,18 @@ extern "C" __global__ void prepareRebuildDispatch(const unsigned int* __restrict
 #ifndef SORT_BLOCKS_BY_BINS
     __shared__ unsigned int keys[NUM_BLOCKS];
 #endif
-    __shared__ bool anyMoved;
-    if (threadIdx.x == 0)
-        anyMoved = false;
-    __syncthreads();
+    // Metal allows at most 1024 threads, or 32 SIMD groups, in a threadgroup.
+    __shared__ bool movedByGroup[32];
     bool moved = false;
     for (int i = threadIdx.x; i < NUM_BLOCKS; i += blockDim.x)
         moved = moved || displacementFlags[i] != 0;
-    if (simd_any(moved))
-        anyMoved = true;
+    bool groupMoved = simd_any(moved);
+    if (threadIdx.x%32 == 0)
+        movedByGroup[threadIdx.x/32] = groupMoved;
     __syncthreads();
-    bool rebuild = anyMoved;
+    bool rebuild = false;
+    for (int i = 0; i < (blockDim.x+31)/32; i++)
+        rebuild = rebuild || movedByGroup[i];
     if (threadIdx.x == 0) {
         pinnedInteractionCount[0] = interactionCount[0];
         pinnedInteractionCount[1] = interactionCount[1];

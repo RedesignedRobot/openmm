@@ -31,6 +31,7 @@
 #include "MetalKernelSources.h"
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 using namespace OpenMM;
 using namespace std;
@@ -108,13 +109,14 @@ MetalFFT3D::MetalFFT3D(MetalContext& context, int xsize, int ysize, int zsize, b
 
     configuration.useLUT = 1;
 
-    app = new VkFFTApp();
-    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    VkFFTResult fftResult = initializeVkFFT(app, configuration);
-    pool->release();
+    auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+    auto deleteApp = [](VkFFTApp* value) { deleteVkFFT(value); delete value; };
+    unique_ptr<VkFFTApp, decltype(deleteApp)> pendingApp(new VkFFTApp(), deleteApp);
+    VkFFTResult fftResult = initializeVkFFT(pendingApp.get(), configuration);
     if (fftResult != VKFFT_SUCCESS) {
         throw OpenMMException("Error executing initializeVkFFT: "+context.intToString(fftResult));
     }
+    app = pendingApp.release();
 }
 
 MetalFFT3D::~MetalFFT3D() {

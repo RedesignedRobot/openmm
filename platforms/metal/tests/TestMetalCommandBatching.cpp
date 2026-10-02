@@ -62,6 +62,7 @@ public:
 };
 
 static QueuePlatform platform;
+static string precision = "single";
 
 void createSystem(System& system, vector<Vec3>& positions, NonbondedForce::NonbondedMethod method) {
     // NonbondedForce only uses a neighbor list for more than 3000 particles.
@@ -95,6 +96,7 @@ double measureCommitsPerStep(NonbondedForce::NonbondedMethod method) {
     createSystem(system, positions, method);
     LangevinMiddleIntegrator integrator(300.0, 1.0, 0.002);
     Context context(system, integrator, platform);
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context, MetalPlatform::MetalPrecision()));
     context.setPositions(positions);
     integrator.step(10);
     MetalQueue& queue = platform.getQueue(context);
@@ -135,6 +137,8 @@ void testWorkLeftOpenAfterStep() {
     integrator2.setRandomNumberSeed(5);
     Context context1(system, integrator1, platform, properties);
     Context context2(system, integrator2, platform, properties);
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context1, MetalPlatform::MetalPrecision()));
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context2, MetalPlatform::MetalPrecision()));
     context1.setPositions(positions);
     context2.setPositions(positions);
 
@@ -169,6 +173,9 @@ void testWorkLeftOpenAfterStep() {
 
 int main(int argc, char* argv[]) {
     try {
+        if (argc > 1)
+            precision = argv[1];
+        platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
         testCommitsPerStep();
         testWorkLeftOpenAfterStep();
     }

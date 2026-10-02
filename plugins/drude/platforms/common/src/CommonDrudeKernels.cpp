@@ -303,12 +303,14 @@ void CommonIntegrateDrudeLangevinStepKernel::execute(ContextImpl& context, const
     // Compute integrator coefficients.
     
     double stepSize = integrator.getStepSize();
-    double vscale = exp(-stepSize*integrator.getFriction());
-    double fscale = (1-vscale)/integrator.getFriction()/(double) 0x100000000;
-    double noisescale = sqrt(2*BOLTZ*integrator.getTemperature()*integrator.getFriction())*sqrt(0.5*(1-vscale*vscale)/integrator.getFriction());
-    double vscaleDrude = exp(-stepSize*integrator.getDrudeFriction());
-    double fscaleDrude = (1-vscaleDrude)/integrator.getDrudeFriction()/(double) 0x100000000;
-    double noisescaleDrude = sqrt(2*BOLTZ*integrator.getDrudeTemperature()*integrator.getDrudeFriction())*sqrt(0.5*(1-vscaleDrude*vscaleDrude)/integrator.getDrudeFriction());
+    double friction = integrator.getFriction();
+    double drudeFriction = integrator.getDrudeFriction();
+    double vscale = exp(-stepSize*friction);
+    double fscale = (friction == 0 ? stepSize : -expm1(-stepSize*friction)/friction)/(double) 0x100000000;
+    double noisescale = sqrt(BOLTZ*integrator.getTemperature()*-expm1(-2*stepSize*friction));
+    double vscaleDrude = exp(-stepSize*drudeFriction);
+    double fscaleDrude = (drudeFriction == 0 ? stepSize : -expm1(-stepSize*drudeFriction)/drudeFriction)/(double) 0x100000000;
+    double noisescaleDrude = sqrt(BOLTZ*integrator.getDrudeTemperature()*-expm1(-2*stepSize*drudeFriction));
     double maxDrudeDistance = integrator.getMaxDrudeDistance();
     double hardwallscaleDrude = sqrt(BOLTZ*integrator.getDrudeTemperature());
     if (stepSize != prevStepSize) {

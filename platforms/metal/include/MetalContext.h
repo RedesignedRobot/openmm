@@ -288,6 +288,10 @@ public:
      */
     metalFunction_t getKernel(metalModule_t& module, const std::string& name);
     /**
+     * Allocate a shared buffer, or throw with its name and requested byte size.
+     */
+    metalDeviceptr_t createBuffer(size_t bytes, const std::string& name);
+    /**
      * How a kernel's buffer argument reads memory: as ordinary values, as float pairs (a mixed4s buffer in mixed
      * precision), or as raw 32 bit words that work with either, as the clear kernels do.
      */
@@ -534,6 +538,10 @@ public:
      */
     void clearAutoclearBuffersIfNeeded();
 private:
+    friend class MetalSort;
+    void releaseResources();
+    void releaseModule(metalModule_t module);
+    void releaseKernel(metalFunction_t kernel);
     /**
      * How to bind a kernel's arguments.  sizes holds the byte size of each value argument and 0 for
      * each buffer.  When the kernel has too many arguments for separate bindings, offsets holds where

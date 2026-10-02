@@ -28,12 +28,13 @@
 #include "openmm/common/ContextSelector.h"
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
 using namespace OpenMM;
 
-MetalArray::MetalArray() : pointer(0), ownsMemory(false), pairStorage(false) {
+MetalArray::MetalArray() : context(NULL), pointer(0), size(0), elementSize(0), ownsMemory(false), pairStorage(false) {
 }
 
 MetalArray::MetalArray(MetalContext& context, size_t size, int elementSize, const std::string& name) : pointer(0), pairStorage(false) {
@@ -54,9 +55,9 @@ void MetalArray::initialize(ComputeContext& context, size_t size, int elementSiz
     this->elementSize = elementSize;
     this->name = name;
     ownsMemory = true;
-    pointer = this->context->getDevice()->newBuffer(std::max(size*elementSize, (size_t) 16), MTL::ResourceStorageModeShared);
-    if (pointer == 0)
-        throw OpenMMException("Error creating array "+name);
+    if (elementSize <= 0 || size > std::numeric_limits<size_t>::max()/elementSize)
+        throw OpenMMException("Array "+name+" ("+std::to_string(size)+" elements of "+std::to_string(elementSize)+" bytes) exceeds the host address limit");
+    pointer = this->context->createBuffer(std::max(size*elementSize, (size_t) 16), name);
 }
 
 void MetalArray::resize(size_t size) {
@@ -64,9 +65,19 @@ void MetalArray::resize(size_t size) {
         throw OpenMMException("MetalArray has not been initialized");
     if (!ownsMemory)
         throw OpenMMException("Cannot resize an array that does not own its storage");
-    pointer->release();
-    pointer = 0;
-    initialize(*context, size, elementSize, name);
+    MetalArray replacement(*context, size, elementSize, name);
+    replacement.pairStorage = pairStorage;
+    swap(replacement);
+}
+
+void MetalArray::swap(MetalArray& other) noexcept {
+    std::swap(context, other.context);
+    std::swap(pointer, other.pointer);
+    std::swap(size, other.size);
+    std::swap(elementSize, other.elementSize);
+    std::swap(ownsMemory, other.ownsMemory);
+    std::swap(pairStorage, other.pairStorage);
+    name.swap(other.name);
 }
 
 ComputeContext& MetalArray::getContext() {

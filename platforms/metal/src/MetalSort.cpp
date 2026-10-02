@@ -27,12 +27,18 @@
 #include "MetalKernelSources.h"
 #include <algorithm>
 #include <map>
+#include <memory>
 
 using namespace OpenMM;
 using namespace std;
 
 MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, unsigned int length, bool uniform) :
-        context(context), trait(trait), dataLength(length), uniform(uniform) {
+        context(context), trait(trait), module(NULL), shortListKernel(NULL), shortList2Kernel(NULL),
+        copyShortListKernel(NULL), computeRangeKernel(NULL), assignElementsKernel(NULL),
+        computeBucketPositionsKernel(NULL), copyToBucketsKernel(NULL), sortBucketsKernel(NULL),
+        dataLength(length), uniform(uniform) {
+    auto cleanup = [](MetalSort* sort) { sort->releaseResources(); };
+    unique_ptr<MetalSort, decltype(cleanup)> constructionGuard(this, cleanup);
     // Create kernels.
 
     map<string, string> replacements;
@@ -43,7 +49,7 @@ MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, u
     replacements["MAX_KEY"] = trait->getMaxKey();
     replacements["MAX_VALUE"] = trait->getMaxValue();
     replacements["UNIFORM"] = (uniform ? "1" : "0");
-    metalModule_t module = context.createModule(context.replaceStrings(MetalKernelSources::sort, replacements));
+    module = context.createModule(context.replaceStrings(MetalKernelSources::sort, replacements));
     shortListKernel = context.getKernel(module, "sortShortList");
     shortList2Kernel = context.getKernel(module, "sortShortList2");
     copyShortListKernel = context.getKernel(module, "copyShortList");
@@ -87,9 +93,18 @@ MetalSort::MetalSort(MetalContext& context, ComputeSortImpl::SortTrait* trait, u
         offsetInBucket.initialize<uint1>(context, length, "offsetInBucket");
     }
     buckets.initialize(context, length, trait->getDataSize(), "buckets");
+    constructionGuard.release();
 }
 
 MetalSort::~MetalSort() {
+    releaseResources();
+}
+
+void MetalSort::releaseResources() {
+    for (metalFunction_t kernel : {shortListKernel, shortList2Kernel, copyShortListKernel, computeRangeKernel,
+            assignElementsKernel, computeBucketPositionsKernel, copyToBucketsKernel, sortBucketsKernel})
+        context.releaseKernel(kernel);
+    context.releaseModule(module);
     delete trait;
 }
 

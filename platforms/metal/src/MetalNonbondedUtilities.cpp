@@ -34,6 +34,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdint>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <unistd.h>
 #include <map>
@@ -68,6 +71,8 @@ static const int MaxBlocksSortedInOneGroup = 1024;
 static const int BinSortThreadBlockSize = 256;
 // computeSortKeys' number of block size bins.
 static const int NumSizeBins = 20;
+// interactingAtoms uses a 32-bit unsigned tile offset.
+static const uint64_t MaxNeighborTiles = numeric_limits<unsigned int>::max()/MetalContext::TileSize;
 
 class MetalNonbondedUtilities::BlockSortTrait : public ComputeSortImpl::SortTrait {
 public:
@@ -93,11 +98,6 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     sortBlocksByBins = useIndirectRebuild && context.getNumAtomBlocks() > MaxBlocksSortedInOneGroup;
     // Decide how many thread blocks to use.
 
-    // The tile count, the single pair count, and how many times copyInteractionCounts has run, then the same three
-    // for each of the last 4 copies.
-    pinnedCountDeviceMemory = context.getDevice()->newBuffer(20*sizeof(unsigned int), MTL::ResourceStorageModeShared);
-    pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
-    memset(pinnedCountBuffer, 0, 20*sizeof(unsigned int));
     // Large systems have enough neighbor list tiles to split finely, and 160 force blocks per core instead of 40 make
     // apoa1, cellulose and stmv 4-11% faster on an M3 Ultra and 1-2% faster on an M2.  Small systems lose at 160 (rf
     // 5% on the M3 Ultra, gbsa 1.4% on the M2): their tiles are already spread thin, and every block adds 64 entries
@@ -113,6 +113,11 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
 
     useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(MetalKernelSources::nonbonded);
+    // Allocate last so a failure above cannot leak the counts buffer.
+    // The tile count, single pair count, copy counter, and the last four copies use 20 words.
+    pinnedCountDeviceMemory = context.createBuffer(20*sizeof(unsigned int), "pinnedCountDeviceMemory");
+    pinnedCountBuffer = (unsigned int*) pinnedCountDeviceMemory->contents();
+    memset(pinnedCountBuffer, 0, 20*sizeof(unsigned int));
 }
 
 MetalNonbondedUtilities::~MetalNonbondedUtilities() {
@@ -313,18 +318,20 @@ void MetalNonbondedUtilities::initialize(const System& system) {
         waitForCount = (numContexts > 1 || maxListBytes > unusedMemory/256);
         if (!waitForCount)
             context.getCurrentStream().commitWhenIdle();
-        maxTiles = 20*numAtomBlocks;
-        if (maxTiles > numTiles || !waitForCount)
-            maxTiles = numTiles;
-        if (maxTiles < 1)
-            maxTiles = 1;
-        maxSinglePairs = 5*numAtoms;
-        if (!waitForCount && maxSinglePairs < maxPossiblePairs)
-            maxSinglePairs = maxPossiblePairs;
+        uint64_t initialTiles = max<uint64_t>(1, waitForCount ? min<uint64_t>(20ULL*numAtomBlocks, numTiles) : numTiles);
+        uint64_t initialPairs = waitForCount ? 5ULL*numAtoms : max<uint64_t>(5ULL*numAtoms, maxPossiblePairs);
+        // Leave room for the signed single-pair loop index's final stride.
+        uint64_t pairLimit = numeric_limits<int>::max()-(uint64_t) numForceThreadBlocks*forceThreadBlockSize;
+        if (initialTiles > MaxNeighborTiles)
+            throw OpenMMException("Neighbor list tile capacity "+to_string(initialTiles)+" exceeds the 32-bit atom index limit of "+to_string(MaxNeighborTiles));
+        if (initialPairs > pairLimit)
+            throw OpenMMException("Neighbor list pair capacity "+to_string(initialPairs)+" exceeds the 32-bit pair index limit of "+to_string(pairLimit));
+        maxTiles = (unsigned int) initialTiles;
+        maxSinglePairs = (unsigned int) initialPairs;
         // Small systems leave most GPU cores idle during the neighbor list build, so give each atom block several warps.
         numTilesInBatch = (numAtomBlocks < 64*context.getMultiprocessors() ? 4 : 1);
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
-        interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
+        interactingAtoms.initialize<int>(context, (size_t) MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
         singlePairs.initialize<int2>(context, maxSinglePairs, "singlePairs");
         int elementSize = (context.getUseDoublePrecision() ? sizeof(double) : sizeof(float));
@@ -624,14 +631,30 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
     // The most recent timestep had too many interactions to fit in the arrays.  Make the arrays bigger to prevent
     // this from happening in the future.
 
+    // Prepare every replacement before changing any buffer or capacity.
+    unique_ptr<MetalArray> newTiles, newAtoms, newPairs;
+    unsigned int newMaxTiles = maxTiles, newMaxSinglePairs = maxSinglePairs;
     if (pinnedCountBuffer[0] > maxTiles) {
-        maxTiles = (unsigned int) (1.2*pinnedCountBuffer[0]);
-        unsigned int numBlocks = context.getNumAtomBlocks();
-        int totalTiles = numBlocks*(numBlocks+1)/2;
-        if (maxTiles > totalTiles)
-            maxTiles = totalTiles;
-        interactingTiles.resize(maxTiles);
-        interactingAtoms.resize(MetalContext::TileSize*(size_t) maxTiles);
+        uint64_t numBlocks = context.getNumAtomBlocks();
+        uint64_t totalTiles = numBlocks*(numBlocks+1)/2;
+        uint64_t limit = min(totalTiles, MaxNeighborTiles);
+        if (pinnedCountBuffer[0] > limit)
+            throw OpenMMException("Neighbor list requires "+to_string(pinnedCountBuffer[0])+" tiles, exceeding the tile capacity limit of "+to_string(limit));
+        newMaxTiles = (unsigned int) min<uint64_t>(6ULL*pinnedCountBuffer[0]/5, limit);
+        newTiles.reset(new MetalArray(context, newMaxTiles, sizeof(int), "interactingTiles"));
+        newAtoms.reset(new MetalArray(context, (size_t) MetalContext::TileSize*newMaxTiles, sizeof(int), "interactingAtoms"));
+    }
+    if (pinnedCountBuffer[1] > maxSinglePairs) {
+        uint64_t pairLimit = numeric_limits<int>::max()-(uint64_t) numForceThreadBlocks*forceThreadBlockSize;
+        if (pinnedCountBuffer[1] > pairLimit)
+            throw OpenMMException("Neighbor list requires "+to_string(pinnedCountBuffer[1])+" pairs, exceeding the 32-bit pair index limit of "+to_string(pairLimit));
+        newMaxSinglePairs = (unsigned int) min<uint64_t>(6ULL*pinnedCountBuffer[1]/5, pairLimit);
+        newPairs.reset(new MetalArray(context, newMaxSinglePairs, sizeof(int2), "singlePairs"));
+    }
+    if (newTiles) {
+        interactingTiles.swap(*newTiles);
+        interactingAtoms.swap(*newAtoms);
+        maxTiles = newMaxTiles;
         if (forceArgs.size() > 0)
             forceArgs[7] = &interactingTiles.getDevicePointer();
         findInteractingBlocksArgs[6] = &interactingTiles.getDevicePointer();
@@ -639,9 +662,9 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
             forceArgs[17] = &interactingAtoms.getDevicePointer();
         findInteractingBlocksArgs[7] = &interactingAtoms.getDevicePointer();
     }
-    if (pinnedCountBuffer[1] > maxSinglePairs) {
-        maxSinglePairs = (unsigned int) (1.2*pinnedCountBuffer[1]);
-        singlePairs.resize(maxSinglePairs);
+    if (newPairs) {
+        singlePairs.swap(*newPairs);
+        maxSinglePairs = newMaxSinglePairs;
         if (forceArgs.size() > 0)
             forceArgs[19] = &singlePairs.getDevicePointer();
         findInteractingBlocksArgs[8] = &singlePairs.getDevicePointer();

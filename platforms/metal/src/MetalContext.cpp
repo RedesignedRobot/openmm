@@ -53,6 +53,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -205,9 +206,15 @@ static string rewriteDeviceSignatures(const string& source) {
 
 MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, MetalPlatform::PlatformData& platformData,
         MetalContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false),
-        pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
+        device(NULL), pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
         useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false), autoclearWorkCount(-1),
         autoclearBufferCount(0) {
+    // A failed constructor does not run our destructor, but its members are still alive here.
+    auto cleanup = [](MetalContext* context) {
+        context->releaseResources();
+        delete context->workThread;
+    };
+    unique_ptr<MetalContext, decltype(cleanup)> constructionGuard(this, cleanup);
     if (precision == "single") {
         useDoublePrecision = false;
         useMixedPrecision = false;
@@ -231,8 +238,15 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
         int numDevices = (device == NULL ? 0 : 1);
         if (deviceIndex < -1 || deviceIndex >= numDevices)
             throw OpenMMException("Illegal value for DeviceIndex: "+intToString(deviceIndex));
+        if (device == NULL)
+            throw OpenMMException("No Metal device is available");
         this->deviceIndex = 0;
-        defaultQueue = shared_ptr<ComputeQueueImpl>(new MetalQueue(device->newCommandQueue()));
+        auto stream = NS::TransferPtr(device->newCommandQueue());
+        if (!stream)
+            throw OpenMMException("Error creating Metal command queue");
+        auto queue = make_shared<MetalQueue>(stream.get());
+        stream.detach();
+        defaultQueue = queue;
     }
     else {
         this->deviceIndex = originalContext->deviceIndex;
@@ -259,11 +273,11 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
     io_service_t gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AGXAccelerator"));
     CFNumberRef cores = (CFNumberRef) IORegistryEntryCreateCFProperty(gpu, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+    IOObjectRelease(gpu);
     if (cores == NULL)
         throw OpenMMException("Error initializing Metal: the IORegistry has no GPU core count");
     CFNumberGetValue(cores, kCFNumberIntType, &multiprocessors);
     CFRelease(cores);
-    IOObjectRelease(gpu);
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_METAL"] = "1";
@@ -393,9 +407,14 @@ MetalContext::MetalContext(const System& system, int deviceIndex, bool useBlocki
     integration = new MetalIntegrationUtilities(*this, system);
     expression = new MetalExpressionUtilities(*this);
     clearBuffer(posq);
+    constructionGuard.release();
 }
 
 MetalContext::~MetalContext() {
+    releaseResources();
+}
+
+void MetalContext::releaseResources() {
     pushAsCurrent();
     for (auto force : forces)
         delete force;
@@ -421,30 +440,32 @@ MetalContext::~MetalContext() {
         kernel.first->release();
     popAsCurrent();
     contextIsValid = false;
-    device->release();
+    if (device != NULL)
+        device->release();
 }
 
 void MetalContext::initialize() {
     ContextSelector selector(*this);
     int numEnergyBuffers = max(numThreadBlocks*ThreadBlockSize, nonbonded->getNumEnergyBuffers());
+    size_t pinnedBufferSize;
     if (useDoublePrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<double>(*this, multiprocessors, "energySum");
-        int pinnedBufferSize = max(paddedNumAtoms*4, numEnergyBuffers);
-        pinnedBuffer = malloc(pinnedBufferSize*sizeof(double));
+        pinnedBufferSize = max((size_t) paddedNumAtoms*4, (size_t) numEnergyBuffers)*sizeof(double);
     }
     else if (useMixedPrecision) {
         energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<double>(*this, multiprocessors, "energySum");
-        int pinnedBufferSize = max(paddedNumAtoms*4, numEnergyBuffers);
-        pinnedBuffer = malloc(pinnedBufferSize*sizeof(double));
+        pinnedBufferSize = max((size_t) paddedNumAtoms*4, (size_t) numEnergyBuffers)*sizeof(double);
     }
     else {
         energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
         energySum.initialize<float>(*this, multiprocessors, "energySum");
-        int pinnedBufferSize = max(paddedNumAtoms*6, numEnergyBuffers);
-        pinnedBuffer = malloc(pinnedBufferSize*sizeof(float));
+        pinnedBufferSize = max((size_t) paddedNumAtoms*6, (size_t) numEnergyBuffers)*sizeof(float);
     }
+    pinnedBuffer = malloc(pinnedBufferSize);
+    if (pinnedBuffer == NULL)
+        throw OpenMMException("Error allocating buffer pinnedBuffer ("+to_string(pinnedBufferSize)+" bytes)");
     for (int i = 0; i < numAtoms; i++) {
         double mass = system.getParticleMass(i);
         if (useDoublePrecision || useMixedPrecision)
@@ -575,20 +596,53 @@ metalModule_t MetalContext::createModule(const string source, const map<string, 
     string body = rewriteDeviceSignatures(regex_replace(regex_replace(source, regex("\\bthread\\b"), "_mmThread"), regex("\\blong long\\b"), "long"));
     string log;
     metalModule_t module = createLibrary(header+rewriteKernelSignatures(body, false)+"\n", log, saveTemps);
+    bool packed = false;
     if (module == NULL) {
         // A kernel past Metal's 31 buffer bindings compiles once its values are packed.  Any other
         // error fails both ways, and the first log reports it.
         string packedLog;
         module = createLibrary(header+rewriteKernelSignatures(body, true)+"\n", packedLog, saveTemps);
-        if (module != NULL)
-            packedModules.insert(module);
+        packed = (module != NULL);
     }
     if (module == NULL && log.find("no 'buffer' resource location available") != string::npos)
         throw OpenMMException("Error compiling program: a Metal kernel can have at most 31 array and value arguments, which this system exceeds.  "+log);
     if (module == NULL)
         throw OpenMMException("Error compiling program: "+log);
+    auto moduleGuard = NS::TransferPtr(module);
     loadedModules.push_back(module);
+    try {
+        if (packed)
+            packedModules.insert(module);
+    }
+    catch (...) {
+        loadedModules.pop_back();
+        throw;
+    }
+    moduleGuard.detach();
     return module;
+}
+
+void MetalContext::releaseModule(metalModule_t module) {
+    auto entry = find(loadedModules.begin(), loadedModules.end(), module);
+    if (entry != loadedModules.end()) {
+        packedModules.erase(module);
+        loadedModules.erase(entry);
+        module->release();
+    }
+}
+
+void MetalContext::releaseKernel(metalFunction_t kernel) {
+    if (kernelArguments.erase(kernel) != 0)
+        kernel->release();
+}
+
+metalDeviceptr_t MetalContext::createBuffer(size_t bytes, const string& name) {
+    if (bytes > device->maxBufferLength())
+        throw OpenMMException("Buffer "+name+" ("+to_string(bytes)+" bytes) exceeds the Metal buffer length limit of "+to_string(device->maxBufferLength())+" bytes");
+    metalDeviceptr_t buffer = device->newBuffer(bytes, MTL::ResourceStorageModeShared);
+    if (buffer == NULL)
+        throw OpenMMException("Error allocating buffer "+name+" ("+to_string(bytes)+" bytes)");
+    return buffer;
 }
 
 metalModule_t MetalContext::createLibrary(const string& source, string& log, bool saveTemps) {
@@ -609,28 +663,27 @@ metalModule_t MetalContext::createLibrary(const string& source, string& log, boo
         out.close();
     }
 
-    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
+    auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+    auto options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
     options->setLanguageVersion(MTL::LanguageVersion3_2);
     options->setMathMode(MTL::MathModeSafe);
     options->setMathFloatingPointFunctions(MTL::MathFloatingPointFunctionsPrecise);
     NS::Error* error = NULL;
-    metalModule_t module = device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options, &error);
-    options->release();
+    metalModule_t module = device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options.get(), &error);
     if (module == NULL)
         log = error->localizedDescription()->utf8String();
-    pool->release();
     return module;
 }
 
 metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& name) {
-    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    MTL::Function* function = module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+    auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+    auto function = NS::TransferPtr(module->newFunction(NS::String::string(name.c_str(), NS::UTF8StringEncoding)));
     MTL::ComputePipelineReflection* reflection = NULL;
     bool packed = (packedModules.find(module) != packedModules.end());
     bool typeInfo = (packed || useMixedPrecision);
     MTL::PipelineOption reflectionOptions = (typeInfo ? MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo : MTL::PipelineOptionBindingInfo);
-    metalFunction_t kernel = (function == NULL ? NULL : device->newComputePipelineState(function, reflectionOptions, &reflection, NULL));
+    metalFunction_t kernel = (!function ? NULL : device->newComputePipelineState(function.get(), reflectionOptions, &reflection, NULL));
+    auto kernelGuard = NS::TransferPtr(kernel);
     KernelArguments args;
     MTL::BufferBinding* argsBinding = NULL;
     vector<BufferLayout> bindingLayouts;
@@ -662,14 +715,12 @@ metalFunction_t MetalContext::getKernel(metalModule_t& module, const string& nam
             bufferIndex++;
         }
     }
-    if (function != NULL)
-        function->release();
-    pool->release();
     if (kernel == NULL)
         throw OpenMMException("Error creating kernel "+name);
     if (!validArguments)
         throw OpenMMException("Error creating kernel "+name+": its packed arguments don't match its buffer bindings");
-    kernelArguments[kernel] = args;
+    kernelArguments.emplace(kernel, std::move(args));
+    kernelGuard.detach();
     return kernel;
 }
 

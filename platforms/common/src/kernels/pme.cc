@@ -55,6 +55,7 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
     LOCAL real* slab = slabs[group];
     for (int v = lane; v < SPREAD_SLAB; v += 32)
         slab[v] = 0;
+    SYNC_WARPS; // The first atom can add to entries initialized by another lane.
     const real scale = RECIP((real) (PME_ORDER-1));
     const int dy = lane/PME_ORDER;
     const int dz = lane-PME_ORDER*dy;
