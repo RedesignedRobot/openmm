@@ -106,11 +106,10 @@ void MetalQueue::commit() {
     if ((int) pending.size() > MaxBuffersInFlight)
         pending.front()->waitUntilCompleted();
     while (!pending.empty() && pending.front()->status() >= MTL::CommandBufferStatusCompleted) {
-        MTL::CommandBuffer* buffer = pending.front();
+        auto buffer = NS::TransferPtr(pending.front());
         pending.pop_front();
         if (buffer->status() == MTL::CommandBufferStatusError)
             throw OpenMMException("Error executing METAL command buffer: "+string(buffer->error()->localizedDescription()->utf8String()));
-        buffer->release();
     }
 }
 

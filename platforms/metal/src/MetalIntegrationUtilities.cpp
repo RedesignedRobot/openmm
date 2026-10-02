@@ -44,11 +44,11 @@ MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, cons
         pendingCMBlockSize(0), pendingCMVelocity(NULL), prefetchesKineticEnergy(false), kineticEnergyQueued(false),
         kineticEnergyWorkCount(-1) {
         ccmaEvent = context.createEvent();
-        ccmaConvergedDeviceMemory = context.getDevice()->newBuffer(sizeof(int), MTL::ResourceStorageModeShared);
-        ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
         // posDelta shares kernels and raw copies with velm, so it stores float pairs too.  The zeros the
         // base class uploaded read the same either way.
         getPosDelta().setPairStorage(context.getUseMixedPrecision());
+        ccmaConvergedDeviceMemory = context.createBuffer(sizeof(int), "ccmaConvergedDeviceMemory");
+        ccmaConvergedMemory = (int*) ccmaConvergedDeviceMemory->contents();
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {
