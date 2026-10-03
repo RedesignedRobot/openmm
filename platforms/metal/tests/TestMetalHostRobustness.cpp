@@ -87,6 +87,21 @@ public:
         cc.getNonbondedUtilities().interactionCount.download(counts);
         return counts[0];
     }
+    static vector<int> neighborOrder(MetalContext& cc) {
+        auto& nb = cc.getNonbondedUtilities();
+        ASSERT(nb.useNeighborList && nb.useIndirectRebuild && !nb.forceRebuildNeighborList);
+        vector<int> order = cc.getAtomIndex();
+        if (nb.useRoleOrder) {
+            vector<int> roles;
+            nb.atomOrder.download(roles);
+            for (int i = 0; i < cc.getNumAtoms(); i++)
+                order[i] = cc.getAtomIndex()[roles[i]];
+        }
+        return order;
+    }
+    static void forceNeighborRebuild(MetalContext& cc) {
+        cc.getNonbondedUtilities().forceRebuildNeighborList = true;
+    }
 };
 }
 
@@ -424,12 +439,82 @@ static void testAdaptiveReorder() {
     ASSERT(isfinite(context.getState(State::Energy).getPotentialEnergy()));
 }
 
+static void testNonleaderMovement() {
+    for (bool roleOrder : {false, true}) {
+        System system;
+        const int side = 16, count = side*side*side;
+        const double spacing = 1.1, box = side*spacing;
+        system.setDefaultPeriodicBoxVectors(Vec3(box, 0, 0), Vec3(0, box, 0), Vec3(0, 0, box));
+        auto* nb = new NonbondedForce();
+        nb->setNonbondedMethod(NonbondedForce::CutoffPeriodic);
+        nb->setCutoffDistance(1.0);
+        system.addForce(nb);
+        vector<Vec3> positions;
+        for (int x = 0; x < side; x++)
+            for (int y = 0; y < side; y++)
+                for (int z = 0; z < side; z++) {
+                    int atom = system.addParticle(1.0);
+                    nb->addParticle(roleOrder && atom < count/2 ? 0 : 0.5, 0.3,
+                            roleOrder && atom >= count/2 ? 0 : 0.7);
+                    positions.push_back(Vec3(x, y, z)*spacing);
+                }
+        VerletIntegrator integrator(0.001);
+        Context context(system, integrator, platform);
+        context.setPositions(positions);
+        context.setVelocities(vector<Vec3>(count));
+        integrator.step(1); // Finish initial reordering and build the list with all pairs outside 1.08 nm.
+        State initial = context.getState(State::Positions | State::Forces);
+        for (const Vec3& force : initial.getForces())
+            ASSERT_EQUAL_VEC(Vec3(0, 0, 0), force, 1e-6);
+        MetalContext& cc = platform.metal(context);
+        ASSERT_EQUAL(roleOrder, cc.getNonbondedUtilities().getUseRoleOrder());
+        vector<int> order = MetalHostRobustnessAccess::neighborOrder(cc), inverse(count);
+        for (int i = 0; i < count; i++)
+            inverse[order[i]] = i;
+        int moved = -1, partner = -1;
+        Vec3 displacement;
+        // Search all axes: reordering may put a whole row of the grid in one tile.
+        const int strides[] = {side*side, side, 1};
+        for (int axis = 0; axis < 3 && moved < 0; axis++) {
+            for (int i = 0; i < count-strides[axis]; i++) {
+                int j = i+strides[axis];
+                if ((i/strides[axis])%side < side-1 && inverse[i]%32 != 0 &&
+                        inverse[i]/32 != inverse[j]/32 && (!roleOrder || (i < count/2 && j < count/2))) {
+                    moved = i;
+                    partner = j;
+                    displacement[axis] = 0.2;
+                    break;
+                }
+            }
+        }
+        ASSERT(moved >= 0);
+        vector<Vec3> velocities(count);
+        velocities[moved] = displacement/integrator.getStepSize();
+        context.setVelocities(velocities);
+        integrator.step(1); // Only this atom moves, by 0.2 nm, beyond the 0.04 nm rebuild threshold.
+        ASSERT(order == MetalHostRobustnessAccess::neighborOrder(cc));
+        State actual = context.getState(State::Positions | State::Forces | State::Energy);
+        for (int i = 0; i < count; i++)
+            ASSERT_EQUAL_VEC(initial.getPositions()[i]+(i == moved ? displacement : Vec3()),
+                    actual.getPositions()[i], 1e-6);
+        MetalHostRobustnessAccess::forceNeighborRebuild(cc);
+        State rebuilt = context.getState(State::Forces | State::Energy);
+        const vector<Vec3>& expected = rebuilt.getForces();
+        ASSERT(expected[partner].dot(expected[partner]) > 1e-6);
+        cout << "nonleader movement: roleOrder=" << roleOrder << " atom=" << moved
+             << " lane=" << inverse[moved]%32 << " partner=" << partner
+             << " force error=" << sqrt((actual.getForces()[partner]-expected[partner]).dot(
+                     actual.getForces()[partner]-expected[partner])) << endl;
+        compareForces(actual, rebuilt);
+    }
+}
+
 int main(int argc, char* argv[]) {
     string precision = argc > 1 ? argv[1] : "single";
     platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
     platform.setPropertyDefaultValue("DeterministicForces", "true");
     int failures = 0;
-    for (auto test : vector<pair<string, function<void()>>>{{"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", testAdaptiveReorder}}) {
+    for (auto test : vector<pair<string, function<void()>>>{{"nonleader movement", testNonleaderMovement}, {"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", testAdaptiveReorder}}) {
         if (argc > 2 && (string(argv[2]) == "audit" ? test.first == "adaptive reorder" : string(argv[2]) != test.first))
             continue;
         try {

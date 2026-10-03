@@ -91,8 +91,9 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         moved = displacement.x*displacement.x + displacement.y*displacement.y + displacement.z*displacement.z > 0.25f*PADDING*PADDING;
     }
     __shared__ int tileMoved[FIND_BLOCK_BOUNDS_GROUP/TILE_SIZE];
+    bool anyMoved = simd_any(moved);
     if (indexInTile == 0)
-        tileMoved[tileInGroup] = (validBlock && simd_any(moved));
+        tileMoved[tileInGroup] = (validBlock && anyMoved);
 #endif
     real4 pos = make_real4(tPos.x, tPos.y, tPos.z, 0);
 #ifdef USE_PERIODIC
