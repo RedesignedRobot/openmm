@@ -133,8 +133,8 @@ private:
  */
 class MetalCalcGBSAOBCForceKernel : public CommonCalcGBSAOBCForceKernel {
 public:
-    MetalCalcGBSAOBCForceKernel(std::string name, const Platform& platform, MetalContext& cu) :
-            CommonCalcGBSAOBCForceKernel(name, platform, cu), cu(cu) {
+    MetalCalcGBSAOBCForceKernel(std::string name, const Platform& platform, MetalContext& cu, bool customOBC2 = false) :
+            CommonCalcGBSAOBCForceKernel(name, platform, cu, customOBC2), cu(cu) {
     }
     /**
      * Execute the kernel to calculate the forces and/or energy.

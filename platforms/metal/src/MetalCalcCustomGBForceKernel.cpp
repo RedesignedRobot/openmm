@@ -30,7 +30,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
 
 using namespace OpenMM;
 using namespace std;
@@ -46,11 +45,6 @@ const string ACE_ENERGY = "28.3919551*(radius+0.14)^2*(radius/B)^6; radius=or+of
 const string PAIR_ENERGY = "-138.935485*(1/soluteDielectric-1/solventDielectric)*charge1*charge2";
 const string PAIR_F = ";f=sqrt(r^2+B1*B2*exp(-r^2/(4*B1*B2)))";
 const double OBC2_OFFSET = 0.009;   // GBSAOBCForce's fixed dielectric offset
-// GBSAOBCForce adds OBC's term for an atom engulfed by a neighbor's scaled sphere, 2*(1/or1-1/L), which the openmm.app
-// template leaves out.  It is nonzero only for pairs closer than sr2-or1, so the two agree whenever the largest sr
-// minus the smallest or is under every bond length.  Protein and nucleic acid parameters give 0.053 nm (sulfur's sr
-// against hydrogen's or); the shortest X-H bond is 0.096 nm.
-const double MAX_ENGULF_DISTANCE = 0.09;
 const double ACE_PREFACTOR = 28.3919551;   // 4*pi times GBSAOBCForce's default surface area energy, 2.25936 kJ/mol/nm^2
 
 // Python's "%.16g", which _createEnergyTerms uses for the named constants.
@@ -95,7 +89,7 @@ bool isShiftedPairTerm(const string& expression, const string& params, double cu
     string shift = expression.substr(head.size(), expression.size()-head.size()-tail.size());
     char* end;
     double inverseCutoff = strtod(shift.c_str(), &end);
-    return end != shift.c_str() && *end == '\0' && fabs(inverseCutoff*cutoff-1) < 1e-12;
+    return end != shift.c_str() && *end == '\0' && inverseCutoff == 1/cutoff;
 }
 
 } // namespace
@@ -162,16 +156,13 @@ unique_ptr<GBSAOBCForce> MetalCalcCustomGBForceKernel::equivalentOBC(const Custo
 bool MetalCalcCustomGBForceKernel::copyParticles(const CustomGBForce& force, GBSAOBCForce& obc) {
     // customgbforces.py stores or = radius-offset and sr = scalingFactor*or.
     vector<double> params;
-    double minOffsetRadius = numeric_limits<double>::max(), maxScaledRadius = 0;
     for (int i = 0; i < force.getNumParticles(); i++) {
         force.getParticleParameters(i, params);
-        if (params[1] <= 0)
+        if (!isfinite(params[0]) || !isfinite(params[1]) || !isfinite(params[2]) || params[1] <= 0 || params[2] < 0)
             return false;
         obc.setParticleParameters(i, params[0], params[1]+OBC2_OFFSET, params[2]/params[1]);
-        minOffsetRadius = min(minOffsetRadius, params[1]);
-        maxScaledRadius = max(maxScaledRadius, params[2]);
     }
-    return maxScaledRadius-minOffsetRadius < MAX_ENGULF_DISTANCE;
+    return true;
 }
 
 void MetalCalcCustomGBForceKernel::initialize(const System& system, const CustomGBForce& force) {
@@ -188,7 +179,7 @@ void MetalCalcCustomGBForceKernel::initialize(const System& system, const Custom
         inner.getAs<CommonCalcCustomGBForceKernel>().initialize(system, force);
         return;
     }
-    inner = Kernel(new MetalCalcGBSAOBCForceKernel(CalcGBSAOBCForceKernel::Name(), getPlatform(), cu));
+    inner = Kernel(new MetalCalcGBSAOBCForceKernel(CalcGBSAOBCForceKernel::Name(), getPlatform(), cu, true));
     inner.getAs<MetalCalcGBSAOBCForceKernel>().initialize(system, *obc);
 }
 
@@ -206,7 +197,6 @@ void MetalCalcCustomGBForceKernel::copyParametersToContext(ContextImpl& context,
     if (force.getNumParticles() != obc->getNumParticles())
         throw OpenMMException("updateParametersInContext: The number of particles has changed");
     if (!copyParticles(force, *obc))
-        throw OpenMMException("updateParametersInContext: The new radii leave the OBC2 form this Context was built for "
-                "(largest sr minus smallest or must stay under 0.09 nm)");
+        throw OpenMMException("updateParametersInContext: OBC2 parameters must be finite with or > 0 and sr >= 0");
     inner.getAs<MetalCalcGBSAOBCForceKernel>().copyParametersToContext(context, *obc);
 }

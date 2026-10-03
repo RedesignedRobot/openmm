@@ -38,8 +38,8 @@ namespace OpenMM {
  * rides in the nonbonded kernel and its pair energy in a generic N^2 kernel, about twice the step time of the
  * hand-written GBSAOBCForce kernels on the Folding@home OBC2 unit.  When the force is exactly that template (the
  * expressions openmm.app writes, no salt, dielectric offset 0.009, ACE or no surface term, no globals, tables or
- * parameter derivatives, one CustomGBForce in the System) and its radii keep OBC's engulfing term at zero at every
- * bonded distance, this kernel builds the equivalent GBSAOBCForce and runs the Metal GBSAOBC kernel.  Any other
+ * parameter derivatives, one CustomGBForce in the System), this kernel runs the Metal GBSAOBC kernel with the
+ * app's Coulomb constant and without the engulfment term in either the Born sum or its derivative.  Any other
  * CustomGBForce runs the common kernel unchanged.
  */
 class MetalCalcCustomGBForceKernel : public CalcCustomGBForceKernel {
