@@ -118,10 +118,10 @@ private:
     class SyncQueuePreComputation;
     class SyncQueuePostComputation;
     /**
-     * Run the reciprocal space kernels that follow charge spreading.  Metal energy-only Coulomb PME stops after
-     * the forward FFT and energy evaluation; force evaluations also convolve, inverse transform, and interpolate.
+     * Run the reciprocal space kernels that follow charge spreading: the forward FFT, the convolution (and the energy
+     * on energy steps), the inverse FFT and force interpolation.
      */
-    void computeReciprocalFromGrid(bool includeForces, bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
+    void computeReciprocalFromGrid(bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
     ComputeContext& cc;
     ForceInfo* info;
     bool hasInitializedKernel;

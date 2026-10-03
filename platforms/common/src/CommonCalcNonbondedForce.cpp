@@ -769,7 +769,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
     cc.addForce(info);
 }
 
-void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeForces, bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat) {
+void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat) {
     // Energy steps take the separate kernels, since gridEvaluateEnergy needs the transformed grid.
     if (includeEnergy || !fft->execPmeConvolution(pmeGrid1, pmeGrid2, pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVectors, M_PI*M_PI/(alpha*alpha))) {
         fft->execFFT(pmeGrid1, pmeGrid2, true);
@@ -789,14 +789,8 @@ void CommonCalcNonbondedForceKernel::computeReciprocalFromGrid(bool includeForce
             pmeEvalEnergyKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[1]);
             pmeEvalEnergyKernel->setArg<mm_float4>(7, recipBoxVectorsFloat[2]);
         }
-        if (includeEnergy) {
+        if (includeEnergy)
             pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-#ifdef OpenMMMetal_EXPORTS
-            // Energy consumes the forward transform.  The remaining Coulomb PME work only produces forces.
-            if (!includeForces && !doLJPME)
-                return;
-#endif
-        }
         pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
         fft->execFFT(pmeGrid2, pmeGrid1, false);
     }
@@ -1143,17 +1137,17 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 cc.clearBuffer(pmeOwnerHeads);
                 pmeOwnerBinKernel->execute(cc.getNumAtoms());
                 pmeOwnerGatherKernel->execute(64*pmeOwnerHeads.getSize(), 64);
-                computeReciprocalFromGrid(includeForces, includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
+                computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
             }
             else if (deferPmeSpread && !reciprocalOnQueue) {
                 cc.addForcePassKernel(pmeSpreadChargeKernel, cc.getNumAtoms());
-                cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeForces, includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
+                cc.addAfterForcePass([=] () { computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat); });
             }
             else {
                 pmeSpreadChargeKernel->execute(cc.getNumAtoms());
                 if (useFixedPointChargeSpreading)
                     pmeFinishSpreadChargeKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
-                computeReciprocalFromGrid(includeForces, includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
+                computeReciprocalFromGrid(includeEnergy, recipBoxVectors, recipBoxVectorsFloat);
             }
         }
 
