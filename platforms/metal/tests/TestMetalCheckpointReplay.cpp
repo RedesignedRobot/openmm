@@ -2,7 +2,9 @@
 #include "MetalContext.h"
 #include "MetalNonbondedUtilities.h"
 #include "MetalPlatform.h"
+#include "MetalKernels.h"
 #include "openmm/Context.h"
+#include "openmm/KernelFactory.h"
 #include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/MonteCarloBarostat.h"
 #include "openmm/NonbondedForce.h"
@@ -26,6 +28,17 @@ class TestPlatform : public MetalPlatform {
 public:
     MetalContext& metal(Context& context) const {
         return *static_cast<PlatformData*>(getContextImpl(context).getPlatformData())->contexts[0];
+    }
+    mutable MetalApplyMonteCarloBarostatKernel* trial = nullptr;
+};
+
+class TrialFactory : public KernelFactory {
+public:
+    KernelImpl* createKernelImpl(string name, const Platform& platform, ContextImpl& context) const override {
+        auto& p=static_cast<const TestPlatform&>(platform);
+        auto& metal=*static_cast<MetalPlatform::PlatformData*>(context.getPlatformData())->contexts[0];
+        p.trial=new MetalApplyMonteCarloBarostatKernel(name, platform, metal);
+        return p.trial;
     }
 };
 
@@ -79,21 +92,72 @@ static vector<unsigned char> rawVelocities(MetalContext& metal) {
 }
 
 // A fresh Context must use the same arithmetic as a Context that has already stepped.
-static void testCheckpoint(TestPlatform& platform, const string& precision) {
+static void advanceOwner(TestPlatform& platform, Context& context, LangevinMiddleIntegrator& integrator, int step) {
+    auto& metal=platform.metal(context);
+    if (step == 5) {
+        auto before=metal.getAtomIndex();
+        // Force a real reorder in both continuations without changing coordinates.
+        // PME forces need not be invariant to translation relative to its mesh.
+        metal.forceReorder();
+        metal.reorderAtoms();
+        ASSERT(metal.getAtomsWereReordered());
+        auto reordered=context.getState(State::Forces).getForces();
+        auto repeated=context.getState(State::Forces).getForces();
+        ASSERT(memcmp(reordered.data(),repeated.data(),reordered.size()*sizeof(Vec3)) == 0);
+        cout << "owner continuation: forced reorder, permutation changed=" << (before != metal.getAtomIndex()) << endl;
+    }
+    bool trial=(step+1)%25 == 0;
+    bool accept=(step+1)%50 == 25;
+    Vec3 a,b,c;
+    if (trial) {
+        context.getState(0).getPeriodicBoxVectors(a,b,c);
+        // Expansion with zero acceptance uniform must accept. Very high pressure
+        // makes the same proposal reject with uniform 0.5, well away from a boundary.
+        context.setParameter(MonteCarloBarostat::Pressure(), accept ? 1 : 1e8);
+        platform.trial->setTrialUniforms(0.75, accept ? 0 : 0.5);
+    }
+    integrator.step(1);
+    if (trial) {
+        auto result=platform.trial->getTrialState();
+        ASSERT_EQUAL(16, result.size());
+        ASSERT_EQUAL(accept, result[6] != 0);
+        Vec3 nextA,nextB,nextC;
+        context.getState(0).getPeriodicBoxVectors(nextA,nextB,nextC);
+        ASSERT_EQUAL(accept, nextA[0] != a[0]);
+        if (!accept) { ASSERT(a == nextA); ASSERT(b == nextB); ASSERT(c == nextC); }
+        cout << "owner device-box trial: " << (accept ? "accepted" : "rejected") << endl;
+    }
+}
+
+static void testCheckpoint(TestPlatform& platform, const string& precision, bool owner=false) {
+    if (owner) {
+        setenv("OPENMM_METAL_PME_OWNER", "1", 1);
+        setenv("OPENMM_METAL_DEVICE_BOX", "1", 1);
+        setenv("OPENMM_METAL_DEVICE_BAROSTAT", "1", 1);
+        setenv("OPENMM_METAL_COOP_SHAKE", "0", 1);
+    }
     System system;
     vector<Vec3> positions;
     createWater(system, positions);
     auto* barostat = new MonteCarloBarostat(1, 300, 25);
     barostat->setRandomNumberSeed(2027);
     system.addForce(barostat);
-    map<string, string> properties = {{"Precision", precision}, {"DeterministicForces", "true"}};
+    map<string, string> properties = {{"Precision", precision}, {"DeterministicForces", "true"},
+            {"DeviceIndex", "0"}, {"DisablePmeStream", "true"}};
     string blob;
-    vector<vector<Vec3>> expected;
+    vector<State> expected;
     vector<unsigned char> velocities;
     {
         LangevinMiddleIntegrator integrator(300, 1, 0.002);
         integrator.setRandomNumberSeed(2026);
         Context context(system, integrator, platform, properties);
+        for (auto& property : properties) {
+            string effective=platform.getPropertyValue(context,property.first);
+            cout << "checkpoint owner=" << owner << " " << property.first << " requested=" << property.second
+                 << " effective=" << effective << endl;
+            ASSERT_EQUAL(property.second,effective);
+        }
+        if (owner) ASSERT(platform.metal(context).getUseDeviceBox());
         context.setPositions(positions);
         context.setVelocitiesToTemperature(300, 2026);
         context.applyConstraints(integrator.getConstraintTolerance());
@@ -106,8 +170,9 @@ static void testCheckpoint(TestPlatform& platform, const string& precision) {
         blob = checkpoint.str();
         velocities = rawVelocities(platform.metal(context));
         for (int i = 0; i < 100; i++) {
-            integrator.step(1);
-            expected.push_back(context.getState(State::Positions).getPositions());
+            if (owner) advanceOwner(platform,context,integrator,i);
+            else integrator.step(1);
+            expected.push_back(context.getState(State::Positions|State::Velocities|State::Forces));
         }
     }
     LangevinMiddleIntegrator integrator(300, 1, 0.002);
@@ -120,15 +185,24 @@ static void testCheckpoint(TestPlatform& platform, const string& precision) {
     ASSERT(blob == restored.str());
     ASSERT(velocities == rawVelocities(platform.metal(context)));
     for (int i = 0; i < 100; i++) {
-        integrator.step(1);
-        const vector<Vec3> actual = context.getState(State::Positions).getPositions();
+        if (owner) advanceOwner(platform,context,integrator,i);
+        else integrator.step(1);
+        State state=context.getState(State::Positions|State::Velocities|State::Forces);
+        const vector<Vec3>& actual = state.getPositions();
         double delta = 0;
         for (int j = 0; j < actual.size(); j++)
             for (int k = 0; k < 3; k++)
-                delta = max(delta, abs(actual[j][k]-expected[i][j][k]));
-        if (memcmp(actual.data(), expected[i].data(), actual.size()*sizeof(Vec3)) != 0) {
+                delta = max(delta, abs(actual[j][k]-expected[i].getPositions()[j][k]));
+        if (memcmp(actual.data(), expected[i].getPositions().data(), actual.size()*sizeof(Vec3)) != 0) {
             cout << "checkpoint mismatch at step " << 2501+i << ", maximum position delta " << delta << endl;
             throw OpenMMException("Checkpoint continuation must be bitwise equal");
+        }
+        if (owner) {
+            ASSERT(memcmp(state.getVelocities().data(),expected[i].getVelocities().data(),actual.size()*sizeof(Vec3)) == 0);
+            ASSERT(memcmp(state.getForces().data(),expected[i].getForces().data(),actual.size()*sizeof(Vec3)) == 0);
+            Vec3 a,b,c,ea,eb,ec;
+            state.getPeriodicBoxVectors(a,b,c); expected[i].getPeriodicBoxVectors(ea,eb,ec);
+            ASSERT(a == ea); ASSERT(b == eb); ASSERT(c == ec);
         }
     }
 }
@@ -136,7 +210,9 @@ static void testCheckpoint(TestPlatform& platform, const string& precision) {
 int main(int argc, char* argv[]) {
     try {
         TestPlatform platform;
+        platform.registerKernelFactory(ApplyMonteCarloBarostatKernel::Name(), new TrialFactory());
         testCheckpoint(platform, argc > 1 ? argv[1] : "mixed");
+        if (argc == 1 || string(argv[1]) == "mixed") testCheckpoint(platform, "mixed", true);
         cout << "Done" << endl;
         return 0;
     }

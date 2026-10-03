@@ -13,6 +13,8 @@
 #include "openmm/VerletIntegrator.h"
 #include "openmm/VirtualSite.h"
 #include "openmm/internal/AssertionUtilities.h"
+#include "openmm/internal/ContextImpl.h"
+#include "openmm/serialization/XmlSerializer.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -22,24 +24,32 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <vector>
 
 using namespace OpenMM;
 using namespace std;
-static MetalPlatform platform;
+class OwnerPlatform : public MetalPlatform {
+public:
+    MetalContext& metal(Context& context) const {
+        return *static_cast<PlatformData*>(getContextImpl(context).getPlatformData())->contexts[0];
+    }
+};
+static OwnerPlatform platform;
 
 struct OwnerSwitch {
     bool existed;
-    string saved;
-    OwnerSwitch(bool enabled) : existed(getenv("OPENMM_METAL_PME_OWNER") != nullptr) {
-        if (existed) saved = getenv("OPENMM_METAL_PME_OWNER");
-        setenv("OPENMM_METAL_PME_OWNER", enabled ? "1" : "0", 1);
+    string name, saved;
+    OwnerSwitch(bool enabled, const string& name="OPENMM_METAL_PME_OWNER") :
+            existed(getenv(name.c_str()) != nullptr), name(name) {
+        if (existed) saved = getenv(name.c_str());
+        setenv(name.c_str(), enabled ? "1" : "0", 1);
     }
     ~OwnerSwitch() {
-        if (existed) setenv("OPENMM_METAL_PME_OWNER", saved.c_str(), 1);
-        else unsetenv("OPENMM_METAL_PME_OWNER");
+        if (existed) setenv(name.c_str(), saved.c_str(), 1);
+        else unsetenv(name.c_str());
     }
 };
 
@@ -132,6 +142,9 @@ struct Spread {
 };
 
 void testGrid(const string& precision) {
+    // This standalone kernel fixture supplies a synthetic box through arguments.
+    // Production instead uses the Context's box, including device-box bindings.
+    OwnerSwitch box(false, "OPENMM_METAL_DEVICE_BOX");
     Fixture f=waterBox();
     System system; for (auto p : f.pos) system.addParticle(1);
     MetalPlatform::PlatformData data(nullptr,system,"","true",precision,"false",platform.getPropertyDefaultValue(MetalPlatform::MetalTempDirectory()),"true","false",1,nullptr);
@@ -199,6 +212,52 @@ void testForces(const string& precision) {
         double err=0, norm=0;
         for (int i=0; i<(int)ref.size(); i++) { Vec3 d=ref[i]-owned[i]; err+=d.dot(d); norm+=ref[i].dot(ref[i]); }
         ASSERT(sqrt(err/max(norm,1e-30)) < (deterministic ? 1e-6 : 1e-4));
+    }
+}
+
+void testFahForces(const string& directory) {
+    OwnerSwitch box(true, "OPENMM_METAL_DEVICE_BOX");
+    OwnerSwitch barostat(true, "OPENMM_METAL_DEVICE_BAROSTAT");
+    OwnerSwitch shake(false, "OPENMM_METAL_COOP_SHAKE");
+    ifstream systemFile(directory+"/system.xml"), stateFile(directory+"/state.xml");
+    unique_ptr<System> system(XmlSerializer::deserialize<System>(systemFile));
+    unique_ptr<State> state(XmlSerializer::deserialize<State>(stateFile));
+    const map<string, string> properties = {{"Precision", "mixed"}, {"DeviceIndex", "0"},
+            {"DisablePmeStream", "true"}, {"DeterministicForces", "true"}};
+    vector<Vec3> baseline, owned;
+    for (int run=0; run<3; run++) {
+        OwnerSwitch flag(run != 0);
+        VerletIntegrator integrator(0.001);
+        Context context(*system, integrator, platform, properties);
+        ASSERT(platform.metal(context).getUseDeviceBox());
+        ASSERT(platform.metal(context).getUseFixedPointChargeSpreading());
+        cout << "FAH " << directory << " owner=" << (run != 0) << " context=" << run;
+        for (auto& property : properties) {
+            string effective=platform.getPropertyValue(context, property.first);
+            cout << " " << property.first << " requested=" << property.second << " effective=" << effective;
+            ASSERT_EQUAL(property.second, effective);
+        }
+        cout << endl;
+        context.setState(*state);
+        context.computeVirtualSites();
+        auto current=context.getState(State::Forces).getForces();
+        if (run == 0) baseline=current;
+        else {
+            for (int repeat=0; repeat<3; repeat++) {
+                auto next=context.getState(State::Forces).getForces();
+                ASSERT(memcmp(current.data(), next.data(), current.size()*sizeof(Vec3)) == 0);
+            }
+            if (run == 1) owned=current;
+            else ASSERT(memcmp(owned.data(), current.data(), current.size()*sizeof(Vec3)) == 0);
+            double error=0, norm=0;
+            for (int i=0; i<(int)current.size(); i++) {
+                Vec3 delta=current[i]-baseline[i];
+                error+=delta.dot(delta); norm+=baseline[i].dot(baseline[i]);
+            }
+            double relative=sqrt(error/max(norm, 1e-30));
+            cout << "FAH relative force error=" << relative << " tolerance=1e-6 repeat=bitwise" << endl;
+            ASSERT(relative < 1e-6);
+        }
     }
 }
 
@@ -297,6 +356,12 @@ int main(int argc, char** argv) {
         string precision=argc > 1 ? argv[1] : "single";
         if (argc == 4 && string(argv[2]) == "--kill") return kill(precision,argv[3]);
         testGrid(precision); testForces(precision); testReferenceForces(precision);
+        if (argc > 2) {
+            ASSERT_EQUAL(string("--fah"), string(argv[2]));
+            ASSERT_EQUAL(string("mixed"), precision);
+            ASSERT(argc > 3);
+            for (int i=3; i<argc; i++) testFahForces(argv[i]);
+        }
         cout << "Done" << endl;
     }
     catch (const exception& e) { cerr << e.what() << endl; return 1; }
