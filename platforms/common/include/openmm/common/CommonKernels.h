@@ -705,8 +705,8 @@ private:
  */
 class CommonCalcGBSAOBCForceKernel : public CalcGBSAOBCForceKernel {
 public:
-    CommonCalcGBSAOBCForceKernel(std::string name, const Platform& platform, ComputeContext& cc) : CalcGBSAOBCForceKernel(name, platform), cc(cc),
-            hasCreatedKernels(false) {
+    CommonCalcGBSAOBCForceKernel(std::string name, const Platform& platform, ComputeContext& cc, bool customOBC2 = false) : CalcGBSAOBCForceKernel(name, platform), cc(cc),
+            hasCreatedKernels(false), customOBC2(customOBC2) {
     }
     /**
      * Initialize the kernel.
@@ -735,6 +735,8 @@ protected:
     class ForceInfo;
     double prefactor, surfaceAreaFactor, cutoff;
     bool hasCreatedKernels;
+    // The app's CustomGB OBC2 expression omits the engulfment term and uses its own Coulomb constant.
+    const bool customOBC2;
     int maxTiles;
     ComputeContext& cc;
     ForceInfo* info;

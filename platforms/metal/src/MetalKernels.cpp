@@ -416,6 +416,8 @@ bool MetalCalcGBSAOBCForceKernel::createOwnedKernels() {
     if ((double) numBlocks*numBlocks > MAX_OWNED_BLOCK_PAIRS_PER_WARP*numWarps)
         return false;
     map<string, string> defines;
+    if (customOBC2)
+        defines["CUSTOM_OBC2"] = "1";
     if (nb.getUsePeriodic())
         defines["USE_PERIODIC"] = "1";
     defines["CUTOFF_SQUARED"] = cu.doubleToString(cutoff*cutoff);

@@ -57,7 +57,11 @@ DEVICE real bornSumTerm(real r, real invR, real radius1, real invRadius1, real s
     real u_ij2 = u_ij*u_ij;
     real ratio = LOG(u_ij*lowerLimit);
     real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) + (scaledRadius2*scaledRadius2*invR)*(l_ij2-u_ij2));
+#ifdef CUSTOM_OBC2
+    return term;
+#else
     return term + (radius1 < scaledRadius2-r ? 2.0f*(invRadius1-l_ij) : 0);
+#endif
 }
 
 /**

@@ -18,6 +18,13 @@
     real t2I = (l_ij2I-u_ij2I);
     real term1 = (0.5f*(0.25f+OBC_PARAMS2.y*OBC_PARAMS2.y*invRSquaredOver4)*t2J + t1J*invRSquaredOver4)*invR;
     real term2 = (0.5f*(0.25f+OBC_PARAMS1.y*OBC_PARAMS1.y*invRSquaredOver4)*t2I + t1I*invRSquaredOver4)*invR;
+#ifdef CUSTOM_OBC2
+    // term1/2 are -dI/dr/r for the integral including engulfment.  The app omits
+    // 1/or-1/(sr-r), whose derivative is -1/(sr-r)^2.  At equality max(or, D)
+    // selects or, so use the same strict inequality as the omitted correction.
+    term1 -= (OBC_PARAMS1.x < OBC_PARAMS2.y-r ? invR*l_ij2J : 0);
+    term2 -= (OBC_PARAMS2.x < OBC_PARAMS1.y-r ? invR*l_ij2I : 0);
+#endif
     real tempdEdR = (OBC_PARAMS1.x < rScaledRadiusJ ? BORN_FORCE1*term1/0x100000000 : 0);
     tempdEdR += (OBC_PARAMS2.x < rScaledRadiusI ? BORN_FORCE2*term2/0x100000000 : 0);
 #ifdef USE_CUTOFF

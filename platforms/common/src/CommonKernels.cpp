@@ -1977,11 +1977,15 @@ void CommonCalcGBSAOBCForceKernel::initialize(const System& system, const GBSAOB
     charges.upload(chargeVec, true);
     params.upload(paramsVector);
     prefactor = -ONE_4PI_EPS0*((1.0/force.getSoluteDielectric())-(1.0/force.getSolventDielectric()));
+    if (customOBC2)
+        prefactor = -138.935485*((1.0/force.getSoluteDielectric())-(1.0/force.getSolventDielectric()));
     surfaceAreaFactor = -6.0*4*M_PI*force.getSurfaceAreaEnergy();
     bool useCutoff = (force.getNonbondedMethod() != GBSAOBCForce::NoCutoff);
     bool usePeriodic = (force.getNonbondedMethod() != GBSAOBCForce::NoCutoff && force.getNonbondedMethod() != GBSAOBCForce::CutoffNonPeriodic);
     cutoff = force.getCutoffDistance();
     string source = CommonKernelSources::gbsaObc2;
+    if (customOBC2)
+        source = "#define CUSTOM_OBC2\n"+source+"\n#undef CUSTOM_OBC2\n";
     map<string, string> replacements;
     replacements["CHARGE1"] = prefix+"charge1";
     replacements["CHARGE2"] = prefix+"charge2";
@@ -2009,6 +2013,8 @@ double CommonCalcGBSAOBCForceKernel::execute(ContextImpl& context, bool includeF
         maxTiles = (nb.getUseCutoff() ? nb.getInteractingTiles().getSize() : 0);
         int numAtomBlocks = cc.getPaddedNumAtoms()/32;
         map<string, string> defines;
+        if (customOBC2)
+            defines["CUSTOM_OBC2"] = "1";
         if (nb.getUseCutoff())
             defines["USE_CUTOFF"] = "1";
         if (nb.getUsePeriodic())
