@@ -398,13 +398,14 @@ static void testConstructorCleanup(bool fft) {
     }
 }
 
-static void testAdaptiveReorder() {
+static void testAdaptiveReorder(bool deterministic) {
     System system;
     vector<Vec3> positions;
     makeWater(system, positions);
     LangevinMiddleIntegrator integrator(300, 1, 0.0001);
     integrator.setRandomNumberSeed(2029);
-    Context context(system, integrator, platform);
+    Context context(system, integrator, platform, {{"DeterministicForces", deterministic ? "true" : "false"}});
+    ASSERT_EQUAL(deterministic ? "true" : "false", platform.getPropertyValue(context, "DeterministicForces"));
     MetalContext& cc = platform.metal(context);
     cc.getCurrentStream().commitWhenIdle();
     context.setPositions(positions);
@@ -430,12 +431,19 @@ static void testAdaptiveReorder() {
 
     // FAH batching: no state downloads or finishes in these 200 integration steps.
     // This ends before the fixed 251-step reorder could repair the poor atom order.
+    int stepsBeforeBatch = cc.getStepsSinceReorder();
     integrator.step(200);
     unsigned int reorders = MetalHostRobustnessAccess::adaptiveReorders(cc);
-    cout << "adaptive reorder: baseline=" << baseline << " grown=" << grown
+    cout << "adaptive reorder: deterministic=" << deterministic << " baseline=" << baseline << " grown=" << grown
          << " requests=" << reorders << " stepsSinceReorder=" << cc.getStepsSinceReorder() << endl;
-    ASSERT_EQUAL(1, reorders);
-    ASSERT(cc.getStepsSinceReorder() < 200);
+    // Snapshot timing is intentionally excluded from deterministic replay.
+    ASSERT_EQUAL(deterministic ? 0 : 1, reorders);
+    if (deterministic) {
+        ASSERT_EQUAL(stepsBeforeBatch+200, cc.getStepsSinceReorder());
+    }
+    else {
+        ASSERT(cc.getStepsSinceReorder() < 200);
+    }
     ASSERT(isfinite(context.getState(State::Energy).getPotentialEnergy()));
 }
 
@@ -514,7 +522,7 @@ int main(int argc, char* argv[]) {
     platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
     platform.setPropertyDefaultValue("DeterministicForces", "true");
     int failures = 0;
-    for (auto test : vector<pair<string, function<void()>>>{{"nonleader movement", testNonleaderMovement}, {"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", testAdaptiveReorder}}) {
+    for (auto test : vector<pair<string, function<void()>>>{{"nonleader movement", testNonleaderMovement}, {"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", [] { testAdaptiveReorder(false); testAdaptiveReorder(true); }}}) {
         if (argc > 2 && (string(argv[2]) == "audit" ? test.first == "adaptive reorder" : string(argv[2]) != test.first))
             continue;
         try {

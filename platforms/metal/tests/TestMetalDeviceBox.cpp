@@ -145,15 +145,22 @@ static void testHostUpdate(BoxPlatform& platform, System& system, const State* i
         platform.metal(context).forceReorder();
         results.push_back(context.getState(State::Energy | State::Forces));
         vector<State> groups;
-        for (int group = 0; group < 3; group++)
+        double checkpointMagnitude = 0;
+        for (int group = 0; group < 3; group++) {
             groups.push_back(context.getState(State::Energy | State::Forces, false, 1<<group));
+            checkpointMagnitude += abs(groups.back().getPotentialEnergy());
+        }
         groupStates.push_back(groups);
         stringstream checkpoint;
         context.createCheckpoint(checkpoint);
         context.setPeriodicBoxVectors(box[0], box[1], box[2]);
         context.loadCheckpoint(checkpoint);
         State restored = context.getState(State::Energy | State::Forces);
-        compare(results.back(), restored, 0);
+        // Checkpoints invalidate the neighbor list.  Rebuilt tiles can arrive in
+        // a different order, changing floating-point energy sums even when both
+        // arms rebuild.  Keep forces bitwise and use the same cancellation-aware
+        // energy bound as the device-scaled checkpoint and flag comparisons.
+        compare(results.back(), restored, 1e-8*checkpointMagnitude);
         Vec3 found[3];
         restored.getPeriodicBoxVectors(found[0], found[1], found[2]);
         for (int i = 0; i < 3; i++) ASSERT_EQUAL_VEC(box[i]*1.015, found[i], 1e-12);
