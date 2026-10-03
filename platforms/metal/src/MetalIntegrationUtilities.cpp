@@ -31,6 +31,7 @@
 #include "CommonKernelSources.h"
 #include "openmm/common/ContextSelector.h"
 #include "openmm/VirtualSite.h"
+#include "openmm/LangevinMiddleIntegrator.h"
 #include <cstdlib>
 
 using namespace OpenMM;
@@ -271,7 +272,9 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
 
         vector<int> clusterVsite(max(1, numSettle), -1);
         vector<mm_float4> clusterVsiteWeights(max(1, numSettle), mm_float4(0, 0, 0, 0));
-        bool foldVsites = (numVsites > 0 && numVsites == numThreeParticleAverageSites && numSettle > 0);
+        // Other top-level integrators can switch to a consumer that needs eagerly distributed forces.
+        bool foldVsites = (dynamic_cast<LangevinMiddleIntegrator*>(&context.getContextImpl()->getIntegrator()) != nullptr &&
+                numVsites > 0 && numVsites == numThreeParticleAverageSites && numSettle > 0);
         if (foldVsites) {
             vector<int> clusterOfAtom(numAtoms, -1);
             for (int i = 0; i < numSettle; i++)
