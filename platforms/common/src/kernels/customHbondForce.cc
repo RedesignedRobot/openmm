@@ -169,9 +169,9 @@ KERNEL void computeHbondForces(
             localData[LOCAL_ID].pos3 = (atoms2.z > -1 ? trimTo3(posq[atoms2.z]) : make_real3(0));
         }
         SYNC_WARPS;
-        if (donorIndex < NUM_DONORS) {
-            int index = indexInWarp;
-            for (int j = 0; j < 32; j++) {
+        int index = indexInWarp;
+        for (int j = 0; j < 32; j++) {
+            if (donorIndex < NUM_DONORS) {
                 int acceptorIndex = acceptorStart+index;
 #ifdef USE_EXCLUSIONS
                 if (acceptorIndex < NUM_ACCEPTORS && acceptorIndex != exclusionIndices.x && acceptorIndex != exclusionIndices.y && acceptorIndex != exclusionIndices.z && acceptorIndex != exclusionIndices.w) {
@@ -192,8 +192,10 @@ KERNEL void computeHbondForces(
                     }
 #endif
                 }
-                index = (index+1)%32;
             }
+            // The next lane takes ownership of this acceptor's shared forces.
+            SYNC_WARPS;
+            index = (index+1)%32;
         }
 
         // Write results
@@ -203,7 +205,6 @@ KERNEL void computeHbondForces(
             applyForce(atoms.y, f2, force);
             applyForce(atoms.z, f3, force);
         }
-        SYNC_WARPS;
         applyForce(atoms2.x, localData[LOCAL_ID].f1, force);
         applyForce(atoms2.y, localData[LOCAL_ID].f2, force);
         applyForce(atoms2.z, localData[LOCAL_ID].f3, force);
