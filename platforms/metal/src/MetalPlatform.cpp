@@ -103,10 +103,12 @@ MetalPlatform::MetalPlatform() {
     platformProperties.push_back(MetalUseCpuPme());
     platformProperties.push_back(MetalDisablePmeStream());
     platformProperties.push_back(MetalDeterministicForces());
+    platformProperties.push_back(MetalDeviceIndex());
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
     setPropertyDefaultValue(MetalDisablePmeStream(), "false");
     setPropertyDefaultValue(MetalDeterministicForces(), "false");
+    setPropertyDefaultValue(MetalDeviceIndex(), "");
 }
 
 double MetalPlatform::getSpeed() const {
@@ -145,6 +147,10 @@ void MetalPlatform::contextCreated(ContextImpl& context, const map<string, strin
     transform(cpuPmePropValue.begin(), cpuPmePropValue.end(), cpuPmePropValue.begin(), ::tolower);
     transform(pmeStreamPropValue.begin(), pmeStreamPropValue.end(), pmeStreamPropValue.begin(), ::tolower);
     transform(deterministicForcesValue.begin(), deterministicForcesValue.end(), deterministicForcesValue.begin(), ::tolower);
+    string devicePropValue = (properties.find(MetalDeviceIndex()) == properties.end() ?
+            getPropertyDefaultValue(MetalDeviceIndex()) : properties.find(MetalDeviceIndex())->second);
+    if (devicePropValue.find_first_not_of("0, ") != string::npos)
+        throw OpenMMException("Illegal value for DeviceIndex: "+devicePropValue);
     vector<string> pmeKernelName;
 //    pmeKernelName.push_back(CalcPmeReciprocalForceKernel::Name());
     if (!supportsKernels(pmeKernelName))
@@ -197,6 +203,7 @@ MetalPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sy
     propertyValues[MetalPlatform::MetalUseCpuPme()] = useCpuPme ? "true" : "false";
     propertyValues[MetalPlatform::MetalDisablePmeStream()] = disablePmeStream ? "true" : "false";
     propertyValues[MetalPlatform::MetalDeterministicForces()] = deterministicForces ? "true" : "false";
+    propertyValues[MetalPlatform::MetalDeviceIndex()] = "0";
     contextEnergy.resize(contexts.size());
 }
 
