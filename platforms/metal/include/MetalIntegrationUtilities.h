@@ -1,0 +1,165 @@
+#ifndef OPENMM_METALINTEGRATIONUTILITIES_H_
+#define OPENMM_METALINTEGRATIONUTILITIES_H_
+
+/* -------------------------------------------------------------------------- *
+ *                                   OpenMM                                   *
+ * -------------------------------------------------------------------------- *
+ * This is part of the OpenMM molecular simulation toolkit.                   *
+ * See https://openmm.org/development.                                        *
+ *                                                                            *
+ * Portions copyright (c) 2009-2019 Stanford University and the Authors.      *
+ * Portions copyright (c) 2020 Advanced Micro Devices, Inc.                   *
+ * Authors: Peter Eastman, Nicholas Curtis                                    *
+ * Contributors:                                                              *
+ *                                                                            *
+ * This program is free software: you can redistribute it and/or modify       *
+ * it under the terms of the GNU Lesser General Public License as published   *
+ * by the Free Software Foundation, either version 3 of the License, or       *
+ * (at your option) any later version.                                        *
+ *                                                                            *
+ * This program is distributed in the hope that it will be useful,            *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of             *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the              *
+ * GNU Lesser General Public License for more details.                        *
+ *                                                                            *
+ * You should have received a copy of the GNU Lesser General Public License   *
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.      *
+ * -------------------------------------------------------------------------- */
+
+#include "MetalArray.h"
+#include "openmm/System.h"
+#include "openmm/common/IntegrationUtilities.h"
+#include "openmm/common/windowsExportCommon.h"
+#include "openmm/common/ComputeEvent.h"
+
+namespace OpenMM {
+
+class MetalContext;
+
+/**
+ * This class implements features that are used by many different integrators, including
+ * common workspace arrays, random number generation, and enforcing constraints.
+ */
+
+class OPENMM_EXPORT_COMMON MetalIntegrationUtilities : public IntegrationUtilities {
+public:
+    MetalIntegrationUtilities(MetalContext& context, const System& system);
+    ~MetalIntegrationUtilities();
+    /**
+     * Get the array which contains position deltas.
+     */
+    MetalArray& getPosDelta();
+    /**
+     * Get the array which contains random values.  Each element is a float4, whose components
+     * are independent, normally distributed random numbers with mean 0 and variance 1.
+     */
+    MetalArray& getRandom();
+    /**
+     * Get the array which contains the current step size.
+     */
+    MetalArray& getStepSize();
+    /**
+     * Compute the positions of virtual sites.  The kernel writes only positions, so a clear of the autoclear buffers
+     * that integrateLangevinMiddle() folded into the step stays valid across it.
+     */
+    void computeVirtualSites();
+    /**
+     * Distribute forces from virtual sites to the atoms they are based on.  When the fused LangevinMiddle kernel has
+     * folded the sites into their SETTLE clusters, this only notes that the force buffer holds undistributed forces:
+     * the next step adds each site's force to its atoms as it kicks them.
+     */
+    void distributeForcesFromVirtualSites();
+    /**
+     * Distribute the virtual sites' forces now if distributeForcesFromVirtualSites() left them in the buffer.  A
+     * download of the forces calls this first, so it sees the same forces as without the fold.
+     */
+    void ensureVirtualSiteForcesDistributed();
+    /**
+     * Update the positions and velocities for one LangevinMiddleIntegrator step and enforce the constraints, all in one
+     * kernel.  This does nothing and returns false if CCMA enforces any of the constraints, or in double precision.
+     *
+     * @param params   the velocity scale and noise scale of the integrator
+     * @param tol      the constraint tolerance
+     */
+    bool integrateLangevinMiddle(ComputeArray& params, double tol);
+    /** Whether the prepared fused kernel can consume role forces, including all virtual sites. */
+    bool canFoldOrderedForces() const;
+    /**
+     * Get whether integrateLangevinMiddle() can remove center of mass motion for a CMMotionRemover.  That holds in
+     * single and mixed precision when the fused kernel runs.
+     */
+    bool canRemoveCenterOfMassMomentum() const;
+    /**
+     * Remove center of mass motion as part of the next step.  calcKernel runs in the force computation's concurrent
+     * pass (see calcPendingCenterOfMassMomentum()) and writes the center of mass velocity to cmVelocity[0].  The next
+     * integrateLangevinMiddle() subtracts it from every atom as it loads it, in place of the
+     * removeCenterOfMassMomentum kernel.
+     *
+     * @param calcKernel   the calcCenterOfMassVelocity kernel, with its arguments set
+     * @param blockSize    the size of calcKernel's single thread group
+     * @param cmVelocity   the array calcKernel writes to
+     */
+    void removeCenterOfMassMomentum(ComputeKernel& calcKernel, int blockSize, ComputeArray& cmVelocity);
+    /**
+     * Run the calcCenterOfMassVelocity kernel that removeCenterOfMassMomentum() left pending, if there is one.  It
+     * reads the velocities and writes only its own output, so it can share a concurrent pass with the force kernels.
+     */
+    void calcPendingCenterOfMassMomentum();
+    /**
+     * Refill the random number pool now if the fused LangevinMiddle kernel runs and the pool is used up.  The next
+     * prepareRandomNumbers() would refill it anyway and return index 0, so this draws the same numbers in the same
+     * order.  It writes only the pool and its seeds, so it can share a concurrent pass with the force kernels.
+     */
+    void refillExhaustedRandomNumbers();
+    /**
+     * Turn on prefetchKineticEnergy().  An integrator whose kinetic energy is computeKineticEnergy(0) turns it on.
+     */
+    void setPrefetchKineticEnergy(bool prefetch);
+    /**
+     * Get whether setPrefetchKineticEnergy() turned prefetchKineticEnergy() on.
+     */
+    bool getPrefetchKineticEnergy() const {
+        return prefetchesKineticEnergy;
+    }
+    /**
+     * Queue the kinetic energy kernel in a force computation that includes energy, ahead of the energy readback.
+     * Context::getState() asks for the kinetic energy right after the potential energy, and the kernel alone in a
+     * command buffer of its own costs a second round trip to the GPU: 0.2-0.3 ms on an idle M3 Ultra, twice per
+     * MonteCarloBarostat trial.  Does nothing unless setPrefetchKineticEnergy() turned it on.
+     */
+    void prefetchKineticEnergy();
+    /**
+     * Call once the energy readback that followed prefetchKineticEnergy() has waited for the GPU.  From then until
+     * the next GPU work, computeKineticEnergy(0) returns the prefetched result without running the kernel again.
+     */
+    void finishKineticEnergyPrefetch();
+    double computeKineticEnergy(double timeShift);
+#ifdef OPENMM_METAL_TEST_HOOKS
+    // Tests turn the fold off to compare it bitwise with the separate scatter.
+    static bool disableOrderedForceFold;
+#endif
+private:
+    void applyConstraintsImpl(bool constrainVelocities, double tol);
+    bool bindAutoclearBuffers();
+    void runVsiteForceKernels();
+    int* ccmaConvergedMemory;
+    metalDeviceptr_t ccmaConvergedDeviceMemory;
+    ComputeEvent ccmaEvent;
+    ComputeKernel langevinMiddleKernel;
+    ComputeArray freeAtoms;
+    int numLangevinMiddleThreads, numClearThreads, numBoundAutoclearBuffers;
+    bool clearsAutoclearBuffers;
+    ComputeKernel pendingCMCalc;
+    int pendingCMBlockSize;
+    ComputeArray* pendingCMVelocity;
+    bool prefetchesKineticEnergy, kineticEnergyQueued;
+    long long kineticEnergyWorkCount;
+    ComputeArray settleVsites, settleVsiteWeights;
+    int numThreeParticleAverageSites;
+    bool foldsVsites, vsiteForcesDistributed, vsitesPlacedByStep;
+    bool foldsOrderedForces = false;
+};
+
+} // namespace OpenMM
+
+#endif /*OPENMM_METALINTEGRATIONUTILITIES_H_*/
