@@ -597,7 +597,6 @@ IntegrationUtilities::IntegrationUtilities(ComputeContext& context, const System
 
     // Create the kernels used by this class.
 
-    map<string, string> defines;
     defines["NUM_CCMA_ATOMS"] = context.intToString(numCCMAAtoms);
     defines["NUM_CCMA_CONSTRAINTS"] = context.intToString(numCCMA);
     defines["NUM_ATOMS"] = context.intToString(numAtoms);

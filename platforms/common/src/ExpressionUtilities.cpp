@@ -729,7 +729,11 @@ void ExpressionUtilities::processExpression(stringstream& out, const ExpressionT
                         string name2 = prefix+context.intToString(temps.size());
                         names.push_back(name2);
                         temps.push_back(make_pair(*power.second, name2));
-                        out << tempType << " " << name2 << " = 0.0f;\n";
+                        out << tempType << " " << name2 << " = ";
+                        if (isVecType)
+                            out << "make_" << tempType << "(0.0f);\n";
+                        else
+                            out << "0.0f;\n";
                     }
                 }
                 out << "{\n";

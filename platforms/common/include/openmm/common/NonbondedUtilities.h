@@ -79,6 +79,12 @@ public:
      */
     virtual void addParameter(ComputeParameterInfo parameter) = 0;
     /**
+     * Notify the utilities that an interaction uses LJPME.  Platforms may use
+     * this hint to account for the cost of evaluating sparse interaction tiles.
+     */
+    virtual void setUseLJPME() {
+    }
+    /**
      * Add an array (other than a per-atom parameter) that should be passed as an argument to the default interaction kernel.
      */
     virtual void addArgument(ComputeParameterInfo parameter) = 0;

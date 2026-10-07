@@ -208,6 +208,13 @@ public:
      */
     double calcForcesAndEnergy(bool includeForces, bool includeEnergy, int groups=0xFFFFFFFF);
     /**
+     * Calculate forces and energy, returning the ForceImpl sum separately from the
+     * platform's finishComputation result.  Their sum is the potential energy.
+     * This lets a platform defer its energy reduction without changing the order
+     * of floating point additions.  Both outputs refer to the final valid attempt.
+     */
+    double calcForcesAndEnergy(bool includeForces, bool includeEnergy, int groups, double& forceEnergy);
+    /**
      * Get the set of force group flags that were passed to the most recent call to calcForcesAndEnergy().
      * 
      * Note that this returns a reference, so it's possible to modify it.  Be very very cautious about

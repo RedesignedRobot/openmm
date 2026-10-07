@@ -7,7 +7,7 @@ typedef struct {
 /**
  * Generate a random number with PCH-XSH-RR.
  */
-DEVICE unsigned int getRandomInt(RandomState* random) {
+DEVICE unsigned int getRandomInt(PRIVATE RandomState* random) {
     unsigned int xs = ((random->state>>18)^random->state)>>27;
     unsigned int rot = random->state>>59;
     random->state = random->state*6364136223846793005ULL + random->increment;
@@ -17,7 +17,7 @@ DEVICE unsigned int getRandomInt(RandomState* random) {
 /**
  * Generate a normally distributed random number with Box-Muller.
  */
-DEVICE float getRandomNormal(RandomState* random) {
+DEVICE float getRandomNormal(PRIVATE RandomState* random) {
     if (random->nextIsValid) {
         random->nextIsValid = false;
         return random->next;
@@ -35,7 +35,7 @@ DEVICE float getRandomNormal(RandomState* random) {
 /**
  * Perform the first part of integration: velocity step.
  */
-KERNEL void integrateDPDPart1(int numAtoms, int paddedNumAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
+KERNEL void integrateDPDPart1(int numAtoms, int paddedNumAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
         GLOBAL const mixed2* RESTRICT dt, GLOBAL int* RESTRICT tileCounter) {
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     for (int index = GLOBAL_ID; index < numAtoms; index += GLOBAL_SIZE) {
@@ -67,7 +67,7 @@ inline DEVICE mixed3 loadPos(GLOBAL const real4* RESTRICT posq, GLOBAL const rea
  * Compute the friction and noise for a pair of particles.
  */
 DEVICE void processPair(int i, int j, real3 delta, mixed4 vel1, mixed4 vel2, int type1, int type2, int paddedNumAtoms,
-        GLOBAL mm_ulong* RESTRICT velDelta, mixed dt, float kT, int numTypes, GLOBAL const float2* RESTRICT params, RandomState* random,
+        GLOBAL mm_ulong* RESTRICT velDelta, mixed dt, float kT, int numTypes, GLOBAL const float2* RESTRICT params, PRIVATE RandomState* random,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ) {
     if (vel1.w == 0 && vel2.w == 0)
         return;
@@ -99,7 +99,7 @@ DEVICE void processPair(int i, int j, real3 delta, mixed4 vel1, mixed4 vel2, int
 /**
  * Perform the second part of integration: position half step, then interact with heat bath.
  */
-KERNEL void integrateDPDPart2(int numAtoms, int paddedNumAtoms, GLOBAL const real4* RESTRICT posq, GLOBAL const mixed4* RESTRICT velm, GLOBAL mm_long* RESTRICT velDelta,
+KERNEL void integrateDPDPart2(int numAtoms, int paddedNumAtoms, GLOBAL const real4* RESTRICT posq, GLOBAL const mixed4s* RESTRICT velm, GLOBAL mm_long* RESTRICT velDelta,
         GLOBAL const mixed2* RESTRICT dt, GLOBAL const int* particleType, int numTypes, GLOBAL const float2* RESTRICT params, mm_long seed,
         float kT, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         GLOBAL const int2* RESTRICT exclusionTiles, int numExclusionTiles, GLOBAL const int* RESTRICT tiles, GLOBAL const unsigned int* RESTRICT interactionCount,
@@ -277,7 +277,7 @@ KERNEL void integrateDPDPart2(int numAtoms, int paddedNumAtoms, GLOBAL const rea
 /**
  * Perform the third part of integration: update the velocities and the second position half step.
  */
-KERNEL void integrateDPDPart3(int numAtoms, int paddedNumAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL mm_long* RESTRICT velDelta, GLOBAL mixed4* RESTRICT posDelta,
+KERNEL void integrateDPDPart3(int numAtoms, int paddedNumAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL mm_long* RESTRICT velDelta, GLOBAL mixed4s* RESTRICT posDelta,
         GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt) {
     mixed halfdt = 0.5f*dt[0].y;
     mixed deltascale = 1/(mixed) 0x100000000;
@@ -300,8 +300,8 @@ KERNEL void integrateDPDPart3(int numAtoms, int paddedNumAtoms, GLOBAL mixed4* R
  * Perform the fourth part of integration: apply constraint forces to velocities, then record
  * the constrained positions.
  */
-KERNEL void integrateDPDPart4(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4* RESTRICT velm,
-         GLOBAL mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
+KERNEL void integrateDPDPart4(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4s* RESTRICT velm,
+         GLOBAL mixed4s* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif

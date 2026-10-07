@@ -26,6 +26,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/common/ArrayInterface.h"
+#include "openmm/common/ComputeVectorTypes.h"
 #include <memory>
 
 namespace OpenMM {
@@ -67,6 +68,24 @@ public:
      * @param forward  true to perform a forward transform, false to perform an inverse transform
      */
     virtual void execFFT(ArrayInterface& in, ArrayInterface& out, bool forward=true) = 0;
+    /**
+     * Perform the PME reciprocal space convolution of a real-to-complex transform in one call.  On exit, grid
+     * holds what execFFT(grid, scratch, true), the reciprocalConvolution kernel in pme.cc (without LJPME) and
+     * execFFT(scratch, grid, false) would leave there.  A platform that cannot do this for the transform returns
+     * false without doing anything, and the caller runs those three steps itself.
+     *
+     * @param grid             the real grid to convolve, which is replaced by the result
+     * @param scratch          a second grid, large enough for the complex values, whose contents are destroyed
+     * @param moduliX          the B-spline moduli along x
+     * @param moduliY          the B-spline moduli along y
+     * @param moduliZ          the B-spline moduli along z
+     * @param recipBoxVectors  the three reciprocal box vectors
+     * @param recipExpFactor   (pi/alpha)^2 for the Ewald parameter alpha
+     */
+    virtual bool execPmeConvolution(ArrayInterface& grid, ArrayInterface& scratch, ArrayInterface& moduliX, ArrayInterface& moduliY,
+            ArrayInterface& moduliZ, const mm_double4* recipBoxVectors, double recipExpFactor) {
+        return false;
+    }
 };
 
 typedef std::shared_ptr<FFT3DImpl> FFT3D;

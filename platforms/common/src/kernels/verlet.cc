@@ -3,7 +3,7 @@
  */
 
 KERNEL void integrateVerletPart1(int numAtoms, int paddedNumAtoms, GLOBAL const mixed2* RESTRICT dt, GLOBAL const real4* RESTRICT posq,
-        GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed4* RESTRICT posDelta
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed4s* RESTRICT posDelta
 #ifdef USE_MIXED_PRECISION
         , GLOBAL const real4* RESTRICT posqCorrection
 #endif
@@ -39,7 +39,7 @@ KERNEL void integrateVerletPart1(int numAtoms, int paddedNumAtoms, GLOBAL const 
  */
 
 KERNEL void integrateVerletPart2(int numAtoms, GLOBAL mixed2* RESTRICT dt, GLOBAL real4* RESTRICT posq,
-        GLOBAL mixed4* RESTRICT velm, GLOBAL const mixed4* RESTRICT posDelta
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL const mixed4s* RESTRICT posDelta
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif
@@ -89,7 +89,7 @@ KERNEL void integrateVerletPart2(int numAtoms, GLOBAL mixed2* RESTRICT dt, GLOBA
  * Select the step size to use for the next step.
  */
 
-KERNEL void selectVerletStepSize(int numAtoms, int paddedNumAtoms, mixed maxStepSize, mixed errorTol, GLOBAL mixed2* RESTRICT dt, GLOBAL const mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force) {
+KERNEL void selectVerletStepSize(int numAtoms, int paddedNumAtoms, mixed maxStepSize, mixed errorTol, GLOBAL mixed2* RESTRICT dt, GLOBAL const mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force) {
     // Calculate the error.
 
     LOCAL mixed error[256];

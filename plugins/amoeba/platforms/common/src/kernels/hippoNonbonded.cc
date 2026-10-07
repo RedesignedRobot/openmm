@@ -23,6 +23,11 @@ typedef struct {
 
 #define real_shfl SHFL
 
+#elif defined(USE_METAL)
+
+// Metal leaves a lane outside the SIMD group undefined, where CUDA and HIP wrap it.
+#define real_shfl(var, srcLane) SHFL(var, (srcLane)&(TILE_SIZE-1))
+
 #else
 
 //support for 64 bit shuffles
@@ -58,7 +63,7 @@ KERNEL void computeNonbonded(
         , GLOBAL const int* RESTRICT tiles, GLOBAL const unsigned int* RESTRICT interactionCount, real4 periodicBoxSize, real4 invPeriodicBoxSize, 
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, unsigned int maxTiles, GLOBAL const real4* RESTRICT blockCenter,
         GLOBAL const real4* RESTRICT blockSize, GLOBAL const unsigned int* RESTRICT interactingAtoms
-#if defined(__CUDA_ARCH__) || defined(USE_HIP)
+#if defined(__CUDA_ARCH__) || defined(USE_HIP) || defined(USE_METAL)
         , unsigned int maxSinglePairs, GLOBAL const int2* RESTRICT singlePairs
 #endif
 #endif
