@@ -354,6 +354,16 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
         maxSinglePairs = (unsigned int) (1.2*countBuffer[1]);
         singlePairs.resize(maxSinglePairs);
     }
+    for (auto& entry : groupKernels) {
+        KernelSet& kernels = entry.second;
+        kernels.findInteractingBlocksKernel->setArg(10, maxTiles);
+        kernels.findInteractingBlocksKernel->setArg(11, maxSinglePairs);
+        for (const ComputeKernel& kernel : {kernels.forceKernel, kernels.energyKernel, kernels.forceEnergyKernel})
+            if (kernel) {
+                kernel->setArg(14, maxTiles);
+                kernel->setArg(18, maxSinglePairs);
+            }
+    }
     forceRebuildNeighborList = true;
     context.setForcesValid(false);
     return true;
