@@ -300,6 +300,7 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     if (useLargeBlocks)
         setPeriodicBoxArgs(context, kernels.sortBoxDataKernel, 7);
     blockSorter->sort(sortedBlocks);
+    kernels.sortBoxDataKernel->setArg(useLargeBlocks ? 16 : 9, forceRebuildNeighborList);
     kernels.sortBoxDataKernel->execute(context.getNumAtoms());
     setPeriodicBoxArgs(context, kernels.findInteractingBlocksKernel, 0);
     kernels.findInteractingBlocksKernel->execute(context.getNumAtoms(), 256);
