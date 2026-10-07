@@ -98,7 +98,9 @@ inline float4 cross(float4 a, float4 b) {
 }
 
 inline long realToFixedPoint(real x) {
-    return static_cast<long>(clamp((real) -0x8FFFFFFF, (real) 0x8FFFFFFF, x)*0x100000000);
+    // The minimizer detects overflow by looking for values near the limits of the range, but an out of range
+    // conversion wraps on some GPUs, so saturate first.  2147483520 is the largest float below 2^31.
+    return static_cast<long>(clamp(x, -2147483648.0f, 2147483520.0f)*0x100000000);
 }
 
 inline float erfc(float x) {
