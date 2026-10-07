@@ -400,7 +400,7 @@ void MetalNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
-        defines["MAX_BITS_FOR_PAIRS"] = "3";
+        defines["MAX_BITS_FOR_PAIRS"] = (canUsePairList ? "3" : "0");
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
