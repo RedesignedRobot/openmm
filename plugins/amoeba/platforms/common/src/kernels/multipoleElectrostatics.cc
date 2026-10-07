@@ -469,6 +469,10 @@ KERNEL void computeElectrostatics(
                     computeOneInteraction(&data, &localData[tbx+tj], true, d, p, m, 1, &energy);
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef USE_METAL
+                // The next step reads the entry another lane just updated.  Metal promises no lockstep.
+                SYNC_WARPS;
+#endif
             }
             data.force *= -ENERGY_SCALE_FACTOR;
             data.torque *= ENERGY_SCALE_FACTOR;
@@ -564,7 +568,13 @@ KERNEL void computeElectrostatics(
             localData[LOCAL_ID] = loadAtomData(j, posq, sphericalDipole, sphericalQuadrupole, inducedDipole, inducedDipolePolar, dampingAndThole);
             localData[LOCAL_ID].force = make_real3(0);
             localData[LOCAL_ID].torque = make_real3(0);
+#ifdef USE_METAL
+            // The SIMD groups of a threadgroup take different tiles, so they don't all reach a threadgroup
+            // barrier here.  Each one reads only its own slice of localData, as in pmeMultipoleElectrostatics.cc.
+            SYNC_WARPS;
+#else
             SYNC_THREADS;
+#endif
 
             // Compute forces.
 
@@ -575,7 +585,11 @@ KERNEL void computeElectrostatics(
                     computeOneInteraction(&data, &localData[tbx+tj], false, 1, 1, 1, 1, &energy);
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef USE_METAL
+                SYNC_WARPS;
+#else
                 SYNC_THREADS;
+#endif
             }
             data.force *= -ENERGY_SCALE_FACTOR;
             data.torque *= ENERGY_SCALE_FACTOR;

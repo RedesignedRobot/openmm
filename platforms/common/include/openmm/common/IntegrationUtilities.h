@@ -104,7 +104,7 @@ public:
     /**
      * Compute the positions of virtual sites.
      */
-    void computeVirtualSites();
+    virtual void computeVirtualSites();
     /**
      * Distribute forces from virtual sites to the atoms they are based on.
      */
@@ -127,7 +127,7 @@ public:
      * 
      * @param timeShift   the amount by which to shift the velocities in time
      */
-    double computeKineticEnergy(double timeShift);
+    virtual double computeKineticEnergy(double timeShift);
     /**
      * Compute the current velocities, shifting them in time to account for a leapfrog integrator.
      * 
@@ -171,6 +171,7 @@ protected:
     ComputeArray vsiteSymmetryAtoms, vsiteSymmetryMatrix, vsiteSymmetryOffset, vsiteSymmetryUseBox;
     ComputeArray vsiteStage;
     ComputeArray kineticEnergy;
+    std::map<std::string, std::string> defines;
     int randomPos, lastSeed, numVsites, numVsiteStages, keWorkGroupSize;
     bool hasOverlappingVsites;
     mm_double2 lastStepSize;
