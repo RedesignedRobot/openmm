@@ -1,0 +1,198 @@
+/* -------------------------------------------------------------------------- *
+ *                                   OpenMM                                   *
+ * -------------------------------------------------------------------------- *
+ * This is part of the OpenMM molecular simulation toolkit.                   *
+ * See https://openmm.org/development.                                        *
+ *                                                                            *
+ * Portions copyright (c) 2026 Stanford University and the Authors.           *
+ * Authors: Amir Ayub                                                         *
+ * Contributors:                                                              *
+ *                                                                            *
+ * Permission is hereby granted, free of charge, to any person obtaining a    *
+ * copy of this software and associated documentation files (the "Software"), *
+ * to deal in the Software without restriction, including without limitation  *
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,   *
+ * and/or sell copies of the Software, and to permit persons to whom the      *
+ * Software is furnished to do so, subject to the following conditions:       *
+ *                                                                            *
+ * The above copyright notice and this permission notice shall be included in *
+ * all copies or substantial portions of the Software.                        *
+ *                                                                            *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR *
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,   *
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL    *
+ * THE AUTHORS, CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,    *
+ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR      *
+ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE  *
+ * USE OR OTHER DEALINGS IN THE SOFTWARE.                                     *
+ * -------------------------------------------------------------------------- */
+
+/**
+ * This tests that the Metal platform batches kernels into a few command buffers per step,
+ * instead of submitting each kernel separately, and that work left open when step() returns
+ * still reaches the GPU.
+ */
+
+#include "openmm/internal/AssertionUtilities.h"
+#include "openmm/internal/ContextImpl.h"
+#include "MetalContext.h"
+#include "MetalPlatform.h"
+#include "MetalQueue.h"
+#include "openmm/Context.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/LangevinMiddleIntegrator.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/System.h"
+#include <chrono>
+#include <iostream>
+#include <thread>
+
+using namespace OpenMM;
+using namespace std;
+
+/**
+ * Exposes the command queue of a Context.
+ */
+class QueuePlatform : public MetalPlatform {
+public:
+    MetalQueue& getQueue(Context& context) const {
+        PlatformData* data = reinterpret_cast<PlatformData*>(getContextImpl(context).getPlatformData());
+        return data->contexts[0]->getCurrentStream();
+    }
+};
+
+static QueuePlatform platform;
+static string precision = "single";
+
+void createSystem(System& system, vector<Vec3>& positions, NonbondedForce::NonbondedMethod method) {
+    // NonbondedForce only uses a neighbor list for more than 3000 particles.
+
+    const int gridSize = 15;
+    const double spacing = 0.4;
+    double boxSize = gridSize*spacing;
+    system.setDefaultPeriodicBoxVectors(Vec3(boxSize, 0, 0), Vec3(0, boxSize, 0), Vec3(0, 0, boxSize));
+    NonbondedForce* nonbonded = new NonbondedForce();
+    nonbonded->setNonbondedMethod(method);
+    nonbonded->setCutoffDistance(1.0);
+    HarmonicBondForce* bonds = new HarmonicBondForce();
+    for (int i = 0; i < gridSize; i++)
+        for (int j = 0; j < gridSize; j++)
+            for (int k = 0; k < gridSize; k++) {
+                int index = system.addParticle(10.0);
+                nonbonded->addParticle(index%2 == 0 ? 0.2 : -0.2, 0.3, 0.5);
+                positions.push_back(Vec3(i, j, k)*spacing);
+                if (k%2 == 1) {
+                    bonds->addBond(index-1, index, spacing, 1000.0);
+                    nonbonded->addException(index-1, index, 0.0, 1.0, 0.0);
+                }
+            }
+    system.addForce(nonbonded);
+    system.addForce(bonds);
+}
+
+double measureCommitsPerStep(NonbondedForce::NonbondedMethod method, bool usePmeQueue = false) {
+    System system;
+    vector<Vec3> positions;
+    createSystem(system, positions, method);
+    LangevinMiddleIntegrator integrator(300.0, 1.0, 0.002);
+    map<string, string> properties;
+    properties[MetalPlatform::MetalDisablePmeStream()] = (usePmeQueue ? "false" : "true");
+    Context context(system, integrator, platform, properties);
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context, MetalPlatform::MetalPrecision()));
+    context.setPositions(positions);
+    integrator.step(10);
+    MetalQueue& queue = platform.getQueue(context);
+    const int numSteps = 100;
+    long long start = queue.getCommitCount();
+    integrator.step(numSteps);
+    context.getState(State::Positions);
+    return (queue.getCommitCount()-start)/(double) numSteps;
+}
+
+void testCommitsPerStep() {
+    // With PME on the main queue, the host submits each step at most once.  The buffer holds the neighbor
+    // list and force kernels, and is submitted before the host waits for the interaction count, if it has
+    // to.  The rest of the step goes with the next step's neighbor list.  Steps without the wait can share
+    // a buffer, and the idle commit can split a step when the GPU runs out of work.  Without a neighbor list, the step
+    // is submitted after the forces, so the GPU doesn't wait for the host to ask for a result.
+
+    double noCutoff = measureCommitsPerStep(NonbondedForce::NoCutoff);
+    double pme = measureCommitsPerStep(NonbondedForce::PME);
+    // The separate PME queue needs two main-queue submissions per force-only step: SyncQueuePreComputation
+    // submits the positions PME reads, and SyncQueuePostComputation flushes the force pass before encoding
+    // the reciprocal-force wait at the head of the next buffer.  MetalEvent::queueWait() encodes a device
+    // event wait, with no host wait for PME, so reciprocal work can overlap the main force pass.  The PME
+    // queue's own submission is not counted here.  Force both paths regardless of the device's auto default.
+    double pmeQueue = measureCommitsPerStep(NonbondedForce::PME, true);
+    cout << "Commits per step: NoCutoff " << noCutoff << ", PME (main queue) " << pme
+         << ", PME (separate queue) " << pmeQueue << endl;
+    ASSERT(noCutoff >= 0.9 && noCutoff <= 1.1);
+    ASSERT(pme <= 1.1);
+    ASSERT(pmeQueue >= 1.9 && pmeQueue <= 2.1);
+}
+
+void testWorkLeftOpenAfterStep() {
+    // Work left open when step() returns must reach the GPU while the host does something else, and
+    // neither committing it from another thread nor sharing buffers between steps may change the
+    // trajectory.
+
+    System system;
+    vector<Vec3> positions;
+    createSystem(system, positions, NonbondedForce::PME);
+    map<string, string> properties;
+    properties[MetalPlatform::MetalDeterministicForces()] = "true";
+    LangevinMiddleIntegrator integrator1(300.0, 1.0, 0.002);
+    LangevinMiddleIntegrator integrator2(300.0, 1.0, 0.002);
+    integrator1.setRandomNumberSeed(5);
+    integrator2.setRandomNumberSeed(5);
+    Context context1(system, integrator1, platform, properties);
+    Context context2(system, integrator2, platform, properties);
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context1, MetalPlatform::MetalPrecision()));
+    ASSERT_EQUAL(precision, platform.getPropertyValue(context2, MetalPlatform::MetalPrecision()));
+    context1.setPositions(positions);
+    context2.setPositions(positions);
+
+    // After 25 steps the neighbor list may ask for an early reorder, based on an interaction count whose
+    // age depends on how far ahead the host runs, so the two contexts could reorder at different steps.
+
+    const int numSteps = 25;
+    MetalQueue& queue = platform.getQueue(context1);
+    long long start = queue.getCommitCount();
+    integrator1.step(numSteps);
+
+    // The host leaves the queue alone for 50 ms, and a slow GPU gets up to 10 s more.
+
+    this_thread::sleep_for(chrono::milliseconds(50));
+    auto deadline = chrono::steady_clock::now()+chrono::seconds(10);
+    while (!queue.isDrained() && chrono::steady_clock::now() < deadline)
+        this_thread::sleep_for(chrono::milliseconds(1));
+    ASSERT(queue.isDrained());
+    cout << "Commits per step without a sync: " << (queue.getCommitCount()-start)/(double) numSteps << endl;
+
+    // context2 synchronizes after every step, so no command buffer holds work from two steps.
+
+    for (int i = 0; i < numSteps; i++) {
+        integrator2.step(1);
+        context2.getState(State::Positions);
+    }
+    vector<Vec3> positions1 = context1.getState(State::Positions).getPositions();
+    vector<Vec3> positions2 = context2.getState(State::Positions).getPositions();
+    for (int i = 0; i < system.getNumParticles(); i++)
+        ASSERT(positions1[i] == positions2[i]);
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        if (argc > 1)
+            precision = argv[1];
+        platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
+        testCommitsPerStep();
+        testWorkLeftOpenAfterStep();
+    }
+    catch(const exception& e) {
+        cout << "exception: " << e.what() << endl;
+        return 1;
+    }
+    cout << "Done" << endl;
+    return 0;
+}
