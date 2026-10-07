@@ -1,0 +1,92 @@
+#---------------------------------------------------
+# OpenMM Metal RPMD Integrator
+#
+# Creates OpenMMRPMDMetal library,.
+#
+# Windows:
+#   OpenMMRPMDMetal.dll
+#   OpenMMRPMDMetal.lib
+# Unix:
+#   libOpenMMRPMDMetal.so
+#----------------------------------------------------
+
+# The source is organized into subdirectories, but we handle them all from
+# this CMakeLists file rather than letting CMake visit them as SUBDIRS.
+SET(OPENMM_SOURCE_SUBDIRS . ../common)
+
+
+# Collect up information about the version of the OpenMM library we're building
+# and make it available to the code so it can be built into the binaries.
+
+SET(OPENMMRPMDMETAL_LIBRARY_NAME OpenMMRPMDMetal)
+
+SET(SHARED_TARGET ${OPENMMRPMDMETAL_LIBRARY_NAME})
+
+# These are all the places to search for header files which are
+# to be part of the API.
+SET(API_INCLUDE_DIRS) # start empty
+FOREACH(subdir ${OPENMM_SOURCE_SUBDIRS})
+    # append
+    SET(API_INCLUDE_DIRS ${API_INCLUDE_DIRS}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/include/internal)
+ENDFOREACH(subdir)
+
+# We'll need both *relative* path names, starting with their API_INCLUDE_DIRS,
+# and absolute pathnames.
+SET(API_REL_INCLUDE_FILES)   # start these out empty
+SET(API_ABS_INCLUDE_FILES)
+
+FOREACH(dir ${API_INCLUDE_DIRS})
+    FILE(GLOB fullpaths ${dir}/*.h)	# returns full pathnames
+    SET(API_ABS_INCLUDE_FILES ${API_ABS_INCLUDE_FILES} ${fullpaths})
+
+    FOREACH(pathname ${fullpaths})
+        GET_FILENAME_COMPONENT(filename ${pathname} NAME)
+        SET(API_REL_INCLUDE_FILES ${API_REL_INCLUDE_FILES} ${dir}/${filename})
+    ENDFOREACH(pathname)
+ENDFOREACH(dir)
+
+# collect up source files
+SET(SOURCE_FILES) # empty
+SET(SOURCE_INCLUDE_FILES)
+
+FOREACH(subdir ${OPENMM_SOURCE_SUBDIRS})
+    FILE(GLOB_RECURSE src_files  ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/src/*.c)
+    FILE(GLOB incl_files ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/src/*.h)
+    SET(SOURCE_FILES         ${SOURCE_FILES}         ${src_files})   #append
+    SET(SOURCE_INCLUDE_FILES ${SOURCE_INCLUDE_FILES} ${incl_files})
+    INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/include)
+ENDFOREACH(subdir)
+
+SET(COMMON_KERNELS_CPP ${CMAKE_CURRENT_BINARY_DIR}/../common/src/CommonRpmdKernelSources.cpp)
+SET(SOURCE_FILES ${SOURCE_FILES} ${COMMON_KERNELS_CPP})
+
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/../common/src)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/platforms/metal/include)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/platforms/metal/src)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_BINARY_DIR}/platforms/metal/src)
+INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/libraries/metal-cpp)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/platforms/common/include)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_BINARY_DIR}/platforms/common/src)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_BINARY_DIR}/../common/src)
+
+# Create the library
+
+SET_SOURCE_FILES_PROPERTIES(${COMMON_KERNELS_CPP} PROPERTIES GENERATED TRUE)
+ADD_LIBRARY(${SHARED_TARGET} SHARED ${SOURCE_FILES} ${SOURCE_INCLUDE_FILES} ${API_ABS_INCLUDE_FILES})
+ADD_DEPENDENCIES(${SHARED_TARGET} RpmdCommonKernels)
+
+TARGET_LINK_LIBRARIES(${SHARED_TARGET} ${OPENMM_LIBRARY_NAME})
+TARGET_LINK_LIBRARIES(${SHARED_TARGET} ${OPENMM_LIBRARY_NAME}Metal)
+TARGET_LINK_LIBRARIES(${SHARED_TARGET} ${SHARED_RPMD_TARGET})
+SET_TARGET_PROPERTIES(${SHARED_TARGET} PROPERTIES CXX_STANDARD 17)
+SET_TARGET_PROPERTIES(${SHARED_TARGET} PROPERTIES COMPILE_FLAGS "${EXTRA_COMPILE_FLAGS} -DOPENMM_BUILDING_SHARED_LIBRARY")
+SET_TARGET_PROPERTIES(${SHARED_TARGET} PROPERTIES LINK_FLAGS "${EXTRA_LINK_FLAGS}")
+
+INSTALL(TARGETS ${SHARED_TARGET} DESTINATION lib/plugins)
+
+IF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
+    SUBDIRS(tests)
+ENDIF(BUILD_TESTING AND OPENMM_BUILD_METAL_TESTS)
