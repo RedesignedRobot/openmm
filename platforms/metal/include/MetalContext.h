@@ -221,7 +221,7 @@ public:
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
-        return false;
+        return useMixedPrecision;
     }
     /**
      * Get the number of cores in the GPU.

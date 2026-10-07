@@ -79,10 +79,8 @@ MetalContext::MetalContext(const System& system, const string& precision, MetalP
         useDoublePrecision = false;
         useMixedPrecision = true;
     }
-    else if (precision == "double") {
-        useDoublePrecision = true;
-        useMixedPrecision = false;
-    }
+    else if (precision == "double")
+        throw OpenMMException("The Metal platform does not support double precision, because Apple GPUs have no 64 bit floating point.  Use single or mixed.");
     else
         throw OpenMMException("Illegal value for Precision: "+precision);
     contextIndex = platformData.contexts.size();
@@ -172,9 +170,12 @@ MetalContext::MetalContext(const System& system, const string& precision, MetalP
     compilationDefines["make_real2"] = "make_float2";
     compilationDefines["make_real3"] = "make_float3";
     compilationDefines["make_real4"] = "make_float4";
-    compilationDefines["make_mixed2"] = "make_float2";
-    compilationDefines["make_mixed3"] = "make_float3";
-    compilationDefines["make_mixed4"] = "make_float4";
+    if (useMixedPrecision)
+        compilationDefines["USE_MIXED_PRECISION"] = "1";
+    string mixedType = (useMixedPrecision ? "double" : "float");
+    compilationDefines["make_mixed2"] = "make_"+mixedType+"2";
+    compilationDefines["make_mixed3"] = "make_"+mixedType+"3";
+    compilationDefines["make_mixed4"] = "make_"+mixedType+"4";
 
     // Set defines for applying periodic boundary conditions.
 
@@ -260,10 +261,16 @@ MetalContext::~MetalContext() {
 
 void MetalContext::initialize() {
     int numEnergyBuffers = max(numThreadBlocks*ThreadBlockSize, nonbonded->getNumEnergyBuffers());
-    energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
-    energySum.initialize<float>(*this, numGpuCores, "energySum");
-    int pinnedBufferSize = max(paddedNumAtoms*6, numEnergyBuffers);
-    pinnedBuffer.resize(pinnedBufferSize*sizeof(float));
+    if (useMixedPrecision) {
+        energyBuffer.initialize<double>(*this, numEnergyBuffers, "energyBuffer");
+        energySum.initialize<double>(*this, numGpuCores, "energySum");
+        pinnedBuffer.resize(max(paddedNumAtoms*4, numEnergyBuffers)*sizeof(double));
+    }
+    else {
+        energyBuffer.initialize<float>(*this, numEnergyBuffers, "energyBuffer");
+        energySum.initialize<float>(*this, numGpuCores, "energySum");
+        pinnedBuffer.resize(max(paddedNumAtoms*6, numEnergyBuffers)*sizeof(float));
+    }
     for (int i = 0; i < numAtoms; i++) {
         double mass = system.getParticleMass(i);
         if (useMixedPrecision)
@@ -398,14 +405,17 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     }
     if (!compilationDefines.empty())
         src << endl;
+    if (useMixedPrecision)
+        src << MetalKernelSources::df64 << endl;
+    string mixedType = (useMixedPrecision ? "double" : "float");
     src << "typedef float real;\n";
     src << "typedef float2 real2;\n";
     src << "typedef float3 real3;\n";
     src << "typedef float4 real4;\n";
-    src << "typedef float mixed;\n";
-    src << "typedef float2 mixed2;\n";
-    src << "typedef float3 mixed3;\n";
-    src << "typedef float4 mixed4;\n";
+    src << "typedef " << mixedType << " mixed;\n";
+    src << "typedef " << mixedType << "2 mixed2;\n";
+    src << "typedef " << mixedType << "3 mixed3;\n";
+    src << "typedef " << mixedType << "4 mixed4;\n";
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
     for (auto& pair : defines) {
