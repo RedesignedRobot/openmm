@@ -82,6 +82,8 @@ defined.
 +-------------------------------+------------------------------------------------------------+--------------------------------------------+
 |:code:`GLOBAL`                 |:code:`__global`                                            |                                            |
 +-------------------------------+------------------------------------------------------------+--------------------------------------------+
+|:code:`PRIVATE`                |                                                            |                                            |
++-------------------------------+------------------------------------------------------------+--------------------------------------------+
 |:code:`RESTRICT`               |:code:`restrict`                                            |:code:`__restrict__`                        |
 +-------------------------------+------------------------------------------------------------+--------------------------------------------+
 |:code:`LOCAL_ID`               |:code:`get_local_id(0)`                                     |:code:`threadIdx.x`                         |
@@ -107,6 +109,10 @@ defined.
 +-------------------------------+------------------------------------------------------------+--------------------------------------------+
 |:code:`ATOMIC_ADD(dest, value)`|:code:`atom_add(dest, value)`                               |:code:`atomicAdd(dest, value)`              |
 +-------------------------------+------------------------------------------------------------+--------------------------------------------+
+
+Declare every pointer to a thread's own variables (function arguments and local
+variables alike) with :code:`PRIVATE`\ , as in :code:`PRIVATE real3* force`\ .  It is
+empty in OpenCL and CUDA, but Metal requires every pointer to name its address space.
 
 A few other symbols may or may not be defined based on the device you are running on:
 :code:`SUPPORTS_DOUBLE_PRECISION` and :code:`SUPPORTS_64_BIT_ATOMICS`\ .  You

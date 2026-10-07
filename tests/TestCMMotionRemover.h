@@ -34,6 +34,7 @@
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/LangevinIntegrator.h"
+#include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/VerletIntegrator.h"
 #include "SimTKOpenMMRealType.h"
 #include "sfmt/SFMT.h"
@@ -102,6 +103,8 @@ int main(int argc, char* argv[]) {
         initializeTests(argc, argv);
         LangevinIntegrator langevin(0.0, 1e-5, 0.01);
         testMotionRemoval(langevin);
+        LangevinMiddleIntegrator langevinMiddle(0.0, 1e-5, 0.01);
+        testMotionRemoval(langevinMiddle);
         VerletIntegrator verlet(0.01);
         testMotionRemoval(verlet);
         runPlatformTests();

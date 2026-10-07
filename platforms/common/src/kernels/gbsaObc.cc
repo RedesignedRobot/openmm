@@ -79,7 +79,9 @@ KERNEL void computeBornSum(
                         real ratio = LOG(u_ij * RECIP(l_ij));
                         bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                          (params2.y*params2.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                         bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+#endif
                     }
                 }
                 SYNC_WARPS;
@@ -126,7 +128,9 @@ KERNEL void computeBornSum(
                         real ratio = LOG(u_ij * RECIP(l_ij));
                         bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                          (params2.y*params2.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                         bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+#endif
                     }
                     real rScaledRadiusI = r+params1.y;
                     if (params2.x < rScaledRadiusI) {
@@ -137,7 +141,9 @@ KERNEL void computeBornSum(
                         real ratio = LOG(u_ij * RECIP(l_ij));
                         real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                          (params1.y*params1.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                         term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
+#endif
                         localData[tbx+tj].bornSum += term;
                     }
                 }
@@ -269,7 +275,9 @@ KERNEL void computeBornSum(
                             real ratio = LOG(u_ij * RECIP(l_ij));
                             bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                              (params2.y*params2.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                             bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+#endif
                         }
                         real rScaledRadiusI = r+params1.y;
                         if (params2.x < rScaledRadiusI) {
@@ -280,7 +288,9 @@ KERNEL void computeBornSum(
                             real ratio = LOG(u_ij * RECIP(l_ij));
                             real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                              (params1.y*params1.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                             term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
+#endif
                             localData[tbx+tj].bornSum += term;
                         }
                     }
@@ -318,7 +328,9 @@ KERNEL void computeBornSum(
                             real ratio = LOG(u_ij * RECIP(l_ij));
                             bornSum += l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                              (params2.y*params2.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                             bornSum += (params1.x < params2.y-r ? 2.0f*(RECIP(params1.x)-l_ij) : 0);
+#endif
                         }
                         real rScaledRadiusI = r+params1.y;
                         if (params2.x < rScaledRadiusI) {
@@ -329,7 +341,9 @@ KERNEL void computeBornSum(
                             real ratio = LOG(u_ij * RECIP(l_ij));
                             real term = l_ij - u_ij + (0.50f*invR*ratio) + 0.25f*(r*(u_ij2-l_ij2) +
                                              (params1.y*params1.y*invR)*(l_ij2-u_ij2));
+#ifndef CUSTOM_OBC2
                             term += (params2.x < params1.y-r ? 2.0f*(RECIP(params2.x)-l_ij) : 0);
+#endif
                             localData[tbx+tj].bornSum += term;
                         }
                     }

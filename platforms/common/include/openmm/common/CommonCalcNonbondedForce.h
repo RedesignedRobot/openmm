@@ -57,8 +57,9 @@ public:
      * @param deviceIsCpu  whether the device this calculation is running on is a CPU
      * @param useFixedPointChargeSpreading  whether PME charge spreading should be done in fixed point or floating point
      * @param useCpuPme    whether to perform the PME reciprocal space calculation on the CPU
+     * @param sortPmeAtoms whether to process atoms in PME in order of grid index, or in the order they are stored
      */
-    void commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue, bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme);
+    void commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue, bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme, bool sortPmeAtoms=true);
     /**
      * Execute the kernel to calculate the forces and/or energy.
      *
@@ -116,6 +117,11 @@ private:
     class PmePostComputation;
     class SyncQueuePreComputation;
     class SyncQueuePostComputation;
+    /**
+     * Run the reciprocal space kernels that follow charge spreading.  Metal energy-only Coulomb PME stops after
+     * the forward FFT and energy evaluation; force evaluations also convolve, inverse transform, and interpolate.
+     */
+    void computeReciprocalFromGrid(bool includeForces, bool includeEnergy, const mm_double4* recipBoxVectors, const mm_float4* recipBoxVectorsFloat);
     ComputeContext& cc;
     ForceInfo* info;
     bool hasInitializedKernel;
@@ -140,7 +146,7 @@ private:
     ComputeArray pmeDispersionBsplineModuliY;
     ComputeArray pmeDispersionBsplineModuliZ;
     ComputeArray pmeAtomGridIndex;
-    ComputeArray pmeEnergyBuffer;
+    ComputeArray pmeForces;
     ComputeArray chargeBuffer;
     ComputeSort sort;
     ComputeQueue pmeQueue;
@@ -156,7 +162,7 @@ private:
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
     ComputeKernel pmeEvalEnergyKernel, pmeDispersionEvalEnergyKernel;
-    ComputeKernel pmeInterpolateForceKernel, pmeDispersionInterpolateForceKernel;
+    ComputeKernel pmeInterpolateForceKernel, pmeInterpolateForceQueueKernel, pmeDispersionInterpolateForceKernel;
     std::map<std::string, std::string> pmeDefines;
     std::vector<std::pair<int, int> > exceptionAtoms;
     std::vector<std::string> paramNames;
@@ -168,7 +174,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme;
+    bool usePmeQueue, reciprocalOnQueue, deferPmeInterpolation, deferPmeSpread, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortPmeAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;

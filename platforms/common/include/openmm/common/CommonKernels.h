@@ -705,8 +705,8 @@ private:
  */
 class CommonCalcGBSAOBCForceKernel : public CalcGBSAOBCForceKernel {
 public:
-    CommonCalcGBSAOBCForceKernel(std::string name, const Platform& platform, ComputeContext& cc) : CalcGBSAOBCForceKernel(name, platform), cc(cc),
-            hasCreatedKernels(false) {
+    CommonCalcGBSAOBCForceKernel(std::string name, const Platform& platform, ComputeContext& cc, bool customOBC2 = false) : CalcGBSAOBCForceKernel(name, platform), cc(cc),
+            hasCreatedKernels(false), customOBC2(customOBC2) {
     }
     /**
      * Initialize the kernel.
@@ -731,10 +731,12 @@ public:
      * @param force      the GBSAOBCForce to copy the parameters from
      */
     void copyParametersToContext(ContextImpl& context, const GBSAOBCForce& force);
-private:
+protected:
     class ForceInfo;
     double prefactor, surfaceAreaFactor, cutoff;
     bool hasCreatedKernels;
+    // The app's CustomGB OBC2 expression omits the engulfment term and uses its own Coulomb constant.
+    const bool customOBC2;
     int maxTiles;
     ComputeContext& cc;
     ForceInfo* info;
@@ -968,11 +970,19 @@ public:
      * @param integrator the LangevinMiddleIntegrator this kernel is being used for
      */
     double computeKineticEnergy(ContextImpl& context, const LangevinMiddleIntegrator& integrator);
-private:
+protected:
+    /**
+     * Update the positions and velocities, and enforce the constraints.
+     *
+     * @param tol    the constraint tolerance
+     */
+    virtual void integrate(double tol);
     ComputeContext& cc;
+    ComputeArray params;
+private:
     double prevTemp, prevFriction, prevStepSize;
     bool hasInitializedKernels;
-    ComputeArray params, oldDelta;
+    ComputeArray oldDelta;
     ComputeKernel kernel1, kernel2, kernel3;
 };
 

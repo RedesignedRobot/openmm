@@ -152,7 +152,6 @@ KERNEL void buildNeighborList(GLOBAL int* RESTRICT rebuildNeighborList, GLOBAL i
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1); // index within the warp
     const unsigned int tbx = LOCAL_ID - tgx;           // block warpIndex
     LOCAL real4 localPos[LOCAL_MEMORY_SIZE];
-    LOCAL volatile bool anyInteraction[WARPS_IN_BLOCK];
     LOCAL volatile int tileIndex[WARPS_IN_BLOCK];
     LOCAL int reductionBuffer[LOCAL_MEMORY_SIZE];
 
@@ -167,14 +166,12 @@ KERNEL void buildNeighborList(GLOBAL int* RESTRICT rebuildNeighborList, GLOBAL i
         const int exclusions = atomData.w;
         real4 posq1 = posq[atom1];
         localPos[LOCAL_ID] = posq[atom2];
-        if (tgx == 0)
-            anyInteraction[local_warp] = false;
+        bool anyInteraction = false;
         int tj = tgx;
-        int rangeStop = rangeStart + reduceMax(rangeEnd-rangeStart, reductionBuffer);
         SYNC_WARPS;
-        for (int j = rangeStart; j < rangeStop && !anyInteraction[local_warp]; j++) {
-            SYNC_WARPS;
-            if (j < rangeEnd && tj < rangeEnd) {
+        // Positions are read-only during the scan, so lanes may finish independently.
+        for (int j = rangeStart; j < rangeEnd && !anyInteraction; j++) {
+            if (tj < rangeEnd) {
                 bool isExcluded = (((exclusions>>tj)&1) == 0);
                 int localIndex = tbx+tj;
                 real3 delta = make_real3(localPos[localIndex].x-posq1.x, localPos[localIndex].y-posq1.y, localPos[localIndex].z-posq1.z);
@@ -182,18 +179,24 @@ KERNEL void buildNeighborList(GLOBAL int* RESTRICT rebuildNeighborList, GLOBAL i
                 APPLY_PERIODIC_TO_DELTA(delta)
 #endif
                 real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
-                if (!isExcluded && r2 < PADDED_CUTOFF_SQUARED)
-                    anyInteraction[local_warp] = true;
+                anyInteraction = !isExcluded && r2 < PADDED_CUTOFF_SQUARED;
             }
             tj = (tj == rangeEnd-1 ? rangeStart : tj+1);
-            SYNC_WARPS;
         }
-        if (anyInteraction[local_warp]) {
+#ifdef BALLOT
+        unsigned int interactions = BALLOT(anyInteraction);
+        anyInteraction = (interactions != 0);
+#else
+        anyInteraction = (reduceMax((int) anyInteraction, reductionBuffer) != 0);
+#endif
+        if (anyInteraction) {
             SYNC_WARPS;
             if (tgx == 0)
                 tileIndex[local_warp] = ATOMIC_ADD(numGroupTiles, 1);
             SYNC_WARPS;
             filteredGroupData[TILE_SIZE*tileIndex[local_warp]+tgx] = atomData;
         }
+        // Finish reading positions, reduction slots and the tile index before reuse.
+        SYNC_WARPS;
     }
 }

@@ -123,6 +123,8 @@ void CommonIntegrateRPMDStepKernel::initialize(const System& system, const RPMDI
         }
     }
     groupsNotContracted &= integrator.getIntegrationForceGroups();
+    for (auto& g : groupsByCopies)
+        g.second &= integrator.getIntegrationForceGroups();
     if (maxContractedCopies > 0) {
         contractedForces.initialize<long long>(cc, maxContractedCopies*paddedParticles*3, "rpmdContractedForces");
         contractedPositions.initialize(cc, maxContractedCopies*paddedParticles, elementSize, "rpmdContractedPositions");
@@ -189,12 +191,20 @@ void CommonIntegrateRPMDStepKernel::initializeKernels(ContextImpl& context) {
     translateKernel->addArg(cc.getPosq());
     translateKernel->addArg(cc.getAtomIndexArray());
     translateKernel->addArg();
+    if (cc.getUseMixedPrecision())
+        translateKernel->addArg(cc.getPosqCorrection());
+    else
+        translateKernel->addArg(nullptr);
     copyToContextKernel->addArg(velocities);
     copyToContextKernel->addArg(cc.getVelm());
     copyToContextKernel->addArg();
     copyToContextKernel->addArg(cc.getPosq());
     copyToContextKernel->addArg(cc.getAtomIndexArray());
     copyToContextKernel->addArg();
+    if (cc.getUseMixedPrecision())
+        copyToContextKernel->addArg(cc.getPosqCorrection());
+    else
+        copyToContextKernel->addArg(nullptr);
     copyFromContextKernel->addArg(cc.getLongForceBuffer());
     copyFromContextKernel->addArg();
     copyFromContextKernel->addArg(cc.getVelm());
@@ -203,6 +213,10 @@ void CommonIntegrateRPMDStepKernel::initializeKernels(ContextImpl& context) {
     copyFromContextKernel->addArg();
     copyFromContextKernel->addArg(cc.getAtomIndexArray());
     copyFromContextKernel->addArg();
+    if (cc.getUseMixedPrecision())
+        copyFromContextKernel->addArg(cc.getPosqCorrection());
+    else
+        copyFromContextKernel->addArg(nullptr);
     for (auto& g : groupsByCopies) {
         int copies = g.first;
         positionContractionKernels[copies]->addArg(positions);
@@ -314,6 +328,8 @@ void CommonIntegrateRPMDStepKernel::computeForces(ContextImpl& context) {
         for (auto& g : groupsByCopies) {
             int copies = g.first;
             int groupFlags = g.second;
+            if (groupFlags == 0)
+                continue;
 
             // Find the contracted positions.
 

@@ -47,14 +47,14 @@ inline DEVICE void storePos(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT 
 #endif
 }
 
-KERNEL void computePerDof(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT posDelta,
-        GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed2* RESTRICT dt, GLOBAL const mixed* RESTRICT globals,
+KERNEL void computePerDof(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT posDelta,
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed2* RESTRICT dt, GLOBAL const mixed* RESTRICT globals,
         GLOBAL mixed* RESTRICT sum, GLOBAL const float4* RESTRICT gaussianValues, unsigned int gaussianBaseIndex, GLOBAL const float4* RESTRICT uniformValues,
         const mixed energy, GLOBAL mixed* RESTRICT energyParamDerivs
         PARAMETER_ARGUMENTS) {
     TempType3 stepSize = make_TempType3(dt[0].y);
     int index = GLOBAL_ID;
-    const TempType forceScale = ((TempType) 1)/0xFFFFFFFF;
+    const TempType forceScale = (TempType) 0x1p-32f;
     while (index < NUM_ATOMS) {
 #ifdef LOAD_POS_AS_DELTA
         TempType4 position = loadPos(posq, posqCorrection, index) + convertToTempType4(posDelta[index]);

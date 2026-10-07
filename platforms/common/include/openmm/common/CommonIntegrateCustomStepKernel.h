@@ -108,6 +108,21 @@ private:
     class ReorderListener;
     class GlobalTarget;
     class DerivFunction;
+    struct DeferredInput {
+        int variable;
+        bool deferred;
+        double value;
+    };
+    /**
+     * A global computation whose result waits on an energy the device still holds, or on another deferred
+     * result.  inputs holds each variable the expression reads: its value at the time, or deferred=true when
+     * an earlier deferred computation provides it.
+     */
+    struct DeferredGlobal {
+        int step, energySlot;
+        double energy, uniform, gaussian;
+        std::vector<DeferredInput> inputs;
+    };
     std::string createPerDofComputation(const std::string& variable, const Lepton::ParsedExpression& expr, CustomIntegrator& integrator,
         const std::string& forceName, const std::string& energyName, std::vector<const TabulatedFunction*>& functions,
         std::vector<std::pair<std::string, std::string> >& functionNames);
@@ -117,15 +132,29 @@ private:
     void recordGlobalValue(double value, GlobalTarget target, CustomIntegrator& integrator);
     void recordChangedParameters(ContextImpl& context);
     bool evaluateCondition(int step);
+    bool readsDeferredValue(int step) const;
+    void deferGlobal(int step, double uniform, double gaussian);
+    void resolveDeferredGlobals();
+    /**
+     * A round trip to the GPU costs about 170 us on the M3 Ultra, so a CustomIntegrator that reads the energy
+     * twice per step (FAH's nonequilibrium switching) keeps up to this many energies on the device before it
+     * downloads them.
+     */
+    static const int MaxDeferredEnergies = 128;
     ComputeContext& cc;
     double energy;
+    int energySlot, numDeferredEnergies;
+    std::vector<bool> canDeferEnergy, deferredVariable;
+    std::vector<std::vector<int> > stepGlobals;
+    std::vector<DeferredGlobal> deferredGlobals;
+    std::map<int, int> savedEnergySlot;
     float energyFloat;
     int numGlobalVariables, sumWorkGroupSize;
     bool hasInitializedKernels, deviceGlobalsAreCurrent, modifiesParameters, hasAnyConstraints, needsEnergyParamDerivs;
     std::vector<bool> deviceValuesAreCurrent;
     mutable std::vector<bool> localValuesAreCurrent;
     ComputeArray globalValues, sumBuffer, summedValue;
-    ComputeArray uniformRandoms, randomSeed, perDofEnergyParamDerivs;
+    ComputeArray uniformRandoms, randomSeed, perDofEnergyParamDerivs, deferredEnergies;
     std::vector<ComputeArray> tabulatedFunctions, perDofValues;
     std::map<int, double> savedEnergy;
     std::map<int, ComputeArray> savedForces;
