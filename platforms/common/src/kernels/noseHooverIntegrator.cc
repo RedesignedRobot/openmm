@@ -1,7 +1,7 @@
 /**
  * Perform the first part of integration: velocity step.
  */
-KERNEL void integrateNoseHooverMiddlePart1(int numAtoms, int numPairs, int paddedNumAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
+KERNEL void integrateNoseHooverMiddlePart1(int numAtoms, int numPairs, int paddedNumAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force,
         GLOBAL const mixed2* RESTRICT dt, GLOBAL const int* RESTRICT atomList, GLOBAL const int2* RESTRICT pairList) {
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     int index = GLOBAL_ID;
@@ -22,12 +22,12 @@ KERNEL void integrateNoseHooverMiddlePart1(int numAtoms, int numPairs, int padde
         int atom2 = pairList[index].y;
         mixed4 v1 = velm[atom1];
         mixed4 v2 = velm[atom2];
-        mixed m1 = v1.w == 0.0f ? 0.0f : 1.0f / v1.w;
-        mixed m2 = v2.w == 0.0f ? 0.0f : 1.0f / v2.w;
+        mixed m1 = v1.w == 0.0f ? (mixed) 0 : 1.0f / v1.w;
+        mixed m2 = v2.w == 0.0f ? (mixed) 0 : 1.0f / v2.w;
         mixed mass1fract = m1 / (m1 + m2);
         mixed mass2fract = m2 / (m1 + m2);
-        mixed invRedMass = (m1 * m2 != 0.0f) ? (m1 + m2)/(m1 * m2) : 0.0f;
-        mixed invTotMass = (m1 + m2 != 0.0f) ? 1.0f /(m1 + m2) : 0.0f;
+        mixed invRedMass = (m1 * m2 != 0.0f) ? (m1 + m2)/(m1 * m2) : (mixed) 0;
+        mixed invTotMass = (m1 + m2 != 0.0f) ? 1.0f /(m1 + m2) : (mixed) 0;
         mixed3 comVel;
         comVel.x= v1.x*mass1fract + v2.x*mass2fract;
         comVel.y= v1.y*mass1fract + v2.y*mass2fract;
@@ -76,7 +76,7 @@ KERNEL void integrateNoseHooverMiddlePart1(int numAtoms, int numPairs, int padde
 /**
  * Perform the second part of integration: position half step
  */
-KERNEL void integrateNoseHooverMiddlePart2(int numAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL mixed4* RESTRICT posDelta,
+KERNEL void integrateNoseHooverMiddlePart2(int numAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed4s* RESTRICT posDelta,
         GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt) {
     mixed halfdt = 0.5f*dt[0].y;
     int index = GLOBAL_ID;
@@ -94,7 +94,7 @@ KERNEL void integrateNoseHooverMiddlePart2(int numAtoms, GLOBAL mixed4* RESTRICT
 /**
  * Perform the third part of integration: another position half step
  */
-KERNEL void integrateNoseHooverMiddlePart3(int numAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL mixed4* RESTRICT posDelta,
+KERNEL void integrateNoseHooverMiddlePart3(int numAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed4s* RESTRICT posDelta,
         GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt) {
     mixed halfdt = 0.5f*dt[0].y;
     int index = GLOBAL_ID;
@@ -113,8 +113,8 @@ KERNEL void integrateNoseHooverMiddlePart3(int numAtoms, GLOBAL mixed4* RESTRICT
  * Perform the fourth part of integration: apply constraint forces to velocities, then record
  * the constrained positions.
  */
-KERNEL void integrateNoseHooverMiddlePart4(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4* RESTRICT velm,
-         GLOBAL mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
+KERNEL void integrateNoseHooverMiddlePart4(int numAtoms, GLOBAL real4* RESTRICT posq, GLOBAL mixed4s* RESTRICT velm,
+         GLOBAL mixed4s* RESTRICT posDelta, GLOBAL mixed4* RESTRICT oldDelta, GLOBAL const mixed2* RESTRICT dt
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif
@@ -150,7 +150,7 @@ KERNEL void integrateNoseHooverMiddlePart4(int numAtoms, GLOBAL real4* RESTRICT 
 
 KERNEL void integrateNoseHooverHardWall(int numPairs, GLOBAL const float* RESTRICT maxPairDistance, 
                                         GLOBAL mixed2* RESTRICT dt, GLOBAL real4* RESTRICT posq,
-                                        GLOBAL mixed4* RESTRICT velm, GLOBAL const int2* RESTRICT pairList,
+                                        GLOBAL mixed4s* RESTRICT velm, GLOBAL const int2* RESTRICT pairList,
                                         GLOBAL const float* RESTRICT pairTemperature
 #ifdef USE_MIXED_PRECISION
                                         ,GLOBAL real4* RESTRICT posqCorrection
@@ -186,9 +186,9 @@ KERNEL void integrateNoseHooverHardWall(int numPairs, GLOBAL const float* RESTRI
                 mixed3 bondDir = make_mixed3(delta.x * rInv, delta.y * rInv, delta.z * rInv);
                 mixed3 vel1 = make_mixed3(velm[atom1].x, velm[atom1].y, velm[atom1].z);
                 mixed3 vel2 = make_mixed3(velm[atom2].x, velm[atom2].y, velm[atom2].z);
-                mixed m1 = velm[atom1].w != 0.0 ? 1.0/velm[atom1].w : 0.0;
-                mixed m2 = velm[atom2].w != 0.0 ? 1.0/velm[atom2].w : 0.0;
-                mixed invTotMass = (m1 + m2 != 0.0) ? 1.0 /(m1 + m2) : 0.0;
+                mixed m1 = velm[atom1].w != 0.0 ? 1.0/velm[atom1].w : (mixed) 0;
+                mixed m2 = velm[atom2].w != 0.0 ? 1.0/velm[atom2].w : (mixed) 0;
+                mixed invTotMass = (m1 + m2 != 0.0) ? 1.0 /(m1 + m2) : (mixed) 0;
                 mixed deltaR = r-maxDelta;
                 mixed deltaT = dtPos;
                 mixed dt = dtPos;

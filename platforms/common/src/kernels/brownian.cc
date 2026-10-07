@@ -3,7 +3,7 @@
  */
 
 KERNEL void integrateBrownianPart1(int numAtoms, int paddedNumAtoms, mixed tauDeltaT, mixed noiseAmplitude, GLOBAL const mm_long* RESTRICT force,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL const mixed4* RESTRICT velm, GLOBAL const float4* RESTRICT random, unsigned int randomIndex) {
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL const mixed4s* RESTRICT velm, GLOBAL const float4* RESTRICT random, unsigned int randomIndex) {
     randomIndex += GLOBAL_ID;
     const mixed fscale = tauDeltaT/(mixed) 0x100000000;
     for (int index = GLOBAL_ID; index < numAtoms; index += GLOBAL_SIZE) {
@@ -21,7 +21,7 @@ KERNEL void integrateBrownianPart1(int numAtoms, int paddedNumAtoms, mixed tauDe
  * Perform the second step of Brownian integration.
  */
 
-KERNEL void integrateBrownianPart2(int numAtoms, mixed oneOverDeltaT, GLOBAL real4* posq, GLOBAL mixed4* velm, GLOBAL const mixed4* RESTRICT posDelta
+KERNEL void integrateBrownianPart2(int numAtoms, mixed oneOverDeltaT, GLOBAL real4* posq, GLOBAL mixed4s* velm, GLOBAL const mixed4s* RESTRICT posDelta
 #ifdef USE_MIXED_PRECISION
         , GLOBAL real4* RESTRICT posqCorrection
 #endif

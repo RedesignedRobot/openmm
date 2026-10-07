@@ -282,6 +282,9 @@ KERNEL void gridSpreadFixedMultipoles(GLOBAL const real4* RESTRICT posq, GLOBAL 
 #else
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add));
+    #elif defined(USE_METAL)
+                    // Metal can't take the address of a vector component.
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index, add);
     #else
                     ATOMIC_ADD(&pmeGrid[index].x, add);
     #endif
@@ -406,6 +409,9 @@ KERNEL void gridSpreadInducedDipoles(GLOBAL const real4* RESTRICT posq, GLOBAL c
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add1));
                     ATOMIC_ADD(&pmeGrid[2*index+1], (mm_ulong) realToFixedPoint(add2));
+    #elif defined(USE_METAL)
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index, add1);
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index+1, add2);
     #else
                     ATOMIC_ADD(&pmeGrid[index].x, add1);
                     ATOMIC_ADD(&pmeGrid[index].y, add2);

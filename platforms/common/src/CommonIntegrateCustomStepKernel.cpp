@@ -114,7 +114,7 @@ private:
 };
 
 CommonIntegrateCustomStepKernel::CommonIntegrateCustomStepKernel(std::string name, const Platform& platform, ComputeContext& cc) : IntegrateCustomStepKernel(name, platform), cc(cc),
-        hasInitializedKernels(false), deviceGlobalsAreCurrent(false), needsEnergyParamDerivs(false) {
+        energySlot(-1), numDeferredEnergies(0), hasInitializedKernels(false), deviceGlobalsAreCurrent(false), needsEnergyParamDerivs(false) {
 }
 
 void CommonIntegrateCustomStepKernel::initialize(const System& system, const CustomIntegrator& integrator) {
@@ -264,6 +264,21 @@ void CommonIntegrateCustomStepKernel::prepareForComputation(ContextImpl& context
         for (auto& name : parameterNames)
             parameterVariableIndex.push_back(expressionSet.getVariableIndex(name));
 
+        // Record which global variables, context parameters and dt each step reads.
+
+        stepGlobals.resize(numSteps);
+        for (int step = 0; step < numSteps; step++)
+            for (auto& expr : expression[step]) {
+                for (int i = 0; i < integrator.getNumGlobalVariables(); i++)
+                    if (usesVariable(expr, integrator.getGlobalVariableName(i)))
+                        stepGlobals[step].push_back(globalVariableIndex[i]);
+                for (int i = 0; i < (int) parameterNames.size(); i++)
+                    if (usesVariable(expr, parameterNames[i]))
+                        stepGlobals[step].push_back(parameterVariableIndex[i]);
+                if (usesVariable(expr, "dt"))
+                    stepGlobals[step].push_back(dtVariableIndex);
+            }
+
         // Record the variable names and flags for the force and energy in each step.
 
         forceGroupFlags.resize(numSteps, integrator.getIntegrationForceGroups());
@@ -382,6 +397,7 @@ void CommonIntegrateCustomStepKernel::prepareForComputation(ContextImpl& context
                 needsForces[step-1] = (needsForces[step] || needsForces[step-1]);
                 needsEnergy[step-1] = (needsEnergy[step] || needsEnergy[step-1]);
                 needsGlobals[step-1] = (needsGlobals[step] || needsGlobals[step-1]);
+                stepGlobals[step-1].insert(stepGlobals[step-1].end(), stepGlobals[step].begin(), stepGlobals[step].end());
                 computeBothForceAndEnergy[step-1] = (computeBothForceAndEnergy[step] || computeBothForceAndEnergy[step-1]);
             }
 
@@ -572,6 +588,26 @@ void CommonIntegrateCustomStepKernel::prepareForComputation(ContextImpl& context
         sumKineticEnergyKernel->addArg(summedValue);
         sumKineticEnergyKernel->addArg(numAtoms);
 
+        // A global computation into a variable can wait for its energy while the device keeps working.  The host
+        // replays it once something needs the value.  Energy parameter derivatives come with their own download,
+        // so an integrator that uses them gains nothing.
+
+        int numPartialSums = cc.getNumEnergyPartialSums();
+        bool defersEnergy = false;
+        canDeferEnergy.resize(numSteps, false);
+        for (int step = 0; step < numSteps; step++) {
+            canDeferEnergy[step] = (stepType[step] == CustomIntegrator::ComputeGlobal && stepTarget[step].type == VARIABLE &&
+                    numPartialSums > 0 && !needsEnergyParamDerivs);
+            defersEnergy |= (canDeferEnergy[step] && needsEnergy[step]);
+        }
+        deferredVariable.resize(expressionSet.getNumVariables(), false);
+        if (defersEnergy) {
+            if (cc.getUseDoublePrecision() || cc.getUseMixedPrecision())
+                deferredEnergies.initialize<double>(cc, MaxDeferredEnergies*numPartialSums, "deferredEnergies");
+            else
+                deferredEnergies.initialize<float>(cc, MaxDeferredEnergies*numPartialSums, "deferredEnergies");
+        }
+
         // Delete the custom functions.
 
         for (auto& function : functions)
@@ -650,8 +686,10 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
     IntegrationUtilities& integration = cc.getIntegrationUtilities();
     int numAtoms = cc.getNumAtoms();
     int numSteps = integrator.getNumComputations();
-    if (!forcesAreValid)
+    if (!forcesAreValid) {
         savedEnergy.clear();
+        savedEnergySlot.clear();
+    }
 
     // Loop over computation steps in the integrator and execute them.
 
@@ -687,11 +725,24 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
             }
             else {
                 recordChangedParameters(context);
-                {
+                int slot = -1;
+                if (computeEnergy && canDeferEnergy[step] && deferredEnergies.isInitialized()) {
+                    if (numDeferredEnergies == MaxDeferredEnergies)
+                        resolveDeferredGlobals();
+                    slot = numDeferredEnergies++;
+                    cc.setDeferredEnergy(&deferredEnergies, slot);
+                }
+                try {
                     ContextDeselector deselector(cc);
                     energy = context.calcForcesAndEnergy(computeForce, computeEnergy, forceGroups);
                 }
+                catch (...) {
+                    cc.setDeferredEnergy(NULL, 0);
+                    throw;
+                }
+                cc.setDeferredEnergy(NULL, 0);
                 savedEnergy[forceGroups] = energy;
+                savedEnergySlot[forceGroups] = slot;
                 if (needsEnergyParamDerivs) {
                     context.getEnergyParameterDerivatives(energyParamDerivs);
                     if (perDofEnergyParamDerivNames.size() > 0) {
@@ -703,8 +754,17 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
             }
             forcesAreValid = true;
         }
-        if (needsEnergy[step])
+        if (needsEnergy[step]) {
             energy = savedEnergy[forceGroups];
+            energySlot = savedEnergySlot[forceGroups];
+        }
+        bool deferStep = false;
+        if (readsDeferredValue(step)) {
+            if (canDeferEnergy[step] && deferredGlobals.size() < 4*MaxDeferredEnergies)
+                deferStep = true;
+            else
+                resolveDeferredGlobals();
+        }
         if (needsGlobals[step] && !deviceGlobalsAreCurrent) {
             // Upload the global values to the device.
 
@@ -725,10 +785,16 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
             kernels[step][0]->execute(numAtoms, 128);
         }
         else if (stepType[step] == CustomIntegrator::ComputeGlobal) {
-            expressionSet.setVariable(uniformVariableIndex, SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber());
-            expressionSet.setVariable(gaussianVariableIndex, SimTKOpenMMUtilities::getNormallyDistributedRandomNumber());
-            expressionSet.setVariable(stepEnergyVariableIndex[step], energy);
-            recordGlobalValue(globalExpressions[step][0].evaluate(), stepTarget[step], integrator);
+            double uniform = SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber();
+            double gaussian = SimTKOpenMMUtilities::getNormallyDistributedRandomNumber();
+            if (deferStep)
+                deferGlobal(step, uniform, gaussian);
+            else {
+                expressionSet.setVariable(uniformVariableIndex, uniform);
+                expressionSet.setVariable(gaussianVariableIndex, gaussian);
+                expressionSet.setVariable(stepEnergyVariableIndex[step], energy);
+                recordGlobalValue(globalExpressions[step][0].evaluate(), stepTarget[step], integrator);
+            }
         }
         else if (stepType[step] == CustomIntegrator::ComputeSum) {
             kernels[step][0]->setArg(9, integration.prepareRandomNumbers(requiredGaussian[step]));
@@ -783,6 +849,7 @@ void CommonIntegrateCustomStepKernel::execute(ContextImpl& context, CustomIntegr
         if (stepInvalidatesForces) {
             forcesAreValid = false;
             savedEnergy.clear();
+            savedEnergySlot.clear();
         }
         step = nextStep;
     }
@@ -860,6 +927,7 @@ void CommonIntegrateCustomStepKernel::recordGlobalValue(double value, GlobalTarg
         case PARAMETER:
             expressionSet.setVariable(target.variableIndex, value);
             localGlobalValues[target.variableIndex] = value;
+            deferredVariable[target.variableIndex] = false;
             deviceGlobalsAreCurrent = false;
             break;
     }
@@ -875,6 +943,83 @@ void CommonIntegrateCustomStepKernel::recordChangedParameters(ContextImpl& conte
     }
 }
 
+bool CommonIntegrateCustomStepKernel::readsDeferredValue(int step) const {
+    if (needsEnergy[step] && energySlot >= 0)
+        return true;
+    for (int variable : stepGlobals[step])
+        if (deferredVariable[variable])
+            return true;
+    return false;
+}
+
+void CommonIntegrateCustomStepKernel::deferGlobal(int step, double uniform, double gaussian) {
+    DeferredGlobal global;
+    global.step = step;
+    global.energySlot = (needsEnergy[step] ? energySlot : -1);
+    global.energy = energy;
+    global.uniform = uniform;
+    global.gaussian = gaussian;
+    for (int variable : stepGlobals[step])
+        global.inputs.push_back({variable, (bool) deferredVariable[variable], localGlobalValues[variable]});
+    deferredGlobals.push_back(global);
+    deferredVariable[stepTarget[step].variableIndex] = true;
+}
+
+void CommonIntegrateCustomStepKernel::resolveDeferredGlobals() {
+    if (deferredGlobals.empty() && numDeferredEnergies == 0)
+        return;
+    ContextSelector selector(cc);
+    vector<double> deviceEnergy(numDeferredEnergies, 0.0);
+    if (numDeferredEnergies > 0) {
+        int n = cc.getNumEnergyPartialSums();
+        if (deferredEnergies.getElementSize() == sizeof(double)) {
+            vector<double> sums;
+            deferredEnergies.download(sums);
+            for (int slot = 0; slot < numDeferredEnergies; slot++)
+                for (int i = 0; i < n; i++)
+                    deviceEnergy[slot] += sums[slot*n+i];
+        }
+        else {
+            vector<float> sums;
+            deferredEnergies.download(sums);
+            for (int slot = 0; slot < numDeferredEnergies; slot++)
+                for (int i = 0; i < n; i++)
+                    deviceEnergy[slot] += sums[slot*n+i];
+        }
+    }
+
+    // Replay the deferred computations in order.  value holds each variable's latest deferred result.
+
+    vector<double> value = localGlobalValues;
+    for (DeferredGlobal& global : deferredGlobals) {
+        for (DeferredInput& input : global.inputs)
+            expressionSet.setVariable(input.variable, input.deferred ? value[input.variable] : input.value);
+        expressionSet.setVariable(uniformVariableIndex, global.uniform);
+        expressionSet.setVariable(gaussianVariableIndex, global.gaussian);
+        double stepEnergy = global.energy+(global.energySlot >= 0 ? deviceEnergy[global.energySlot] : 0.0);
+        expressionSet.setVariable(stepEnergyVariableIndex[global.step], stepEnergy);
+        value[stepTarget[global.step].variableIndex] = globalExpressions[global.step][0].evaluate();
+    }
+    for (int i = 0; i < (int) localGlobalValues.size(); i++) {
+        if (deferredVariable[i]) {
+            localGlobalValues[i] = value[i];
+            deferredVariable[i] = false;
+            deviceGlobalsAreCurrent = false;
+        }
+        expressionSet.setVariable(i, localGlobalValues[i]);
+    }
+    if (energySlot >= 0)
+        energy += deviceEnergy[energySlot];
+    energySlot = -1;
+    for (auto& saved : savedEnergySlot)
+        if (saved.second >= 0) {
+            savedEnergy[saved.first] += deviceEnergy[saved.second];
+            saved.second = -1;
+        }
+    deferredGlobals.clear();
+    numDeferredEnergies = 0;
+}
+
 void CommonIntegrateCustomStepKernel::getGlobalVariables(ContextImpl& context, vector<double>& values) const {
     if (!globalValues.isInitialized()) {
         // The data structures haven't been created yet, so just return the list of values that was given earlier.
@@ -882,6 +1027,8 @@ void CommonIntegrateCustomStepKernel::getGlobalVariables(ContextImpl& context, v
         values = initialGlobalVariables;
         return;
     }
+    // Replaying deferred computations changes only what a caller could already see, so this stays const to callers.
+    const_cast<CommonIntegrateCustomStepKernel*>(this)->resolveDeferredGlobals();
     values.resize(numGlobalVariables);
     for (int i = 0; i < numGlobalVariables; i++)
         values[i] = localGlobalValues[globalVariableIndex[i]];
@@ -896,6 +1043,7 @@ void CommonIntegrateCustomStepKernel::setGlobalVariables(ContextImpl& context, c
         initialGlobalVariables = values;
         return;
     }
+    resolveDeferredGlobals();
     for (int i = 0; i < numGlobalVariables; i++) {
         localGlobalValues[globalVariableIndex[i]] = values[i];
         expressionSet.setVariable(globalVariableIndex[i], values[i]);

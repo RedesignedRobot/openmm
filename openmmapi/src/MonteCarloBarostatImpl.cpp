@@ -63,31 +63,28 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
         return;
     step = 0;
 
-    // Compute the current potential energy.
-
     int groups = context.getIntegrator().getIntegrationForceGroups();
-    double initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
-
-    // Modify the periodic box size.
-
+    double initialEnergy, finalEnergy, volume, deltaVolume, newVolume, numberOfScaledParticles;
     Vec3 box[3];
-    context.getPeriodicBoxVectors(box[0], box[1], box[2]);
-    double volume = box[0][0]*box[1][1]*box[2][2];
-    double deltaVolume = volumeScale*2*(SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber()-0.5);
-    double newVolume = volume+deltaVolume;
-    double lengthScale = pow(newVolume/volume, 1.0/3.0);
-    kernel.getAs<ApplyMonteCarloBarostatKernel>().saveCoordinates(context);
-    context.getOwner().setPeriodicBoxVectors(box[0]*lengthScale, box[1]*lengthScale, box[2]*lengthScale);
-    kernel.getAs<ApplyMonteCarloBarostatKernel>().scaleCoordinates(context, lengthScale, lengthScale, lengthScale);
-
-    // Compute the energy of the modified system.
-
-    double numberOfScaledParticles;
-    if (owner.getScaleMoleculesAsRigid())
-        numberOfScaledParticles = context.getMolecules().size();
-    else
-        numberOfScaledParticles = context.getSystem().getNumParticles();
-    double finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    auto propose = [&] () {
+        context.getPeriodicBoxVectors(box[0], box[1], box[2]);
+        volume = box[0][0]*box[1][1]*box[2][2];
+        deltaVolume = volumeScale*2*(SimTKOpenMMUtilities::getUniformlyDistributedRandomNumber()-0.5);
+        newVolume = volume+deltaVolume;
+        double lengthScale = pow(newVolume/volume, 1.0/3.0);
+        kernel.getAs<ApplyMonteCarloBarostatKernel>().saveCoordinates(context);
+        context.getOwner().setPeriodicBoxVectors(box[0]*lengthScale, box[1]*lengthScale, box[2]*lengthScale);
+        kernel.getAs<ApplyMonteCarloBarostatKernel>().scaleCoordinates(context, lengthScale, lengthScale, lengthScale);
+        if (owner.getScaleMoleculesAsRigid())
+            numberOfScaledParticles = context.getMolecules().size();
+        else
+            numberOfScaledParticles = context.getSystem().getNumParticles();
+    };
+    if (!kernel.getAs<ApplyMonteCarloBarostatKernel>().computeTrialEnergies(context, groups, propose, initialEnergy, finalEnergy)) {
+        initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+        propose();
+        finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    }
     double pressure = context.getParameter(MonteCarloBarostat::Pressure())*(AVOGADRO*1e-25);
     double kT = BOLTZ*context.getParameter(MonteCarloBarostat::Temperature());
     double w = finalEnergy-initialEnergy + pressure*deltaVolume - numberOfScaledParticles*kT*log(newVolume/volume);

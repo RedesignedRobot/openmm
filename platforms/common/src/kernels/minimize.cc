@@ -168,6 +168,10 @@ DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
     } while(check != old);
 
     #endif
+#elif defined(__METAL_VERSION__)
+
+    ATOMIC_ADD(target, value);
+
 #else
     #error "Internal error: atomicAddMixed is missing an implementation for this platform"
 #endif
@@ -228,7 +232,7 @@ KERNEL void restorePos(
 }
 
 KERNEL void convertForces(
-    GLOBAL const mixed4* RESTRICT velm,
+    GLOBAL const mixed4s* RESTRICT velm,
     GLOBAL const mm_long* RESTRICT forceBuffer,
     GLOBAL const int* RESTRICT order,
     GLOBAL mixed* RESTRICT grad,
