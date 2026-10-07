@@ -50,7 +50,7 @@ public:
 };
 
 MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
+        forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), waitForCount(true), waitThisStep(false), tilesAfterReorder(0) {
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
@@ -231,15 +231,22 @@ void MetalNonbondedUtilities::initialize(const System& system) {
 
     maxCutoff = getMaxCutoffDistance();
     if (useCutoff) {
-        // Select a size for the arrays that hold the neighbor list.  We have to make a fairly
-        // arbitrary guess, but if this turns out to be too small we'll increase it later.
+        // Select a size for the arrays that hold the neighbor list.  If arrays for every tile and single pair
+        // the list could ever hold fit in 1/256 of the device's working set, the list can't overflow, so the
+        // host only needs to wait for the interaction count after a reorder.  Otherwise we have to make a
+        // fairly arbitrary guess, but if this turns out to be too small we'll increase it later.
 
+        long long maxPossiblePairs = (canUsePairList ? 3 : 0)*(long long) MetalContext::TileSize*numTiles;
+        long long maxListBytes = numTiles*(MetalContext::TileSize+1)*(long long) sizeof(int)+maxPossiblePairs*(long long) sizeof(mm_int2);
+        waitForCount = (numContexts > 1 || maxListBytes > context.getDevice().recommendedMaxWorkingSetSize()/256);
         maxTiles = 20*numAtomBlocks;
-        if (maxTiles > numTiles)
+        if (maxTiles > numTiles || !waitForCount)
             maxTiles = numTiles;
         if (maxTiles < 1)
             maxTiles = 1;
         maxSinglePairs = 5*numAtoms;
+        if (!waitForCount && maxSinglePairs < maxPossiblePairs)
+            maxSinglePairs = maxPossiblePairs;
         interactingTiles.initialize<int>(context, maxTiles, "interactingTiles");
         interactingAtoms.initialize<int>(context, MetalContext::TileSize*maxTiles, "interactingAtoms");
         interactionCount.initialize<unsigned int>(context, 2, "interactionCount");
@@ -305,7 +312,8 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     setPeriodicBoxArgs(context, kernels.findInteractingBlocksKernel, 0);
     kernels.findInteractingBlocksKernel->execute(context.getNumAtoms(), 256);
     forceRebuildNeighborList = false;
-    if (useNeighborList && numTiles > 0)
+    waitThisStep = (waitForCount || context.getStepsSinceReorder() == 0);
+    if (waitThisStep)
         event->enqueue();
 }
 
@@ -322,8 +330,12 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         kernel->execute(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
-        context.flushQueue();
-        event->wait();
+        // Without the wait, the count may come from an earlier step.  It can't exceed the arrays, so it only
+        // guides reordering.
+        if (waitThisStep) {
+            context.flushQueue();
+            event->wait();
+        }
         updateNeighborListSize();
     }
 }
