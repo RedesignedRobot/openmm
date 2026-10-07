@@ -299,6 +299,9 @@ void MetalNonbondedUtilities::prepareInteractions(int forceGroups) {
     kernels.computeSortKeysKernel->execute(context.getNumAtomBlocks());
     if (useLargeBlocks)
         setPeriodicBoxArgs(context, kernels.sortBoxDataKernel, 7);
+    kernels.sortBoxDataKernel->setArg(useLargeBlocks ? 16 : 9, forceRebuildNeighborList);
+    kernels.findInteractingBlocksKernel->setArg(10, maxTiles);
+    kernels.findInteractingBlocksKernel->setArg(11, maxSinglePairs);
     blockSorter->sort(sortedBlocks);
     kernels.sortBoxDataKernel->execute(context.getNumAtoms());
     setPeriodicBoxArgs(context, kernels.findInteractingBlocksKernel, 0);
@@ -316,8 +319,11 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         ComputeKernel& kernel = (includeForces ? (includeEnergy ? kernels.forceEnergyKernel : kernels.forceKernel) : kernels.energyKernel);
         if (kernel.use_count() == 0)
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
-        if (useCutoff)
+        if (useCutoff) {
             setPeriodicBoxArgs(context, kernel, 9);
+            kernel->setArg(14, maxTiles);
+            kernel->setArg(18, maxSinglePairs);
+        }
         kernel->execute(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
