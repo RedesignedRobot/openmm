@@ -322,6 +322,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
         kernel->execute(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
+        context.flushQueue();
         event->wait();
         updateNeighborListSize();
     }

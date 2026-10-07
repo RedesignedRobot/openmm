@@ -87,3 +87,16 @@ void MetalQueue::flush(bool sync) {
         lastBuffer = nullptr;
     }
 }
+
+void MetalQueue::copyBuffer(MTL::Buffer* source, MTL::Buffer* dest, size_t bytes) {
+    if (encoder != nullptr) {
+        encoder->endEncoding();
+        encoder->release();
+        encoder = nullptr;
+    }
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::BlitCommandEncoder* blit = getCommandBuffer().blitCommandEncoder();
+    blit->copyFromBuffer(source, 0, dest, 0, bytes);
+    blit->endEncoding();
+    pool->release();
+}

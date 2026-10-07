@@ -94,7 +94,5 @@ void MetalArray::copyTo(ArrayInterface& dest) const {
     if (dest.getSize() != size || dest.getElementSize() != elementSize)
         throw OpenMMException("Error copying array "+name+" to "+dest.getName()+": The destination array does not match the size of the array");
     MetalQueue& queue = dynamic_cast<MetalQueue&>(*context->getCurrentQueue());
-    queue.flush(true);
-    MetalArray& metalDest = context->unwrap(dest);
-    memcpy(metalDest.buffer->contents(), buffer->contents(), size*elementSize);
+    queue.copyBuffer(buffer, context->unwrap(dest).buffer, size*elementSize);
 }

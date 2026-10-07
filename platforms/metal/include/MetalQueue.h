@@ -61,6 +61,10 @@ public:
      *               submitted but do not wait for it to complete.
      */
     void flush(bool sync=false);
+    /**
+     * Enqueue a copy of the first bytes of one buffer to another.
+     */
+    void copyBuffer(MTL::Buffer* source, MTL::Buffer* dest, size_t bytes);
 private:
     MTL::CommandQueue* queue;
     MTL::CommandBuffer* commandBuffer;
