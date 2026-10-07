@@ -105,7 +105,7 @@ MetalPlatform::MetalPlatform() {
     platformProperties.push_back(MetalDeterministicForces());
     setPropertyDefaultValue(MetalPrecision(), "single");
     setPropertyDefaultValue(MetalUseCpuPme(), "false");
-    setPropertyDefaultValue(MetalDisablePmeStream(), "false");
+    setPropertyDefaultValue(MetalDisablePmeStream(), "true");
     setPropertyDefaultValue(MetalDeterministicForces(), "false");
 }
 
