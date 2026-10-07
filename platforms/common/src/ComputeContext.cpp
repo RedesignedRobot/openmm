@@ -763,17 +763,27 @@ void ComputeContext::reorderAtomsImpl() {
                 int xcell = (int) floor(center.x*invPeriodicBoxSize[0]);
                 center.x -= xcell*periodicBoxX[0];
                 if (xcell != 0 || ycell != 0 || zcell != 0) {
-                    Real dx = molPos[i].x-center.x;
-                    Real dy = molPos[i].y-center.y;
-                    Real dz = molPos[i].z-center.z;
+                    // Shift in double by whole box vectors.  In mixed precision posqCorrection holds the bits
+                    // that posq drops, so split the shifted position again instead of rounding it to float.
+
+                    Vec3 shift = periodicBoxX*xcell + periodicBoxY*ycell + periodicBoxZ*zcell;
                     molPos[i] = center;
                     for (int j = 0; j < (int) atoms.size(); j++) {
                         int atom = atoms[j]+mol.offsets[i];
-                        Real4 p = oldPosq[atom];
-                        p.x -= dx;
-                        p.y -= dy;
-                        p.z -= dz;
-                        oldPosq[atom] = p;
+                        Real4& p = oldPosq[atom];
+                        Real4& c = oldPosqCorrection[atom];
+                        bool mixed = getUseMixedPrecision();
+                        double x = (double) p.x - shift[0] + (mixed ? c.x : 0);
+                        double y = (double) p.y - shift[1] + (mixed ? c.y : 0);
+                        double z = (double) p.z - shift[2] + (mixed ? c.z : 0);
+                        p.x = (Real) x;
+                        p.y = (Real) y;
+                        p.z = (Real) z;
+                        if (mixed) {
+                            c.x = (Real) (x - p.x);
+                            c.y = (Real) (y - p.y);
+                            c.z = (Real) (z - p.z);
+                        }
                         posCellOffsets[atom].x -= xcell;
                         posCellOffsets[atom].y -= ycell;
                         posCellOffsets[atom].z -= zcell;
