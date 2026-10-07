@@ -80,6 +80,14 @@ public:
         static const std::string key = "DeterministicForces";
         return key;
     }
+    /**
+     * This is the name of the parameter for selecting which device to use.  Metal always uses the
+     * system default device, so the only valid values are "", "0" and lists of zeros such as "0,0".
+     */
+    static const std::string& MetalDeviceIndex() {
+        static const std::string key = "DeviceIndex";
+        return key;
+    }
 };
 
 class MetalPlatform::PlatformData {
