@@ -64,6 +64,7 @@ public:
 private:
     MTL::CommandQueue* queue;
     MTL::CommandBuffer* commandBuffer;
+    MTL::CommandBuffer* lastBuffer;
     MTL::ComputeCommandEncoder* encoder;
 };
 
