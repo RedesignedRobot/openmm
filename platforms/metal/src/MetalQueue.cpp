@@ -28,12 +28,14 @@
 
 using namespace OpenMM;
 
-MetalQueue::MetalQueue(MTL::Device& device) : queue(nullptr), commandBuffer(nullptr), encoder(nullptr) {
+MetalQueue::MetalQueue(MTL::Device& device) : queue(nullptr), commandBuffer(nullptr), lastBuffer(nullptr), encoder(nullptr) {
     queue = device.newCommandQueue();
 }
 
 MetalQueue::~MetalQueue() {
     flush();
+    if (lastBuffer != nullptr)
+        lastBuffer->release();
     if (queue != nullptr)
         queue->release();
 }
@@ -63,21 +65,25 @@ MTL::CommandBuffer& MetalQueue::getCommandBuffer() {
 }
 
 void MetalQueue::flush(bool sync) {
-    if (sync) {
-        // Make sure we have a command buffer to use for synchronization.
-
-        getCommandBuffer();
-    }
     if (commandBuffer != nullptr) {
         if (encoder != nullptr)
             encoder->endEncoding();
         commandBuffer->commit();
-        if (sync)
-            commandBuffer->waitUntilCompleted();
         if (encoder != nullptr)
             encoder->release();
-        commandBuffer->release();
+        if (lastBuffer != nullptr)
+            lastBuffer->release();
+        lastBuffer = commandBuffer;
         encoder = nullptr;
         commandBuffer = nullptr;
+    }
+
+    // A queue runs its command buffers in the order they were committed, so waiting for the last one also
+    // waits for work an earlier flush() committed without waiting.
+
+    if (sync && lastBuffer != nullptr) {
+        lastBuffer->waitUntilCompleted();
+        lastBuffer->release();
+        lastBuffer = nullptr;
     }
 }
