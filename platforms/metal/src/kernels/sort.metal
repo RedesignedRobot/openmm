@@ -44,29 +44,25 @@ KERNEL void sortShortList(GLOBAL DATA_TYPE* RESTRICT data, unsigned int length, 
 }
 
 /**
- * An alternate kernel for sorting short lists.  In this version every thread does a full
- * scan through the data to select the destination for one element.  This involves more
+ * An alternate kernel for sorting short lists.  In this version each SIMD group selects the
+ * destination for one element by counting the elements that sort before it.  This involves more
  * work, but also parallelizes much better.
  */
 KERNEL void sortShortList2(GLOBAL const DATA_TYPE* RESTRICT dataIn, GLOBAL DATA_TYPE* RESTRICT dataOut, unsigned int length) {
-    LOCAL DATA_TYPE dataBuffer[64];
-    DATA_TYPE value = dataIn[GLOBAL_ID < length ? GLOBAL_ID : 0];
-    KEY_TYPE key = getValue(value);
-    int count = 0;
-    for (int blockStart = 0; blockStart < length; blockStart += LOCAL_SIZE) {
-        int numInBlock = min(LOCAL_SIZE, length-blockStart);
-        SYNC_THREADS
-        if (LOCAL_ID < numInBlock)
-            dataBuffer[LOCAL_ID] = dataIn[blockStart+LOCAL_ID];
-        SYNC_THREADS
-        for (int i = 0; i < numInBlock; i++) {
-            KEY_TYPE otherKey = getValue(dataBuffer[i]);
-            if (otherKey < key || (otherKey == key && blockStart+i < GLOBAL_ID))
+    const unsigned int indexInWarp = LOCAL_ID%32;
+    for (unsigned int element = GLOBAL_ID/32; element < length; element += GLOBAL_SIZE/32) {
+        DATA_TYPE value = dataIn[element];
+        KEY_TYPE key = getValue(value);
+        unsigned int count = 0;
+        for (unsigned int i = indexInWarp; i < length; i += 32) {
+            KEY_TYPE otherKey = getValue(dataIn[i]);
+            if (otherKey < key || (otherKey == key && i < element))
                 count++;
         }
+        count = simd_sum(count);
+        if (indexInWarp == 0)
+            dataOut[count] = value;
     }
-    if (GLOBAL_ID < length)
-        dataOut[count] = value;
 }
 
 /**
