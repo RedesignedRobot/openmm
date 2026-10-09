@@ -546,7 +546,7 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     const bool nbDevice = (nbVariant == 4);
     const bool nbThreadgroup = (nbVariant == 5);
     auto nbShift = [&](const string& v) {
-        return (nbRotate ? "simd_shuffle_rotate_down("+v+", 1)" : "SHFL("+v+", tgx+1)");
+        return (nbRotate ? "NB_ROTATE("+v+")" : "SHFL("+v+", tgx+1)");
     };
     stringstream broadcastWarpData;
     broadcastWarpData << "posq2.x = SHFL(shflPosq.x, j);\n";

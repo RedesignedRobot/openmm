@@ -1,5 +1,19 @@
 #define WARPS_PER_GROUP (THREAD_BLOCK_SIZE/TILE_SIZE)
 
+#if NB_VARIANT == 2 || NB_VARIANT == 3
+template <class T>
+inline T NB_ROTATE(T var) {
+    return simd_shuffle_rotate_down(var, 1);
+}
+
+template <>
+inline long NB_ROTATE(long var) {
+    uint low = NB_ROTATE((uint) (var & 0xFFFFFFFF));
+    int high = NB_ROTATE((int) (var >> 32));
+    return (((long) high) << 32) + (long) low;
+}
+#endif
+
 /**
  * Save the force on a single atom.
  */
