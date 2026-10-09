@@ -150,6 +150,7 @@ KERNEL void computeNonbonded(
 #ifdef USE_EXCLUSIONS
                 excl >>= 1;
 #endif
+                SYNC_WARPS
             }
         }
         else {
@@ -202,6 +203,7 @@ KERNEL void computeNonbonded(
                 // cycles the indices
                 // 0 1 2 3 4 5 6 7 -> 1 2 3 4 5 6 7 0
                 tj = (tj + 1) & (TILE_SIZE - 1);
+                SYNC_WARPS
             }
             const unsigned int offset = y*TILE_SIZE + tgx;
             // write results for off diagonal tiles
@@ -339,6 +341,7 @@ KERNEL void computeNonbonded(
 #endif // end USE_SYMMETRIC
 #endif
                     tj = (tj + 1) & (TILE_SIZE - 1);
+                    SYNC_WARPS
                 }
             }
             else
@@ -382,6 +385,7 @@ KERNEL void computeNonbonded(
 #endif // end USE_SYMMETRIC
 #endif
                     tj = (tj + 1) & (TILE_SIZE - 1);
+                    SYNC_WARPS
                 }
             }
 
