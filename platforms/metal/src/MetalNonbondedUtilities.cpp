@@ -560,13 +560,13 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     replacements["SAVE_DERIVATIVES"] = saveDerivs.str();
 
     stringstream shuffleWarpData;
-    shuffleWarpData << "shflPosq.x = SHFL(shflPosq.x, tgx+1);\n";
-    shuffleWarpData << "shflPosq.y = SHFL(shflPosq.y, tgx+1);\n";
-    shuffleWarpData << "shflPosq.z = SHFL(shflPosq.z, tgx+1);\n";
-    shuffleWarpData << "shflPosq.w = SHFL(shflPosq.w, tgx+1);\n";
-    shuffleWarpData << "shflForce.x = SHFL(shflForce.x, tgx+1);\n";
-    shuffleWarpData << "shflForce.y = SHFL(shflForce.y, tgx+1);\n";
-    shuffleWarpData << "shflForce.z = SHFL(shflForce.z, tgx+1);\n";
+    shuffleWarpData << "shflPosq.x = simd_shuffle_rotate_down(shflPosq.x, 1);\n";
+    shuffleWarpData << "shflPosq.y = simd_shuffle_rotate_down(shflPosq.y, 1);\n";
+    shuffleWarpData << "shflPosq.z = simd_shuffle_rotate_down(shflPosq.z, 1);\n";
+    shuffleWarpData << "shflPosq.w = simd_shuffle_rotate_down(shflPosq.w, 1);\n";
+    shuffleWarpData << "shflForce.x = simd_shuffle_rotate_down(shflForce.x, 1);\n";
+    shuffleWarpData << "shflForce.y = simd_shuffle_rotate_down(shflForce.y, 1);\n";
+    shuffleWarpData << "shflForce.z = simd_shuffle_rotate_down(shflForce.z, 1);\n";
     replacements["SHUFFLE_WARP_DATA"] = shuffleWarpData.str();
 
     map<string, string> defines;
