@@ -115,7 +115,7 @@ void MetalSort::sort(ArrayInterface& data) {
             shortList2Kernel->setArg(0, data);
             shortList2Kernel->setArg(1, buckets);
             shortList2Kernel->setArg(2, dataLength);
-            shortList2Kernel->execute(dataLength);
+            shortList2Kernel->execute(32*dataLength);
             buckets.copyTo(data);
         }
         else {
