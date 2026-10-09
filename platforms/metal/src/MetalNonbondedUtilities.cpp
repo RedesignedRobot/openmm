@@ -29,6 +29,8 @@
 #include "openmm/OpenMMException.h"
 #include "openmm/common/CommonKernelUtilities.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <utility>
@@ -532,11 +534,36 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
 
     // Part 1. Defines for on diagonal exclusion tiles
 
+    // Lab-only (lane 030 m2, never upstream): M2NB picks a computeNonbonded variant for per-kernel timing.
+    // 0 = 5e7e87048 as is (posq and force rotate through SHFL(x, tgx+1), parameters load from device memory)
+    // 1 = 5e7e87048^ (parameters rotate through SHFL too)      2 = 0 with simd_shuffle_rotate_down(x, 1)
+    // 3 = 1 with simd_shuffle_rotate_down(x, 1)                4 = posq and parameters load from device memory, force rotates
+    // 5 = posq, parameters and force staged in threadgroup memory with SYNC_WARPS per step (Apple OpenCL's nonbonded.cl)
+    const char* nbEnv = getenv("M2NB");
+    const int nbVariant = (nbEnv == nullptr ? 0 : atoi(nbEnv));
+    const bool nbShflParams = (nbVariant == 1 || nbVariant == 3);
+    const bool nbRotate = (nbVariant == 2 || nbVariant == 3);
+    const bool nbDevice = (nbVariant == 4);
+    const bool nbThreadgroup = (nbVariant == 5);
+    auto nbShift = [&](const string& v) {
+        return (nbRotate ? "simd_shuffle_rotate_down("+v+", 1)" : "SHFL("+v+", tgx+1)");
+    };
     stringstream broadcastWarpData;
     broadcastWarpData << "posq2.x = SHFL(shflPosq.x, j);\n";
     broadcastWarpData << "posq2.y = SHFL(shflPosq.y, j);\n";
     broadcastWarpData << "posq2.z = SHFL(shflPosq.z, j);\n";
     broadcastWarpData << "posq2.w = SHFL(shflPosq.w, j);\n";
+    if (nbShflParams) {
+        for (const ComputeParameterInfo& param : params) {
+            broadcastWarpData << param.getType() << " shfl" << param.getName() << ";\n";
+            for (int j = 0; j < param.getNumComponents(); j++) {
+                if (param.getNumComponents() == 1)
+                    broadcastWarpData << "shfl" << param.getName() << "= SHFL(" << param.getName() <<"1,j);\n";
+                else
+                    broadcastWarpData << "shfl" << param.getName()+"."+suffixes[j] << "= SHFL(" << param.getName()+"1."+suffixes[j] <<",j);\n";
+            }
+        }
+    }
     replacements["BROADCAST_WARP_DATA"] = broadcastWarpData.str();
 
     // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles.
@@ -545,6 +572,32 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     for (const ComputeParameterInfo& param : params)
         load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[atom2];\n";
     replacements["LOAD_ATOM2_PARAMETERS_FROM_GLOBAL"] = load2g.str();
+    stringstream declareLocal2, loadLocal2, load2j, clearLocal, declareTg, storeTg, clearTg, load2tg;
+    for (const ComputeParameterInfo& param : params) {
+        declareLocal2<<param.getType()<<" shfl"<<param.getName()<<";\n";
+        loadLocal2<<"shfl"<<param.getName()<<" = global_"<<param.getName()<<"[j];\n";
+        load2j<<param.getType()<<" "<<param.getName()<<"2 = shfl"<<param.getName()<<";\n";
+        clearLocal<<"shfl"<<param.getName()<<" = "<<(param.getNumComponents() == 1 ? "0" : "make_"+param.getType()+"(0)")<<";\n";
+        declareTg<<"LOCAL "<<param.getType()<<" tg_"<<param.getName()<<"[THREAD_BLOCK_SIZE];\n";
+        storeTg<<"tg_"<<param.getName()<<"[LOCAL_ID] = global_"<<param.getName()<<"[j];\n";
+        clearTg<<"tg_"<<param.getName()<<"[LOCAL_ID] = "<<(param.getNumComponents() == 1 ? "0" : "make_"+param.getType()+"(0)")<<";\n";
+        load2tg<<param.getType()<<" "<<param.getName()<<"2 = tg_"<<param.getName()<<"[tbx+tj];\n";
+    }
+    replacements["DECLARE_TG_PARAMETERS"] = declareTg.str();
+    replacements["NB_LOAD_ATOM2_DIAG"] = (nbShflParams ? load2j.str() : load2g.str());
+    replacements["NB_LOAD_ATOM2"] = (nbShflParams ? load2j.str() : nbThreadgroup ? load2tg.str() : load2g.str());
+    replacements["NB_DECLARE_LOCAL"] = (nbShflParams ? declareLocal2.str() : "");
+    replacements["NB_LOAD_LOCAL"] = (nbShflParams ? loadLocal2.str() : "");
+    replacements["NB_CLEAR_LOCAL"] = (nbShflParams ? clearLocal.str() : "");
+    const string stageTg = "tgPosq[LOCAL_ID] = shflPosq;\ntgForce[LOCAL_ID] = make_real3(0);\n";
+    replacements["NB_STAGE_EXCL"] = (nbShflParams ? declareLocal2.str()+loadLocal2.str() : nbThreadgroup ? stageTg+storeTg.str()+"SYNC_WARPS;\n" : "");
+    replacements["NB_STAGE_LIST"] = (nbThreadgroup ? stageTg+"if (j < PADDED_NUM_ATOMS) {\n"+storeTg.str()+"}\nelse {\n"+clearTg.str()+"}\nSYNC_WARPS;\n" : "");
+    const string posq2Shfl = "real4 posq2 = shflPosq;\n", posq2Tg = "real4 posq2 = tgPosq[tbx+tj];\n";
+    replacements["NB_POSQ2_EXCL"] = (nbDevice ? "real4 posq2 = posq[y*TILE_SIZE+tj];\n" : nbThreadgroup ? posq2Tg : posq2Shfl);
+    replacements["NB_POSQ2_LIST"] = (nbDevice ? "real4 posq2 = posq[atomIndices[tbx+tj]];\n" : nbThreadgroup ? posq2Tg : posq2Shfl);
+    replacements["NB_POSQ2_LIST_CENTERED"] = (nbDevice ? "real4 posq2 = posq[atomIndices[tbx+tj]];\nAPPLY_PERIODIC_TO_POS_WITH_CENTER(posq2, blockCenterX)\n" : nbThreadgroup ? posq2Tg : posq2Shfl);
+    replacements["NB_ADD_FORCE2"] = (nbThreadgroup ? "tgForce[tbx+tj] += " : "shflForce += ");
+    replacements["NB_FORCE2_FINAL"] = (nbThreadgroup ? "shflForce = tgForce[LOCAL_ID];\n" : "");
 
     stringstream initDerivs;
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
@@ -560,13 +613,23 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     replacements["SAVE_DERIVATIVES"] = saveDerivs.str();
 
     stringstream shuffleWarpData;
-    shuffleWarpData << "shflPosq.x = SHFL(shflPosq.x, tgx+1);\n";
-    shuffleWarpData << "shflPosq.y = SHFL(shflPosq.y, tgx+1);\n";
-    shuffleWarpData << "shflPosq.z = SHFL(shflPosq.z, tgx+1);\n";
-    shuffleWarpData << "shflPosq.w = SHFL(shflPosq.w, tgx+1);\n";
-    shuffleWarpData << "shflForce.x = SHFL(shflForce.x, tgx+1);\n";
-    shuffleWarpData << "shflForce.y = SHFL(shflForce.y, tgx+1);\n";
-    shuffleWarpData << "shflForce.z = SHFL(shflForce.z, tgx+1);\n";
+    if (nbThreadgroup)
+        shuffleWarpData << "SYNC_WARPS;\n";
+    else {
+        if (!nbDevice)
+            for (const string& c : {"x", "y", "z", "w"})
+                shuffleWarpData << "shflPosq."<<c<<" = "<<nbShift("shflPosq."+c)<<";\n";
+        for (const string& c : {"x", "y", "z"})
+            shuffleWarpData << "shflForce."<<c<<" = "<<nbShift("shflForce."+c)<<";\n";
+        if (nbShflParams)
+            for (const ComputeParameterInfo& param : params) {
+                if (param.getNumComponents() == 1)
+                    shuffleWarpData<<"shfl"<<param.getName()<<"= "<<nbShift("shfl"+param.getName())<<";\n";
+                else
+                    for (int j = 0; j < param.getNumComponents(); j++)
+                        shuffleWarpData<<"shfl"<<param.getName()<<"."<<suffixes[j]<<"= "<<nbShift("shfl"+param.getName()+"."+suffixes[j])<<";\n";
+            }
+    }
     replacements["SHUFFLE_WARP_DATA"] = shuffleWarpData.str();
 
     map<string, string> defines;
@@ -581,6 +644,7 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
     defines["ENABLE_SHUFFLE"] = "1";
+    defines["NB_VARIANT"] = context.intToString(nbVariant);
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
     if (includeEnergy)
@@ -609,7 +673,10 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
     if ((localDataSize/4)%2 == 0 && !context.getUseDoublePrecision())
         defines["PARAMETER_SIZE_IS_EVEN"] = "1";
-    ComputeProgram program = context.compileProgram(context.replaceStrings(kernelSource, replacements), defines);
+    string nbSource = context.replaceStrings(kernelSource, replacements);
+    if (nbEnv != nullptr)
+        fprintf(stderr, "M2NB %d computeNonbonded source %zu bytes\n", nbVariant, nbSource.size());
+    ComputeProgram program = context.compileProgram(nbSource, defines);
     ComputeKernel kernel = program->createKernel("computeNonbonded");
 
     // Set arguments to the Kernel.

@@ -90,6 +90,11 @@ KERNEL void computeNonbonded(
     const unsigned int tbx = LOCAL_ID - tgx;           // block warpIndex
     mixed energy = 0;
     INIT_DERIVATIVES
+#if NB_VARIANT == 5
+    LOCAL real4 tgPosq[THREAD_BLOCK_SIZE];
+    LOCAL real3 tgForce[THREAD_BLOCK_SIZE];
+    DECLARE_TG_PARAMETERS
+#endif
 
     // First loop: process tiles that contain exclusions.
 
@@ -125,7 +130,7 @@ KERNEL void computeNonbonded(
                 real invR = RSQRT(r2);
                 real r = r2*invR;
                 atom2 = y*TILE_SIZE+j;
-                LOAD_ATOM2_PARAMETERS_FROM_GLOBAL
+                NB_LOAD_ATOM2_DIAG
 #ifdef USE_SYMMETRIC
                 real dEdR = 0.0f;
 #else
@@ -163,13 +168,14 @@ KERNEL void computeNonbonded(
             shflForce.x = 0.0f;
             shflForce.y = 0.0f;
             shflForce.z = 0.0f;
+            NB_STAGE_EXCL
 #ifdef USE_EXCLUSIONS
             excl = (excl >> tgx) | (excl << (TILE_SIZE - tgx));
 #endif
             unsigned int tj = tgx;
             for (j = 0; j < TILE_SIZE; j++) {
                 int atom2 = tbx+tj;
-                real4 posq2 = shflPosq;
+                NB_POSQ2_EXCL
                 real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
 #ifdef USE_PERIODIC
                 APPLY_PERIODIC_TO_DELTA(delta)
@@ -178,7 +184,7 @@ KERNEL void computeNonbonded(
                 real invR = RSQRT(r2);
                 real r = r2*invR;
                 atom2 = y*TILE_SIZE+tj;
-                LOAD_ATOM2_PARAMETERS_FROM_GLOBAL
+                NB_LOAD_ATOM2
 #ifdef USE_SYMMETRIC
                 real dEdR = 0.0f;
 #else
@@ -198,16 +204,12 @@ KERNEL void computeNonbonded(
                 force.x -= delta.x;
                 force.y -= delta.y;
                 force.z -= delta.z;
-                shflForce.x += delta.x;
-                shflForce.y += delta.y;
-                shflForce.z += delta.z;
+                NB_ADD_FORCE2 delta;
 #else // !USE_SYMMETRIC
                 force.x -= dEdR1.x;
                 force.y -= dEdR1.y;
                 force.z -= dEdR1.z;
-                shflForce.x += dEdR2.x;
-                shflForce.y += dEdR2.y;
-                shflForce.z += dEdR2.z;
+                NB_ADD_FORCE2 dEdR2;
 #endif // end USE_SYMMETRIC
 #endif
                 SHUFFLE_WARP_DATA
@@ -218,6 +220,7 @@ KERNEL void computeNonbonded(
                 // 0 1 2 3 4 5 6 7 -> 1 2 3 4 5 6 7 0
                 tj = (tj + 1) & (TILE_SIZE - 1);
             }
+            NB_FORCE2_FINAL
             const unsigned int offset = y*TILE_SIZE + tgx;
             // write results for off diagonal tiles
 #ifdef INCLUDE_FORCES
@@ -305,6 +308,7 @@ KERNEL void computeNonbonded(
             unsigned int j = y*TILE_SIZE + tgx;
 #endif
             atomIndices[LOCAL_ID] = j;
+            NB_DECLARE_LOCAL
             real4 shflPosq;
             real3 shflForce;
             shflForce.x = 0.0f;
@@ -313,9 +317,11 @@ KERNEL void computeNonbonded(
             if (j < PADDED_NUM_ATOMS) {
                 // Load position of atom j from global memory
                 shflPosq = posq[j];
+                NB_LOAD_LOCAL
             }
             else {
                 shflPosq = make_real4(0, 0, 0, 0);
+                NB_CLEAR_LOCAL
             }
 #ifdef USE_PERIODIC
             if (singlePeriodicCopy) {
@@ -324,16 +330,17 @@ KERNEL void computeNonbonded(
                 real4 blockCenterX = blockCenter[x];
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
+                NB_STAGE_LIST
                 unsigned int tj = tgx;
                 for (j = 0; j < TILE_SIZE; j++) {
                     int atom2 = tbx+tj;
-                    real4 posq2 = shflPosq;
+                    NB_POSQ2_LIST_CENTERED
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
                     real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
                     real invR = RSQRT(r2);
                     real r = r2*invR;
                     atom2 = atomIndices[tbx+tj];
-                    LOAD_ATOM2_PARAMETERS_FROM_GLOBAL
+                    NB_LOAD_ATOM2
 #ifdef USE_SYMMETRIC
                     real dEdR = 0.0f;
 #else
@@ -353,16 +360,12 @@ KERNEL void computeNonbonded(
                     force.x -= delta.x;
                     force.y -= delta.y;
                     force.z -= delta.z;
-                    shflForce.x += delta.x;
-                    shflForce.y += delta.y;
-                    shflForce.z += delta.z;
+                    NB_ADD_FORCE2 delta;
 #else // !USE_SYMMETRIC
                     force.x -= dEdR1.x;
                     force.y -= dEdR1.y;
                     force.z -= dEdR1.z;
-                    shflForce.x += dEdR2.x;
-                    shflForce.y += dEdR2.y;
-                    shflForce.z += dEdR2.z;
+                    NB_ADD_FORCE2 dEdR2;
 #endif // end USE_SYMMETRIC
 #endif
                     SHUFFLE_WARP_DATA
@@ -373,10 +376,11 @@ KERNEL void computeNonbonded(
 #endif
             {
                 // We need to apply periodic boundary conditions separately for each interaction.
+                NB_STAGE_LIST
                 unsigned int tj = tgx;
                 for (j = 0; j < TILE_SIZE; j++) {
                     int atom2 = tbx+tj;
-                    real4 posq2 = shflPosq;
+                    NB_POSQ2_LIST
                     real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
 #ifdef USE_PERIODIC
                     APPLY_PERIODIC_TO_DELTA(delta)
@@ -385,7 +389,7 @@ KERNEL void computeNonbonded(
                     real invR = RSQRT(r2);
                     real r = r2*invR;
                     atom2 = atomIndices[tbx+tj];
-                    LOAD_ATOM2_PARAMETERS_FROM_GLOBAL
+                    NB_LOAD_ATOM2
 #ifdef USE_SYMMETRIC
                     real dEdR = 0.0f;
 #else
@@ -405,16 +409,12 @@ KERNEL void computeNonbonded(
                     force.x -= delta.x;
                     force.y -= delta.y;
                     force.z -= delta.z;
-                    shflForce.x += delta.x;
-                    shflForce.y += delta.y;
-                    shflForce.z += delta.z;
+                    NB_ADD_FORCE2 delta;
 #else // !USE_SYMMETRIC
                     force.x -= dEdR1.x;
                     force.y -= dEdR1.y;
                     force.z -= dEdR1.z;
-                    shflForce.x += dEdR2.x;
-                    shflForce.y += dEdR2.y;
-                    shflForce.z += dEdR2.z;
+                    NB_ADD_FORCE2 dEdR2;
 #endif // end USE_SYMMETRIC
 #endif
                     SHUFFLE_WARP_DATA
@@ -423,6 +423,7 @@ KERNEL void computeNonbonded(
             }
 
             // Write results.
+            NB_FORCE2_FINAL
 #ifdef INCLUDE_FORCES
             ATOMIC_ADD(&forceBuffers[atom1], static_cast<mm_ulong>(realToFixedPoint(force.x)));
             ATOMIC_ADD(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<mm_ulong>(realToFixedPoint(force.y)));
