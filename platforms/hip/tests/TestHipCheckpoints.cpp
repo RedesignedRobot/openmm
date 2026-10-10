@@ -32,4 +32,6 @@
 #include "TestCheckpoints.h"
 
 void runPlatformTests() {
+    testResumeIsExact(false);
+    testResumeIsExact(true);
 }
