@@ -80,3 +80,8 @@ void MetalCalcNonbondedForceKernel::initialize(const System& system, const Nonbo
 void MetalCalcConstantPotentialForceKernel::initialize(const System& system, const ConstantPotentialForce& force) {
     commonInitialize(system, force, false, mc.getPlatformData().deterministicForces);
 }
+
+void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
+    if (!mc.getIntegrationUtilities().integrateLangevinMiddle(params, tol))
+        CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
+}

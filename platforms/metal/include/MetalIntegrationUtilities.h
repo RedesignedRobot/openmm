@@ -46,9 +46,21 @@ public:
      * Distribute forces from virtual sites to the atoms they are based on.
      */
     void distributeForcesFromVirtualSites();
+    /**
+     * Update the positions and velocities for one LangevinMiddleIntegrator step and enforce the constraints, all in one
+     * kernel.  This does nothing and returns false unless the context uses mixed precision and no constraint goes
+     * through CCMA.
+     *
+     * @param params   the velocity scale and noise scale of the integrator
+     * @param tol      the constraint tolerance
+     */
+    bool integrateLangevinMiddle(ComputeArray& params, double tol);
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     MetalArray ccmaConvergedBuffer;
+    ComputeKernel langevinMiddleKernel;
+    ComputeArray freeAtoms;
+    int numLangevinMiddleUnits;
 };
 
 } // namespace OpenMM

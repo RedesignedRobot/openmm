@@ -177,6 +177,7 @@ protected:
     ComputeArray vsiteSymmetryAtoms, vsiteSymmetryMatrix, vsiteSymmetryOffset, vsiteSymmetryUseBox;
     ComputeArray vsiteStage;
     ComputeArray kineticEnergy;
+    std::map<std::string, std::string> defines;
     int randomPos, lastSeed, numVsites, numVsiteStages, keWorkGroupSize;
     bool hasOverlappingVsites;
     mm_double2 lastStepSize;
