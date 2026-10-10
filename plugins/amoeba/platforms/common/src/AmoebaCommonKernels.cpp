@@ -677,7 +677,7 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     electrostaticsKernel = program->createKernel("computeElectrostatics");
     electrostaticsKernel->addArg(cc.getLongForceBuffer());
     electrostaticsKernel->addArg(torque);
-    electrostaticsKernel->addArg(cc.getEnergyBuffer());
+    electrostaticsKernel->addArg(); // The energy buffer, set in execute()
     electrostaticsKernel->addArg(cc.getPosq());
     electrostaticsKernel->addArg(covalentFlags);
     electrostaticsKernel->addArg(polarizationGroupFlags);
@@ -810,7 +810,7 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
         pmeFixedForceKernel->addArg(cc.getPosq());
         pmeFixedForceKernel->addArg(cc.getLongForceBuffer());
         pmeFixedForceKernel->addArg(torque);
-        pmeFixedForceKernel->addArg(cc.getEnergyBuffer());
+        pmeFixedForceKernel->addArg(); // The energy buffer, set in execute()
         pmeFixedForceKernel->addArg(labDipoles);
         pmeFixedForceKernel->addArg(labQuadrupoles);
         pmeFixedForceKernel->addArg(fracDipoles);
@@ -823,7 +823,7 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
         pmeInducedForceKernel->addArg(cc.getPosq());
         pmeInducedForceKernel->addArg(cc.getLongForceBuffer());
         pmeInducedForceKernel->addArg(torque);
-        pmeInducedForceKernel->addArg(cc.getEnergyBuffer());
+        pmeInducedForceKernel->addArg(); // The energy buffer, set in execute()
         pmeInducedForceKernel->addArg(labDipoles);
         pmeInducedForceKernel->addArg(labQuadrupoles);
         pmeInducedForceKernel->addArg(fracDipoles);
@@ -1034,6 +1034,14 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
     ContextSelector selector(cc);
     if (!hasInitializedScaleFactors) {
         initializeScaleFactors();
+
+        // The energy buffer is created after initialize() is called.
+
+        electrostaticsKernel->setArg(2, cc.getEnergyBuffer());
+        if (usePME) {
+            pmeFixedForceKernel->setArg(3, cc.getEnergyBuffer());
+            pmeInducedForceKernel->setArg(3, cc.getEnergyBuffer());
+        }
         for (auto impl : context.getForceImpls()) {
             AmoebaGeneralizedKirkwoodForceImpl* gkImpl = dynamic_cast<AmoebaGeneralizedKirkwoodForceImpl*>(impl);
             if (gkImpl != NULL) {
@@ -2298,7 +2306,7 @@ void CommonCalcAmoebaWcaDispersionForceKernel::initialize(const System& system, 
     ComputeProgram program = cc.compileProgram(CommonAmoebaKernelSources::amoebaWcaForce, defines);
     forceKernel = program->createKernel("computeWCAForce");
     forceKernel->addArg(cc.getLongForceBuffer());
-    forceKernel->addArg(cc.getEnergyBuffer());
+    forceKernel->addArg(); // The energy buffer, set in execute()
     forceKernel->addArg(cc.getPosq());
     forceKernel->addArg();
     forceKernel->addArg();
@@ -2319,6 +2327,7 @@ double CommonCalcAmoebaWcaDispersionForceKernel::execute(ContextImpl& context, b
     int startTileIndex = nb.getStartTileIndex();
     int numTileIndices = nb.getNumTiles();
     int numForceThreadBlocks = nb.getNumForceThreadBlocks();
+    forceKernel->setArg(1, cc.getEnergyBuffer());
     forceKernel->setArg(3, startTileIndex);
     forceKernel->setArg(4, numTileIndices);
     forceKernel->execute(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
@@ -2650,7 +2659,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
     computeExtrapolatedKernel->addArg(inducedDipole);
     computeExtrapolatedKernel->addArg(extrapolatedDipole);
     polarizationEnergyKernel = program->createKernel("computePolarizationEnergy");
-    polarizationEnergyKernel->addArg(cc.getEnergyBuffer());
+    polarizationEnergyKernel->addArg(); // The energy buffer, set in execute()
     polarizationEnergyKernel->addArg(inducedDipole);
     polarizationEnergyKernel->addArg(extrapolatedDipole);
     polarizationEnergyKernel->addArg(polarizability);
@@ -2774,7 +2783,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
         pmeFixedForceKernel->addArg(cc.getPosq());
         pmeFixedForceKernel->addArg(cc.getLongForceBuffer());
         pmeFixedForceKernel->addArg(torque);
-        pmeFixedForceKernel->addArg(cc.getEnergyBuffer());
+        pmeFixedForceKernel->addArg(); // The energy buffer, set in execute()
         pmeFixedForceKernel->addArg(labDipoles);
         pmeFixedForceKernel->addArg(coreCharge);
         pmeFixedForceKernel->addArg(valenceCharge);
@@ -2793,7 +2802,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
         pmeInducedForceKernel->addArg(cc.getPosq());
         pmeInducedForceKernel->addArg(cc.getLongForceBuffer());
         pmeInducedForceKernel->addArg(torque);
-        pmeInducedForceKernel->addArg(cc.getEnergyBuffer());
+        pmeInducedForceKernel->addArg(); // The energy buffer, set in execute()
         pmeInducedForceKernel->addArg(labDipoles);
         pmeInducedForceKernel->addArg(coreCharge);
         pmeInducedForceKernel->addArg(valenceCharge);
@@ -2820,7 +2829,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
             pmeRecordInducedFieldDipolesKernel->addArg();
         pmeSelfEnergyKernel = program->createKernel("calculateSelfEnergyAndTorque");
         pmeSelfEnergyKernel->addArg(torque);
-        pmeSelfEnergyKernel->addArg(cc.getEnergyBuffer());
+        pmeSelfEnergyKernel->addArg(); // The energy buffer, set in execute()
         pmeSelfEnergyKernel->addArg(labDipoles);
         pmeSelfEnergyKernel->addArg(coreCharge);
         pmeSelfEnergyKernel->addArg(valenceCharge);
@@ -2872,7 +2881,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
             dpmeConvolutionKernel->addArg();
         dpmeEvalEnergyKernel = program->createKernel("gridEvaluateEnergy");
         dpmeEvalEnergyKernel->addArg(pmeGrid2);
-        dpmeEvalEnergyKernel->addArg(cc.getEnergyBuffer());
+        dpmeEvalEnergyKernel->addArg(); // The energy buffer, set in execute()
         dpmeEvalEnergyKernel->addArg(dpmeBsplineModuliX);
         dpmeEvalEnergyKernel->addArg(dpmeBsplineModuliY);
         dpmeEvalEnergyKernel->addArg(dpmeBsplineModuliZ);
@@ -3088,7 +3097,7 @@ void CommonCalcHippoNonbondedForceKernel::initialize(const System& system, const
         program = cc.compileProgram(exceptionsSrc, defines);
         computeExceptionsKernel = program->createKernel("computeNonbondedExceptions");
         computeExceptionsKernel->addArg(cc.getLongForceBuffer());
-        computeExceptionsKernel->addArg(cc.getEnergyBuffer());
+        computeExceptionsKernel->addArg(); // The energy buffer, set in execute()
         computeExceptionsKernel->addArg(torque);
         computeExceptionsKernel->addArg(cc.getPosq());
         computeExceptionsKernel->addArg(exceptionAtoms);
@@ -3235,6 +3244,18 @@ double CommonCalcHippoNonbondedForceKernel::execute(ContextImpl& context, bool i
                 fixedFieldExceptionKernel, exceptionScales[1]);
         createFieldKernel(CommonAmoebaKernelSources::hippoMutualField, {&alpha, &inducedDipole}, inducedField, mutualFieldKernel,
                 mutualFieldExceptionKernel, exceptionScales[2]);
+
+        // The energy buffer is created after initialize() is called.
+
+        polarizationEnergyKernel->setArg(0, cc.getEnergyBuffer());
+        if (usePME) {
+            pmeFixedForceKernel->setArg(3, cc.getEnergyBuffer());
+            pmeInducedForceKernel->setArg(3, cc.getEnergyBuffer());
+            pmeSelfEnergyKernel->setArg(1, cc.getEnergyBuffer());
+            dpmeEvalEnergyKernel->setArg(1, cc.getEnergyBuffer());
+        }
+        if (exceptionAtoms.isInitialized())
+            computeExceptionsKernel->setArg(1, cc.getEnergyBuffer());
     }
 
     // Compute the lab frame moments.
