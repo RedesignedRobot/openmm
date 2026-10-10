@@ -478,6 +478,11 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
     return true;
 }
 
+void CudaNonbondedUtilities::resetNeighborList() {
+    forceRebuildNeighborList = true;
+    tilesAfterReorder = 0;
+}
+
 void CudaNonbondedUtilities::setUsePadding(bool padding) {
     usePadding = padding;
 }
