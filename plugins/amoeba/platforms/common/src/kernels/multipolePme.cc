@@ -3,7 +3,7 @@
 /**
  * Calculate the spline coefficients for a single atom along a single axis.
  */
-DEVICE void computeBSplinePoint(real4* thetai, real w, real* array) {
+DEVICE void computeBSplinePoint(PRIVATE real4* thetai, real w, PRIVATE real* array) {
     // initialization to get to 2nd order recursion
 
     ARRAY(2,2) = w;
