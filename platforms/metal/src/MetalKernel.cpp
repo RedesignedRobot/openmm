@@ -32,8 +32,8 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name) :
-        context(context), pipeline(pipeline), name(name), dynamicLocal(0) {
+MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name, bool packValues) :
+        context(context), pipeline(pipeline), name(name), dynamicLocal(0), packValues(packValues) {
 }
 
 MetalKernel::~MetalKernel() {
@@ -54,11 +54,28 @@ void MetalKernel::execute(int threads, int blockSize) {
     encoder.setComputePipelineState(pipeline);
     int numArgs = arrayArgs.size();
     argPointers.resize(numArgs);
-    for (int i = 0; i < numArgs; i++) {
-        if (arrayArgs[i] != NULL)
-            encoder.setBuffer(arrayArgs[i]->getBuffer(), 0, i);
-        else
-            encoder.setBytes(&primitiveArgs[i], primitiveArgSizes[i], i);
+    if (packValues) {
+        // Arrays take the buffer indices in order, and the values follow in one buffer of 32 byte slots.
+
+        vector<mm_double4> values;
+        int index = 0;
+        for (int i = 0; i < numArgs; i++) {
+            if (arrayArgs[i] != NULL)
+                encoder.setBuffer(arrayArgs[i]->getBuffer(), 0, index++);
+            else
+                values.push_back(primitiveArgs[i]);
+        }
+        if (values.empty())
+            values.push_back(mm_double4(0, 0, 0, 0));
+        encoder.setBytes(values.data(), values.size()*sizeof(mm_double4), index);
+    }
+    else {
+        for (int i = 0; i < numArgs; i++) {
+            if (arrayArgs[i] != NULL)
+                encoder.setBuffer(arrayArgs[i]->getBuffer(), 0, i);
+            else
+                encoder.setBytes(&primitiveArgs[i], primitiveArgSizes[i], i);
+        }
     }
     if (dynamicLocal > 0)
         encoder.setThreadgroupMemoryLength(dynamicLocal, 0);
