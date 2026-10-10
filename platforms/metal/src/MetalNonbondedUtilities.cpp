@@ -500,17 +500,20 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     replacements["ATOM_PARAMETER_DATA"] = localData.str();
     stringstream args;
     for (const ComputeParameterInfo& param : params) {
-        args << ", ";
+        args << ", GLOBAL ";
         if (param.isConstant())
-            args << "GLOBAL const ";
-        args << param.getType();
+            args << "const ";
+        if (param.getNumComponents() == 3)
+            args << param.getComponentType(); // A Metal three component vector takes the space of four.
+        else
+            args << param.getType();
         args << "* RESTRICT global_";
         args << param.getName();
     }
     for (const ComputeParameterInfo& arg : arguments) {
-        args << ", ";
+        args << ", GLOBAL ";
         if (arg.isConstant())
-            args << "GLOBAL const ";
+            args << "const ";
         args << arg.getType();
         args << "* RESTRICT ";
         args << arg.getName();
@@ -520,20 +523,52 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     replacements["PARAMETER_ARGUMENTS"] = args.str();
 
     stringstream load1;
+    stringstream load2g;
     for (const ComputeParameterInfo& param : params) {
-        load1 << param.getType();
-        load1 << " ";
-        load1 << param.getName();
-        load1 << "1 = global_";
-        load1 << param.getName();
-        load1 << "[atom1];\n";
+        const string& name = param.getName();
+        if (param.getNumComponents() == 3) {
+            load1<<param.getType()<<" "<<name<<"1 = make_"<<param.getType()<<"(global_"<<name<<"[3*atom1], global_"<<name<<"[3*atom1+1], global_"<<name<<"[3*atom1+2]);\n";
+            load2g<<param.getType()<<" "<<name<<"2 = make_"<<param.getType()<<"(global_"<<name<<"[3*atom2], global_"<<name<<"[3*atom2+1], global_"<<name<<"[3*atom2+2]);\n";
+        }
+        else {
+            load1<<param.getType()<<" "<<name<<"1 = global_"<<name<<"[atom1];\n";
+            load2g<<param.getType()<<" "<<name<<"2 = global_"<<name<<"[atom2];\n";
+        }
     }
     replacements["LOAD_ATOM1_PARAMETERS"] = load1.str();
-
-    stringstream load2g;
-    for (const ComputeParameterInfo& param : params)
-        load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[atom2];\n";
     replacements["LOAD_ATOM2_PARAMETERS_FROM_GLOBAL"] = load2g.str();
+
+    // Kernels that replace the default source (such as HIPPO) keep parameters in threadgroup memory.
+
+    stringstream loadLocal1, loadLocal2, load2j, clearLocal;
+    for (const ComputeParameterInfo& param : params) {
+        const string& name = param.getName();
+        if (param.getNumComponents() == 1) {
+            loadLocal1<<"localData[localAtomIndex]."<<name<<" = "<<name<<"1;\n";
+            loadLocal2<<"localData[localAtomIndex]."<<name<<" = global_"<<name<<"[j];\n";
+            load2j<<param.getType()<<" "<<name<<"2 = localData[atom2]."<<name<<";\n";
+            clearLocal<<"localData[localAtomIndex]."<<name<<" = 0;\n";
+        }
+        else {
+            if (param.getNumComponents() == 3)
+                loadLocal2<<param.getType()<<" temp_"<<name<<" = make_"<<param.getType()<<"(global_"<<name<<"[3*j], global_"<<name<<"[3*j+1], global_"<<name<<"[3*j+2]);\n";
+            else
+                loadLocal2<<param.getType()<<" temp_"<<name<<" = global_"<<name<<"[j];\n";
+            load2j<<param.getType()<<" "<<name<<"2 = make_"<<param.getType()<<"(";
+            for (int j = 0; j < param.getNumComponents(); ++j) {
+                loadLocal1<<"localData[localAtomIndex]."<<name<<"_"<<suffixes[j]<<" = "<<name<<"1."<<suffixes[j]<<";\n";
+                loadLocal2<<"localData[localAtomIndex]."<<name<<"_"<<suffixes[j]<<" = temp_"<<name<<"."<<suffixes[j]<<";\n";
+                load2j<<(j > 0 ? ", " : "")<<"localData[atom2]."<<name<<"_"<<suffixes[j];
+                clearLocal<<"localData[localAtomIndex]."<<name<<"_"<<suffixes[j]<<" = 0;\n";
+            }
+            load2j<<");\n";
+        }
+    }
+    replacements["LOAD_LOCAL_PARAMETERS_FROM_1"] = loadLocal1.str();
+    replacements["DECLARE_LOCAL_PARAMETERS"] = "";
+    replacements["LOAD_LOCAL_PARAMETERS_FROM_GLOBAL"] = loadLocal2.str();
+    replacements["LOAD_ATOM2_PARAMETERS"] = load2j.str();
+    replacements["CLEAR_LOCAL_PARAMETERS"] = clearLocal.str();
 
     stringstream initDerivs;
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
