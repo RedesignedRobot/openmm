@@ -17,8 +17,9 @@ DEVICE mixed3 multiplyComplexImagPartConj(mixed2 c1, mixed3 c2r, mixed3 c2i) {
 /**
  * Apply the PILE-L thermostat.
  */
-KERNEL void applyPileThermostat(GLOBAL mixed4* velm, GLOBAL float4* random, unsigned int randomIndex,
+KERNEL void applyPileThermostat(GLOBAL mixed4* velm, GLOBAL float4* random, unsigned int startRandomIndex,
         mixed dt, mixed kT, mixed friction) {
+    unsigned int randomIndex = startRandomIndex;
     const int numBlocks = GLOBAL_SIZE/NUM_COPIES;
     const int blockStart = NUM_COPIES*(LOCAL_ID/NUM_COPIES);
     const int indexInBlock = LOCAL_ID-blockStart;
