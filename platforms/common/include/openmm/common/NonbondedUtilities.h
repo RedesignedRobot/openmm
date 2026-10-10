@@ -178,6 +178,13 @@ public:
      */
     virtual void setUsePadding(bool padding) = 0;
     /**
+     * Rebuild the neighbor list the next time interactions are computed, and restart the
+     * tile count that decides when to reorder atoms early.  This is called when a checkpoint
+     * is created or loaded, so the Context that wrote it and a Context that loads it build
+     * their lists from the same positions and compute identical forces.
+     */
+    virtual void resetNeighborList() = 0;
+    /**
      * Initialize this object in preparation for a simulation.
      */
     virtual void initialize(const System& system) = 0;

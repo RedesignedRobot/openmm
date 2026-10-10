@@ -369,6 +369,11 @@ bool MetalNonbondedUtilities::updateNeighborListSize() {
     return true;
 }
 
+void MetalNonbondedUtilities::resetNeighborList() {
+    forceRebuildNeighborList = true;
+    tilesAfterReorder = 0;
+}
+
 void MetalNonbondedUtilities::setUsePadding(bool padding) {
     usePadding = padding;
 }

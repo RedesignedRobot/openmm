@@ -262,6 +262,11 @@ public:
      */
     void setUsePadding(bool padding);
     /**
+     * Rebuild the neighbor list the next time interactions are computed, and restart the
+     * tile count that decides when to reorder atoms early.
+     */
+    void resetNeighborList();
+    /**
      * Set the range of atom blocks and tiles that should be processed by this context.
      */
     void setAtomBlockRange(double startFraction, double endFraction);

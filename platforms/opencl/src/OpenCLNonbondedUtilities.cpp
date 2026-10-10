@@ -442,6 +442,11 @@ bool OpenCLNonbondedUtilities::updateNeighborListSize() {
     return true;
 }
 
+void OpenCLNonbondedUtilities::resetNeighborList() {
+    forceRebuildNeighborList = true;
+    tilesAfterReorder = 0;
+}
+
 void OpenCLNonbondedUtilities::setUsePadding(bool padding) {
     usePadding = padding;
 }

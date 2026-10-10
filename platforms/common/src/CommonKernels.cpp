@@ -379,6 +379,13 @@ void CommonUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream
     stream.write((char*) boxVectors, 3*sizeof(Vec3));
     cc.getIntegrationUtilities().createCheckpoint(stream);
     SimTKOpenMMUtilities::createCheckpoint(stream);
+
+    // The neighbor list depends on the positions where it was last built, and which pairs share a tile
+    // changes the rounding of the forces.  Rebuild it from the checkpointed positions, as any Context
+    // that loads this checkpoint will.
+
+    for (auto ctx : cc.getAllContexts())
+        ctx->getNonbondedUtilities().resetNeighborList();
 }
 
 void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& stream) {
@@ -425,6 +432,8 @@ void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& 
     for (auto listener : cc.getReorderListeners())
         listener->execute();
     cc.validateAtomOrder();
+    for (auto ctx : contexts)
+        ctx->getNonbondedUtilities().resetNeighborList();
 }
 
 void CommonApplyConstraintsKernel::initialize(const System& system) {
