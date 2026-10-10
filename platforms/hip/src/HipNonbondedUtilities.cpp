@@ -500,6 +500,11 @@ bool HipNonbondedUtilities::updateNeighborListSize() {
     return true;
 }
 
+void HipNonbondedUtilities::resetNeighborList() {
+    forceRebuildNeighborList = true;
+    tilesAfterReorder = 0;
+}
+
 void HipNonbondedUtilities::setUsePadding(bool padding) {
     usePadding = padding;
 }
