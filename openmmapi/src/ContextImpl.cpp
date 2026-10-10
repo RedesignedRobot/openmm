@@ -469,6 +469,11 @@ void ContextImpl::createCheckpoint(ostream& stream) {
     updateStateDataKernel.getAs<UpdateStateDataKernel>().createCheckpoint(*this, stream);
     integrator.createCheckpoint(stream);
     stream.flush();
+
+    // A Context that loads this checkpoint computes forces before its first step, so make the
+    // integrator recompute them here too instead of reusing ones from before the checkpoint.
+
+    integrator.stateChanged(State::Forces);
 }
 
 void ContextImpl::loadCheckpoint(istream& stream) {
