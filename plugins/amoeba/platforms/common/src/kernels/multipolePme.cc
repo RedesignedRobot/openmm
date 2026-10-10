@@ -185,7 +185,7 @@ KERNEL void gridSpreadFixedMultipoles(GLOBAL const real4* RESTRICT posq, GLOBAL 
         GLOBAL const real* RESTRICT fracQuadrupole,
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
         GLOBAL mm_ulong* RESTRICT pmeGrid,
-#elif defined(HIPPO)
+#elif defined HIPPO
         GLOBAL real* RESTRICT pmeGrid,
 #else
         GLOBAL real2* RESTRICT pmeGrid,
@@ -283,7 +283,7 @@ KERNEL void gridSpreadFixedMultipoles(GLOBAL const real4* RESTRICT posq, GLOBAL 
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add));
     #else
-                    ATOMIC_ADD(&pmeGrid[index].x, add);
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index, add);
     #endif
 #endif
                 }
@@ -298,7 +298,7 @@ KERNEL void gridSpreadInducedDipoles(GLOBAL const real4* RESTRICT posq, GLOBAL c
 #endif
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
         GLOBAL mm_ulong* RESTRICT pmeGrid,
-#elif defined(HIPPO)
+#elif defined HIPPO
         GLOBAL real* RESTRICT pmeGrid,
 #else
         GLOBAL real2* RESTRICT pmeGrid,
@@ -407,8 +407,8 @@ KERNEL void gridSpreadInducedDipoles(GLOBAL const real4* RESTRICT posq, GLOBAL c
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add1));
                     ATOMIC_ADD(&pmeGrid[2*index+1], (mm_ulong) realToFixedPoint(add2));
     #else
-                    ATOMIC_ADD(&pmeGrid[index].x, add1);
-                    ATOMIC_ADD(&pmeGrid[index].y, add2);
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index, add1);
+                    ATOMIC_ADD(((GLOBAL real*) pmeGrid)+2*index+1, add2);
     #endif
 #endif
                 }
@@ -475,12 +475,14 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
     }
 }
 
-KERNEL void computeFixedPotentialFromGrid(
+// Metal's kernel argument rewriter needs the first argument outside any conditional.
 #ifdef HIPPO
-        GLOBAL const real* RESTRICT pmeGrid,
+    #define POTENTIAL_GRID_TYPE real
 #else
-        GLOBAL const real2* RESTRICT pmeGrid,
+    #define POTENTIAL_GRID_TYPE real2
 #endif
+
+KERNEL void computeFixedPotentialFromGrid(GLOBAL const POTENTIAL_GRID_TYPE* RESTRICT pmeGrid,
         GLOBAL real* RESTRICT phi, GLOBAL mm_long* RESTRICT fieldBuffers,
 #ifndef HIPPO
         GLOBAL mm_long* RESTRICT fieldPolarBuffers,
@@ -662,11 +664,11 @@ KERNEL void computeFixedPotentialFromGrid(
     }
 }
 
-KERNEL void computeInducedPotentialFromGrid(
+KERNEL void computeInducedPotentialFromGrid(GLOBAL const POTENTIAL_GRID_TYPE* RESTRICT pmeGrid,
 #ifdef HIPPO
-        GLOBAL const real* RESTRICT pmeGrid, GLOBAL real* RESTRICT extrapolatedPhi, int order,
+        GLOBAL real* RESTRICT extrapolatedPhi, int order,
 #else
-        GLOBAL const real2* RESTRICT pmeGrid, GLOBAL real* RESTRICT phid, GLOBAL real* RESTRICT phip,
+        GLOBAL real* RESTRICT phid, GLOBAL real* RESTRICT phip,
 #endif
         GLOBAL real* RESTRICT phidp, GLOBAL const real4* RESTRICT posq,
         real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, real4 recipBoxVecX,
