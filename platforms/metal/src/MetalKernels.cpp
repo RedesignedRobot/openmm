@@ -742,9 +742,24 @@ void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& s
         if (version != DeviceCheckpointVersion)
             throw OpenMMException("Checkpoint requires matching OPENMM_METAL_DEVICE_BAROSTAT and device eligibility");
     }
-    {
+    // A reorder during NaN steps leaves a report that the load's first atom index read would throw, after
+    // posq and velm are replaced and before the rest of the state is.  A load that fails keeps the report.
+    MetalAtomReorder* reorder = cu.getNonbondedUtilities().getAtomReorder();
+    bool nan = false;
+    if (reorder != nullptr) {
+        ContextSelector selector(cu);
+        nan = reorder->discardNaN();
+    }
+    try {
         RawCheckpointVelocities raw(cu, rawVelocities);
         CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
+    }
+    catch (...) {
+        if (nan) {
+            ContextSelector selector(cu);
+            reorder->restoreNaN();
+        }
+        throw;
     }
     if (cu.deviceBarostatState != nullptr) {
         vector<double> state(16);
