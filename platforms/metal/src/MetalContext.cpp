@@ -302,6 +302,10 @@ FFT3D MetalContext::createFFT(int xsize, int ysize, int zsize, bool realToComple
     return FFT3D(new MetalFFT3D(*this, xsize, ysize, zsize, realToComplex));
 }
 
+int MetalContext::findLegalFFTDimension(int minimum) {
+    return MetalFFT3D::findLegalDimension(minimum);
+}
+
 vector<ComputeContext*> MetalContext::getAllContexts() {
     vector<ComputeContext*> result;
     for (MetalContext* c : platformData.contexts)
