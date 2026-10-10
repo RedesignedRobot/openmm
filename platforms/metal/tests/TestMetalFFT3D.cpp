@@ -124,6 +124,9 @@ int main(int argc, char* argv[]) {
         testTransform<mm_float2>(true, 32, 33, 33);
         testTransform<mm_float2>(true, 32, 33, 39);
         testTransform<mm_float2>(true, 32, 39, 39);
+        testTransform<mm_float2>(true, 26, 26, 25);
+        testTransform<mm_float2>(true, 55, 55, 55);
+        testTransform<mm_float2>(false, 22, 24, 24);
     }
     catch(const exception& e) {
         cout << "exception: " << e.what() << endl;
