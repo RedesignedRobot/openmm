@@ -405,8 +405,12 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     }
     if (!compilationDefines.empty())
         src << endl;
-    if (useMixedPrecision)
+    if (useMixedPrecision) {
+        // The program's own defines come after this header, too late for df64 to see.
+        if (defines.find("DF64_FINITE") != defines.end())
+            src << "#define DF64_FINITE\n";
         src << MetalKernelSources::df64 << endl;
+    }
     string mixedType = (useMixedPrecision ? "double" : "float");
     src << "typedef float real;\n";
     src << "typedef float2 real2;\n";
