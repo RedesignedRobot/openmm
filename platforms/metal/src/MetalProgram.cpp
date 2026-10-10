@@ -28,7 +28,7 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalProgram::MetalProgram(MetalContext& context, MTL::Library* library) : context(context), library(library) {
+MetalProgram::MetalProgram(MetalContext& context, MTL::Library* library, bool packValues) : context(context), library(library), packValues(packValues) {
 }
 
 ComputeKernel MetalProgram::createKernel(const string& name) {
@@ -49,5 +49,5 @@ ComputeKernel MetalProgram::createKernel(const string& name) {
         throw OpenMMException(message);
     }
     pool->release();
-    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name));
+    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name, packValues));
 }

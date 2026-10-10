@@ -329,7 +329,13 @@ ComputeSort MetalContext::createSort(ComputeSortImpl::SortTrait* trait, unsigned
     return shared_ptr<ComputeSortImpl>(new MetalSort(*this, trait, length, uniform));
 }
 
-static string rewriteKernelArgs(const string& source) {
+/**
+ * Rewrite the value arguments of every kernel.  Normally each one becomes a reference to constant memory.  Metal
+ * allows only 31 buffer bindings per kernel, so with packValues they are instead removed from the signature and read
+ * from one block of 32 byte slots, in the order they are declared.  Preprocessor lines are copied into the code that
+ * reads them, so a value in a branch that is compiled out takes no slot.
+ */
+static string rewriteKernelArgs(const string& source, bool packValues) {
     static regex kernelMatcher("KERNEL void[\\s\\S]*?\\(([\\s\\S]*?)\\)");
     static regex argMatcher("\\#.*|[^,\\s#][^\\,#]*[^,\\s#]*");
     static regex wordMatcher("[^\\s]+");
@@ -350,6 +356,8 @@ static string rewriteKernelArgs(const string& source) {
         pos = kernelMatch.position(1)+argList.size();
         sregex_iterator nextArg(argList.begin(), argList.end(), argMatcher);
         bool addComma = false;
+        stringstream prologue;
+        prologue << "constant uchar* _mmNextValue = _mmValues;\n";
         while (nextArg != end) {
             smatch argMatch = *nextArg;
             string arg = argMatch.str();
@@ -361,6 +369,19 @@ static string rewriteKernelArgs(const string& source) {
             }
             else if (arg[0] == '#') {
                 result << "\n" << arg << "\n";
+                prologue << arg << "\n";
+            }
+            else if (packValues) {
+                vector<string> words;
+                sregex_iterator nextWord(arg.begin(), arg.end(), wordMatcher);
+                for (; nextWord != end; ++nextWord)
+                    if (nextWord->str() != "const")
+                        words.push_back(nextWord->str());
+                string type;
+                for (int i = 0; i < (int) words.size()-1; i++)
+                    type += (i > 0 ? " " : "")+words[i];
+                prologue << "const " << type << " " << words.back() << " = *(constant " << type << "*) _mmNextValue;\n";
+                prologue << "_mmNextValue += " << sizeof(mm_double4) << ";\n";
             }
             else {
                 // This is a primitive value.  We need to transform it into reference to constant memory.
@@ -385,6 +406,14 @@ static string rewriteKernelArgs(const string& source) {
                 }
             }
             ++nextArg;
+        }
+        if (packValues) {
+            if (addComma)
+                result << ", ";
+            result << "constant uchar* _mmValues";
+            size_t brace = source.find('{', pos);
+            result << source.substr(pos, brace+1-pos) << "\n" << prologue.str();
+            pos = brace+1;
         }
         ++nextKernel;
     }
@@ -430,9 +459,9 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     }
     if (!defines.empty())
         src << endl;
-    src << rewriteKernelArgs(source) << endl;
+    string header = src.str();
 
-    // Compile the program.
+    // Compile the program.  If a kernel has more than 31 arguments, try again with its value arguments packed.
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
@@ -442,14 +471,23 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
 #ifdef ENABLE_PRINTF
     options->setEnableLogging(true);
 #endif
-    NS::Error* error = nullptr;
-    MTL::Library* library = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
+    MTL::Library* library = nullptr;
+    string errorString;
+    bool packValues = false;
+    for (int attempt = 0; attempt < 2 && library == nullptr; attempt++) {
+        packValues = (attempt == 1);
+        if (packValues && errorString.find("resource location available") == string::npos)
+            break;
+        string fullSource = header+rewriteKernelArgs(source, packValues)+"\n";
+        NS::Error* error = nullptr;
+        library = device->newLibrary(NS::String::string(fullSource.c_str(), NS::UTF8StringEncoding), options, &error);
+        errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
+    }
     options->release();
-    string errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
     pool->release();
     if (library == nullptr)
         throw OpenMMException("Error compiling program: "+errorString);
-    return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library));
+    return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library, packValues));
 }
 
 string MetalContext::doubleToString(double value, bool mixedIsDouble) const {
