@@ -150,6 +150,19 @@ void MetalAtomReorder::checkForNaN() {
     }
 }
 
+bool MetalAtomReorder::discardNaN() {
+    context.getCurrentStream().finish();
+    int& flag = *(int*) nanFlag->getDevicePointer()->contents();
+    bool pending = (flag != 0);
+    flag = 0;
+    return pending;
+}
+
+void MetalAtomReorder::restoreNaN() {
+    context.getCurrentStream().finish();
+    *(int*) nanFlag->getDevicePointer()->contents() = 1;
+}
+
 bool MetalAtomReorder::hasUsableTables() {
     if (tablesVersion != context.getMoleculeGroupsVersion())
         buildTables();

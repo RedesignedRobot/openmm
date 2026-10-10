@@ -42,6 +42,15 @@ public:
     bool hasUsableTables();
     void prepareScale();
     void scaleCoordinates(MetalArray& scaleFactor);
+    /**
+     * Drop a pending NaN report, once queued reorders have finished, and return whether there was one.  A
+     * checkpoint load replaces the positions it refers to.
+     */
+    bool discardNaN();
+    /**
+     * Restore a report discardNaN() dropped, when the load that was to replace the positions fails.
+     */
+    void restoreNaN();
 private:
     friend class MetalHostRobustnessAccess;
     bool buildTables();

@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
 
 using namespace OpenMM;
 using namespace std;
@@ -53,6 +54,10 @@ public:
     }
     static bool deviceOrderPending(MetalContext& cc) {
         return reorder(cc).hostStale;
+    }
+    static bool nanPending(MetalContext& cc) {
+        cc.getCurrentStream().finish();
+        return *(int*) reorder(cc).nanFlag->getDevicePointer()->contents() != 0;
     }
     static int tablesVersion(MetalContext& cc) {
         return reorder(cc).tablesVersion;
@@ -280,6 +285,65 @@ static void testNaNRecovery() {
     integrator.step(100);
     ASSERT(isfinite(context.getState(State::Positions | State::Energy).getPotentialEnergy()));
     cout << "NaN recovery: device reorder submitted, device permutation changed, finite forces and 100 steps" << endl;
+}
+
+static void expectNaN(Context& context) {
+    try {
+        context.getState(State::Positions);
+    }
+    catch (const OpenMMException& e) {
+        if (string(e.what()).find("NaN") == string::npos)
+            throw;
+        return;
+    }
+    throw OpenMMException("NaN positions were not reported");
+}
+
+static void testNaNRollback() {
+    System system;
+    vector<Vec3> positions;
+    makeWater(system, positions);
+    VerletIntegrator integrator(0.0001);
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    context.setVelocities(vector<Vec3>(positions.size()));
+    double saved = context.getState(State::Energy).getPotentialEnergy();
+    stringstream checkpoint, wrongPrecision;
+    context.createCheckpoint(checkpoint);
+    MetalContext& cc = platform.metal(context);
+    {
+        VerletIntegrator otherIntegrator(0.0001);
+        Context other(system, otherIntegrator, platform, {{MetalPlatform::MetalPrecision(), cc.getUseMixedPrecision() ? "single" : "mixed"}});
+        other.setPositions(positions);
+        other.createCheckpoint(wrongPrecision);
+    }
+    vector<Vec3> invalid = positions;
+    invalid[0][0] = numeric_limits<double>::quiet_NaN();
+    cc.forceReorder();
+    context.setPositions(invalid);
+    ASSERT(MetalHostRobustnessAccess::nanPending(cc));
+    // A load that fails before replacing the positions keeps the report.
+    try {
+        context.loadCheckpoint(wrongPrecision);
+        throw OpenMMException("A checkpoint with the wrong precision loaded");
+    }
+    catch (const OpenMMException& e) {
+        ASSERT(string(e.what()).find("numeric precision") != string::npos);
+    }
+    ASSERT(MetalHostRobustnessAccess::nanPending(cc));
+    // The load replaces the flagged positions, so it must restore cleanly.
+    context.loadCheckpoint(checkpoint);
+    State restored = context.getState(State::Positions | State::Energy);
+    ASSERT_EQUAL_TOL(saved, restored.getPotentialEnergy(), 1e-5);
+    for (int i = 0; i < (int) positions.size(); i++)
+        ASSERT_EQUAL_VEC(positions[i], restored.getPositions()[i], 1e-5);
+    integrator.step(100);
+    ASSERT(isfinite(context.getState(State::Energy).getPotentialEnergy()));
+    // A NaN with no load after it is still reported.
+    cc.forceReorder();
+    context.setPositions(invalid);
+    expectNaN(context);
+    cout << "NaN rollback: failed load kept the report, checkpoint restored over it, 100 steps, later NaN reported" << endl;
 }
 
 static void testMemory() {
@@ -522,7 +586,7 @@ int main(int argc, char* argv[]) {
     platform.setPropertyDefaultValue(MetalPlatform::MetalPrecision(), precision);
     platform.setPropertyDefaultValue("DeterministicForces", "true");
     int failures = 0;
-    for (auto test : vector<pair<string, function<void()>>>{{"nonleader movement", testNonleaderMovement}, {"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", [] { testAdaptiveReorder(false); testAdaptiveReorder(true); }}}) {
+    for (auto test : vector<pair<string, function<void()>>>{{"nonleader movement", testNonleaderMovement}, {"overflow", testOverflow}, {"NaN recovery", testNaNRecovery}, {"NaN rollback", testNaNRollback}, {"memory", testMemory}, {"context cleanup", [] { testConstructorCleanup(false); }}, {"FFT cleanup", [] { testConstructorCleanup(true); }}, {"adaptive reorder", [] { testAdaptiveReorder(false); testAdaptiveReorder(true); }}}) {
         if (argc > 2 && (string(argv[2]) == "audit" ? test.first == "adaptive reorder" : string(argv[2]) != test.first))
             continue;
         try {
