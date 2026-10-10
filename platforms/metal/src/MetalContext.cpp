@@ -473,7 +473,9 @@ MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
 
 int MetalContext::computeThreadBlockSize(double memory) const {
     int maxShared = 32768;
-    int max = (int) (maxShared/memory);
+    // Metal stores a three component vector in the space of four, so more local memory gets used
+    // than we calculate by adding up the sizes of the fields.  To be safe, include a factor of 0.5.
+    int max = (int) (0.5*maxShared/memory);
     if (max < 64)
         return 32;
     int threads = 64;
