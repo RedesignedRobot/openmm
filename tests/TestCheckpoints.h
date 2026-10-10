@@ -27,15 +27,23 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.                                     *
  * -------------------------------------------------------------------------- */
 
+#ifdef WIN32
+  #define _USE_MATH_DEFINES // Needed to get M_PI
+#endif
 #include "openmm/internal/AssertionUtilities.h"
 #include "openmm/AndersenThermostat.h"
 #include "openmm/Context.h"
+#include "openmm/CustomIntegrator.h"
 #include "openmm/LangevinIntegrator.h"
+#include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/VerletIntegrator.h"
 #include "sfmt/SFMT.h"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -266,6 +274,122 @@ void testLangevin() {
     integrator.step(10);
     State s4 = context.getState(State::Positions | State::Velocities | State::Parameters);
     compareStates(s2, s4);
+}
+
+void assertBitwiseEqual(const vector<Vec3>& expected, const vector<Vec3>& found, const string& quantity, int step) {
+    double maxDiff = 0;
+    for (int i = 0; i < expected.size(); i++)
+        for (int j = 0; j < 3; j++)
+            maxDiff = max(maxDiff, fabs(expected[i][j]-found[i][j]));
+    if (maxDiff != 0) {
+        stringstream message;
+        message << quantity << " differ at step " << step << ", max difference " << maxDiff;
+        throw OpenMMException(message.str());
+    }
+}
+
+Integrator* createResumeIntegrator(bool custom) {
+    if (custom) {
+        // Velocity Verlet, which reuses the forces from the end of the previous step.
+
+        CustomIntegrator* integrator = new CustomIntegrator(0.002);
+        integrator->addPerDofVariable("x1", 0);
+        integrator->addUpdateContextState();
+        integrator->addComputePerDof("v", "v+0.5*dt*f/m");
+        integrator->addComputePerDof("x", "x+dt*v");
+        integrator->addComputePerDof("x1", "x");
+        integrator->addConstrainPositions();
+        integrator->addComputePerDof("v", "v+0.5*dt*f/m+(x-x1)/dt");
+        integrator->addConstrainVelocities();
+        return integrator;
+    }
+    LangevinMiddleIntegrator* integrator = new LangevinMiddleIntegrator(300.0, 1.0, 0.002);
+    integrator->setRandomNumberSeed(5);
+    return integrator;
+}
+
+/**
+ * A Context that loads a checkpoint should compute exactly the same forces as the Context
+ * that wrote it, and both should then follow the same trajectory.  This needs a platform
+ * whose forces are deterministic.  The box must be large enough that a neighbor list doesn't
+ * hold every atom, or lists built at different steps are always the same.
+ */
+void testResumeIsExact(bool customIntegrator) {
+    const int gridSize = 13;
+    const double boxSize = 4.0;
+    const double spacing = boxSize/gridSize;
+    const double angle = 104.52*M_PI/180;
+    System system;
+    system.setDefaultPeriodicBoxVectors(Vec3(boxSize, 0, 0), Vec3(0, boxSize, 0), Vec3(0, 0, boxSize));
+    NonbondedForce* nonbonded = new NonbondedForce();
+    system.addForce(nonbonded);
+    nonbonded->setNonbondedMethod(NonbondedForce::PME);
+    nonbonded->setCutoffDistance(0.9);
+    vector<Vec3> positions;
+    vector<pair<int, int> > bonds;
+    for (int i = 0; i < gridSize; i++)
+        for (int j = 0; j < gridSize; j++)
+            for (int k = 0; k < gridSize; k++) {
+                int oxygen = system.addParticle(15.999);
+                system.addParticle(1.008);
+                system.addParticle(1.008);
+                nonbonded->addParticle(-0.834, 0.31507524, 0.635968);
+                nonbonded->addParticle(0.417, 1.0, 0.0);
+                nonbonded->addParticle(0.417, 1.0, 0.0);
+                Vec3 pos(i*spacing, j*spacing, k*spacing);
+                positions.push_back(pos);
+                positions.push_back(pos+Vec3(0.09572, 0, 0));
+                positions.push_back(pos+Vec3(0.09572*cos(angle), 0.09572*sin(angle), 0));
+                system.addConstraint(oxygen, oxygen+1, 0.09572);
+                system.addConstraint(oxygen, oxygen+2, 0.09572);
+                system.addConstraint(oxygen+1, oxygen+2, 0.15139);
+                bonds.push_back(make_pair(oxygen, oxygen+1));
+                bonds.push_back(make_pair(oxygen, oxygen+2));
+            }
+    nonbonded->createExceptionsFromBonds(bonds, 0.0, 0.0);
+    map<string, string> properties;
+    vector<string> names = platform.getPropertyNames();
+    if (find(names.begin(), names.end(), "DeterministicForces") != names.end())
+        properties["DeterministicForces"] = "true";
+    unique_ptr<Integrator> integrator(createResumeIntegrator(customIntegrator));
+    Context context(system, *integrator, platform, properties);
+    context.setPositions(positions);
+    context.setVelocitiesToTemperature(300.0, 5);
+    integrator->step(50);
+
+    // The Context only rebuilds its neighbor list when atoms have moved far enough, so most steps
+    // use a list built at an earlier step.  Write a checkpoint after each of several steps, load
+    // it into a new Context, and compare the forces.
+
+    for (int step = 1; step <= 20; step++) {
+        integrator->step(1);
+        stringstream checkpoint(ios_base::out | ios_base::in | ios_base::binary);
+        context.createCheckpoint(checkpoint);
+        unique_ptr<Integrator> integrator2(createResumeIntegrator(customIntegrator));
+        Context context2(system, *integrator2, platform, properties);
+        context2.loadCheckpoint(checkpoint);
+        State s1 = context.getState(State::Positions | State::Forces);
+        State s2 = context2.getState(State::Positions | State::Forces);
+        assertBitwiseEqual(s1.getPositions(), s2.getPositions(), "Positions", step);
+        assertBitwiseEqual(s1.getForces(), s2.getForces(), "Forces", step);
+    }
+
+    // Write one more checkpoint, continue both simulations without querying either Context,
+    // and see if the trajectories are identical.
+
+    integrator->step(1);
+    stringstream checkpoint(ios_base::out | ios_base::in | ios_base::binary);
+    context.createCheckpoint(checkpoint);
+    unique_ptr<Integrator> integrator2(createResumeIntegrator(customIntegrator));
+    Context context2(system, *integrator2, platform, properties);
+    context2.loadCheckpoint(checkpoint);
+    integrator->step(100);
+    integrator2->step(100);
+    State s1 = context.getState(State::Positions | State::Velocities | State::Forces);
+    State s2 = context2.getState(State::Positions | State::Velocities | State::Forces);
+    assertBitwiseEqual(s1.getPositions(), s2.getPositions(), "Positions", 121);
+    assertBitwiseEqual(s1.getVelocities(), s2.getVelocities(), "Velocities", 121);
+    assertBitwiseEqual(s1.getForces(), s2.getForces(), "Forces", 121);
 }
 
 void runPlatformTests();
