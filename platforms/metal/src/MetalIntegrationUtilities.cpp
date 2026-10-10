@@ -131,7 +131,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         return false;
     ContextSelector selector(context);
     if (!langevinMiddleKernel) {
-        // Each thread handles one unit: a SETTLE cluster, a SHAKE cluster, or an atom in neither.
+        // Each unit is a SETTLE cluster, a SHAKE cluster, or free atoms: one per thread, or four per quad of threads.
 
         int numAtoms = context.getNumAtoms();
         vector<bool> isConstrained(numAtoms, false);
@@ -156,19 +156,31 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         for (int i = 0; i < numAtoms; i++)
             if (!isConstrained[i])
                 unconstrained.push_back(i);
-        if (unconstrained.size() > 0) {
+        int numFree = unconstrained.size();
+        int numFreeQuads = (numFree+3)/4;
+        if (numFree > 0) {
+            unconstrained.resize(4*numFreeQuads, -1);
             freeAtoms.initialize<int>(context, unconstrained.size(), "freeAtoms");
             freeAtoms.upload(unconstrained);
         }
+
+        // The kernel is latency bound: a thread's chain of dependent operations sets its time, not the thread count.
+        // A quad of threads per unit runs the per-atom work four wide, at the cost of running the constraint code in
+        // all four lanes.  That pays only while all the quads fit in one pass of the grid execute() launches.  Past
+        // that, each quad runs several units in sequence and pays the redundant constraint work in full.
+        int numQuadUnits = numSettle+numShake+numFreeQuads;
+        bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
+
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
-        numLangevinMiddleUnits = numSettle+numShake+unconstrained.size();
-        langevinMiddleKernel = program->createKernel("integrateLangevinMiddleFused");
+        int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
+        numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
+        langevinMiddleKernel = program->createKernel(useQuads ? "integrateLangevinMiddleFusedQuads" : "integrateLangevinMiddleFused");
         langevinMiddleKernel->addArg(numSettle);
         langevinMiddleKernel->addArg(numShake);
-        langevinMiddleKernel->addArg(numLangevinMiddleUnits);
+        langevinMiddleKernel->addArg(numUnits);
         langevinMiddleKernel->addArg(context.getPaddedNumAtoms());
         langevinMiddleKernel->addArg(tol);
         langevinMiddleKernel->addArg(context.getPosq());
@@ -193,6 +205,6 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
     langevinMiddleKernel->setArg(4, tol);
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
-    langevinMiddleKernel->execute(numLangevinMiddleUnits);
+    langevinMiddleKernel->execute(numLangevinMiddleThreads);
     return true;
 }

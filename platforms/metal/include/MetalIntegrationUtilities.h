@@ -60,7 +60,7 @@ private:
     MetalArray ccmaConvergedBuffer;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
-    int numLangevinMiddleUnits;
+    int numLangevinMiddleThreads;
 };
 
 } // namespace OpenMM
