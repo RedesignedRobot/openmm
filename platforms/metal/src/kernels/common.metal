@@ -113,5 +113,18 @@ inline float erfc(float x) {
 }
 
 inline float erf(float x) {
-    return 1.0-erfc(x);
+    // 1-erfc(x) has an absolute error near 1.5e-7, which is far too large when x is small.  PME exclusions
+    // subtract nearly equal terms at small r, which happens with Drude particles, so use a series there.
+
+    if (fabs(x) < 0.5f) {
+        float x2 = x*x;
+        return 1.1283791671f*x*(1.0f+x2*(-1.0f/3.0f+x2*(1.0f/10.0f+x2*(-1.0f/42.0f+x2*(1.0f/216.0f+x2*(-1.0f/1320.0f+x2*(1.0f/9360.0f)))))));
+    }
+    return 1.0f-erfc(x);
+}
+
+inline float remainder(float x, float y) {
+    // Metal has fmod but not the IEEE remainder that CUDA and OpenCL provide.
+
+    return x-y*rint(x/y);
 }
