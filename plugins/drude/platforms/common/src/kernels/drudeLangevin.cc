@@ -4,8 +4,9 @@
 
 KERNEL void integrateDrudeLangevinPart1(GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed4* RESTRICT posDelta,
         GLOBAL const int* RESTRICT normalParticles, GLOBAL const int2* RESTRICT pairParticles, GLOBAL const mixed2* RESTRICT dt, mixed vscale, mixed fscale,
-        mixed noisescale, mixed vscaleDrude, mixed fscaleDrude, mixed noisescaleDrude, GLOBAL const float4* RESTRICT random, unsigned int randomIndex) {
+        mixed noisescale, mixed vscaleDrude, mixed fscaleDrude, mixed noisescaleDrude, GLOBAL const float4* RESTRICT random, unsigned int startRandomIndex) {
     mixed stepSize = dt[0].y;
+    unsigned int randomIndex = startRandomIndex;
     
     // Update normal particles.
 
