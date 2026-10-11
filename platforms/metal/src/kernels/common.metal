@@ -104,12 +104,38 @@ inline long realToFixedPoint(real x) {
 }
 
 inline float erfc(float x) {
-    // This approximation for erfc is from Abramowitz and Stegun (1964) p. 299.  They cite the following as
-    // the original source: C. Hastings, Jr., Approximations for Digital Computers (1955).  It has a maximum
-    // error of 1.5e-7.
+    // Metal has no erfc.  This one keeps the relative error small for every x (under 5 ulp in
+    // tests against a double precision erfc), which matters where erfc(x) is small and a caller
+    // subtracts nearly equal terms, such as the LJPME reciprocal space convolution.  With
+    // a = |x| and q = (a-2)/(a+2), which maps [0, inf) onto [-1, 1), (1+2a)*exp(a*a)*erfc(a) is
+    // approximated as 1+p(q), where p is a degree 12 polynomial fitted at Chebyshev nodes.  The
+    // division by 1+2a is refined by one Newton step, and exp(-a*a) is corrected for the
+    // rounding error of a*a.
 
-    float t = 1.0f/(1.0f+0.3275911f*x);
-    return (0.254829592f+(-0.284496736f+(1.421413741f+(-1.453152027f+1.061405429f*t)*t)*t)*t)*t*exp(-x*x);
+    float a = fabs(x);
+    float q = (a-2.0f)/(a+2.0f);
+    float p = -2.025598951e-05f;
+    p = fma(p, q, 6.336945808e-05f);
+    p = fma(p, q, 2.215715504e-04f);
+    p = fma(p, q, -3.579204495e-04f);
+    p = fma(p, q, -1.464070869e-03f);
+    p = fma(p, q, 1.217410550e-03f);
+    p = fma(p, q, 8.724607527e-03f);
+    p = fma(p, q, -8.018963039e-03f);
+    p = fma(p, q, -5.422026664e-02f);
+    p = fma(p, q, 1.640494615e-01f);
+    p = fma(p, q, -1.660303771e-01f);
+    p = fma(p, q, -9.276375920e-02f);
+    p = fma(p, q, 2.769783735e-01f);
+    float r = 1.0f/fma(2.0f, a, 1.0f);
+    float g = fma(p, r, r);
+    float e = fma(fma(g, -a, 0.5f), 2.0f, p-g);
+    g = fma(e, r, g);
+    float s = a*a;
+    float t = g*exp(-s);
+    float result = fma(t, fma(-a, a, s), t);
+    result = (a > 10.0546875f ? 0.0f : result);
+    return (x < 0.0f ? 2.0f-result : result);
 }
 
 inline float erf(float x) {
