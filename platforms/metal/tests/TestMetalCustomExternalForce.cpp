@@ -31,5 +31,39 @@
 #include "TestCustomExternalForce.h"
 #include "sfmt/SFMT.h"
 
+void testErfAccuracy() {
+    // Metal has no erf or erfc, so the platform supplies its own.  Check erfc's relative error over the
+    // whole range, including negative arguments and arguments where erfc is tiny, and erf's absolute
+    // error.  Each particle's y force is -scale*f(x), with scale chosen to make it close to -1 for erfc,
+    // so fixed point force accumulation keeps its relative precision.
+
+    for (bool isErfc : {true, false}) {
+        System system;
+        CustomExternalForce* force = new CustomExternalForce(isErfc ? "y*scale*erfc(x)" : "y*scale*erf(x)");
+        force->addPerParticleParameter("scale");
+        system.addForce(force);
+        vector<Vec3> positions;
+        vector<double> expected;
+        for (int i = -640; i <= 640; i++) {
+            float x = i/64.0f;
+            double value = (isErfc ? erfc((double) x) : erf((double) x));
+            if (isErfc && value < 1e-30)
+                continue;
+            double scale = (isErfc ? 1.0/value : 1.0);
+            system.addParticle(1.0);
+            force->addParticle(positions.size(), {scale});
+            positions.push_back(Vec3(x, 0.5, 0));
+            expected.push_back(-scale*value);
+        }
+        VerletIntegrator integrator(0.001);
+        Context context(system, integrator, platform);
+        context.setPositions(positions);
+        State state = context.getState(State::Forces);
+        for (int i = 0; i < (int) positions.size(); i++)
+            ASSERT_EQUAL_TOL(expected[i], state.getForces()[i][1], isErfc ? 1e-6 : 3e-7);
+    }
+}
+
 void runPlatformTests() {
+    testErfAccuracy();
 }
