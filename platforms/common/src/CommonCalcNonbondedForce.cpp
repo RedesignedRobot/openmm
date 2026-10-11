@@ -139,9 +139,11 @@ private:
 
 class CommonCalcNonbondedForceKernel::PmePreComputation : public ComputeContext::ForcePreComputation {
 public:
-    PmePreComputation(ComputeContext& cc, Kernel& pme, CalcPmeReciprocalForceKernel::IO& io) : cc(cc), pme(pme), io(io) {
+    PmePreComputation(ComputeContext& cc, Kernel& pme, CalcPmeReciprocalForceKernel::IO& io, int forceGroup) : cc(cc), pme(pme), io(io), forceGroup(forceGroup) {
     }
     void computeForceAndEnergy(bool includeForces, bool includeEnergy, int groups) {
+        if ((groups&(1<<forceGroup)) == 0)
+            return;
         Vec3 boxVectors[3];
         cc.getPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
         pme.getAs<CalcPmeReciprocalForceKernel>().beginComputation(io, boxVectors, includeEnergy, true, false);
@@ -150,18 +152,22 @@ private:
     ComputeContext& cc;
     Kernel pme;
     CalcPmeReciprocalForceKernel::IO& io;
+    int forceGroup;
 };
 
 class CommonCalcNonbondedForceKernel::PmePostComputation : public ComputeContext::ForcePostComputation {
 public:
-    PmePostComputation(Kernel& pme, CalcPmeReciprocalForceKernel::IO& io) : pme(pme), io(io) {
+    PmePostComputation(Kernel& pme, CalcPmeReciprocalForceKernel::IO& io, int forceGroup) : pme(pme), io(io), forceGroup(forceGroup) {
     }
     double computeForceAndEnergy(bool includeForces, bool includeEnergy, int groups) {
+        if ((groups&(1<<forceGroup)) == 0)
+            return 0.0;
         return pme.getAs<CalcPmeReciprocalForceKernel>().finishComputation(io);
     }
 private:
     Kernel pme;
     CalcPmeReciprocalForceKernel::IO& io;
+    int forceGroup;
 };
 
 class CommonCalcNonbondedForceKernel::SyncQueuePreComputation : public ComputeContext::ForcePreComputation {
@@ -425,11 +431,16 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
                 try {
                     cpuPme = getPlatform().createKernel(CalcPmeReciprocalForceKernel::Name(), *cc.getContextImpl());
                     cpuPme.getAs<CalcPmeReciprocalForceKernel>().initialize(gridSizeX, gridSizeY, gridSizeZ, numParticles, {}, alpha, false);
-                    ComputeProgram program = cc.compileProgram(CommonKernelSources::pme, pmeDefines);
+                    map<string, string> replacements;
+                    replacements["CHARGE"] = "pos.w";
+                    ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonKernelSources::pme, replacements), pmeDefines);
                     ComputeKernel addForcesKernel = program->createKernel("addForces");
                     pmeio = new PmeIO(cc, addForcesKernel);
-                    cc.addPreComputation(new PmePreComputation(cc, cpuPme, *pmeio));
-                    cc.addPostComputation(new PmePostComputation(cpuPme, *pmeio));
+                    int recipForceGroup = force.getReciprocalSpaceForceGroup();
+                    if (recipForceGroup < 0)
+                        recipForceGroup = force.getForceGroup();
+                    cc.addPreComputation(new PmePreComputation(cc, cpuPme, *pmeio, recipForceGroup));
+                    cc.addPostComputation(new PmePostComputation(cpuPme, *pmeio, recipForceGroup));
                 }
                 catch (OpenMMException& ex) {
                     // The CPU PME plugin isn't available.
@@ -561,9 +572,10 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
         }
     }
 
-    // Add code to subtract off the reciprocal part of excluded interactions.
+    // Add code to subtract off the reciprocal part of excluded interactions.  The CPU PME kernel computes
+    // only the reciprocal space sum, so it needs these too.
 
-    if ((nonbondedMethod == Ewald || nonbondedMethod == PME || nonbondedMethod == LJPME) && pmeio == NULL) {
+    if (nonbondedMethod == Ewald || nonbondedMethod == PME || nonbondedMethod == LJPME) {
         int numContexts = cc.getNumContexts();
         int startIndex = cc.getContextIndex()*force.getNumExceptions()/numContexts;
         int endIndex = (cc.getContextIndex()+1)*force.getNumExceptions()/numContexts;
@@ -891,7 +903,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         }
     }
     double energy = 0.0;
-    if (includeReciprocal && (pmeGrid1.isInitialized() || cosSinSums.isInitialized())) {
+    if (includeReciprocal && (pmeGrid1.isInitialized() || cosSinSums.isInitialized() || pmeio != NULL)) {
         Vec3 a, b, c;
         cc.getPeriodicBoxVectors(a, b, c);
         double volume = a[0]*b[1]*c[2];
@@ -910,7 +922,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             // The Ewald self energy was computed in the kernel.
 
             energy = 0.0;
-            if ((pmeGrid1.isInitialized() || cosSinSums.isInitialized()) && includeReciprocal) {
+            if ((pmeGrid1.isInitialized() || cosSinSums.isInitialized() || pmeio != NULL) && includeReciprocal) {
                 // Invoke a kernel to compute the correction for the neutralizing plasma.
 
                 Vec3 a, b, c;
