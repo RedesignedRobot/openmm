@@ -3186,12 +3186,7 @@ void CommonIntegrateLangevinMiddleStepKernel::execute(ContextImpl& context, cons
 
     // Perform the integration.
 
-    kernel2->setArg(7, integration.prepareRandomNumbers(cc.getPaddedNumAtoms()));
-    kernel1->execute(numAtoms);
-    integration.applyVelocityConstraints(integrator.getConstraintTolerance());
-    kernel2->execute(numAtoms);
-    integration.applyConstraints(integrator.getConstraintTolerance());
-    kernel3->execute(numAtoms);
+    integrate(integrator.getConstraintTolerance());
     integration.computeVirtualSites();
 
     // Update the time and step count.
@@ -3203,6 +3198,17 @@ void CommonIntegrateLangevinMiddleStepKernel::execute(ContextImpl& context, cons
     // Reduce UI lag.
 
     flushPeriodically(cc);
+}
+
+void CommonIntegrateLangevinMiddleStepKernel::integrate(double tol) {
+    IntegrationUtilities& integration = cc.getIntegrationUtilities();
+    int numAtoms = cc.getNumAtoms();
+    kernel2->setArg(7, integration.prepareRandomNumbers(cc.getPaddedNumAtoms()));
+    kernel1->execute(numAtoms);
+    integration.applyVelocityConstraints(tol);
+    kernel2->execute(numAtoms);
+    integration.applyConstraints(tol);
+    kernel3->execute(numAtoms);
 }
 
 double CommonIntegrateLangevinMiddleStepKernel::computeKineticEnergy(ContextImpl& context, const LangevinMiddleIntegrator& integrator) {

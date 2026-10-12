@@ -110,7 +110,7 @@ KernelImpl* MetalKernelFactory::createKernelImpl(std::string name, const Platfor
     if (name == IntegrateVerletStepKernel::Name())
         return new CommonIntegrateVerletStepKernel(name, platform, mc);
     if (name == IntegrateLangevinMiddleStepKernel::Name())
-        return new CommonIntegrateLangevinMiddleStepKernel(name, platform, mc);
+        return new MetalIntegrateLangevinMiddleStepKernel(name, platform, mc);
     if (name == IntegrateBrownianStepKernel::Name())
         return new CommonIntegrateBrownianStepKernel(name, platform, mc);
     if (name == IntegrateVariableVerletStepKernel::Name())
