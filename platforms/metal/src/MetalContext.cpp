@@ -326,7 +326,12 @@ ComputeSort MetalContext::createSort(ComputeSortImpl::SortTrait* trait, unsigned
     return shared_ptr<ComputeSortImpl>(new MetalSort(*this, trait, length, uniform));
 }
 
-static string rewriteKernelArgs(const string& source) {
+/**
+ * Rewrite the arguments of every kernel.  Normally each primitive value becomes a reference to constant memory.
+ * Metal allows only 31 buffers per kernel, so with packArgs every argument except threadgroup memory is instead
+ * read from one buffer of 32 byte slots, with arrays passed by their GPU addresses.
+ */
+static string rewriteKernelArgs(const string& source, bool packArgs) {
     static regex kernelMatcher("KERNEL void[\\s\\S]*?\\(([\\s\\S]*?)\\)");
     static regex lineMatcher("[^\\s].*[^\\s]");
     static regex argMatcher("\\#.*|[^,\\s#][^\\,#]*[^,\\s#]*");
@@ -343,6 +348,9 @@ static string rewriteKernelArgs(const string& source) {
         result << source.substr(pos, kernelMatch.position(1)-pos);
         string argList = kernelMatch[1].str();
         pos = kernelMatch.position(1)+argList.size();
+        stringstream prologue;
+        if (packArgs)
+            result << "constant uchar* _mmArgs";
 
         // Loop over lines in the argument list.
 
@@ -350,6 +358,28 @@ static string rewriteKernelArgs(const string& source) {
         while (nextLine != end) {
             smatch lineMatch = *nextLine;
             string line = lineMatch.str();
+            if (packArgs) {
+                // Preprocessor lines go into both the signature and the prologue, so an argument that is
+                // compiled out takes no slot.
+
+                if (line[0] == '#') {
+                    result << "\n" << line << "\n";
+                    prologue << line << "\n";
+                }
+                else
+                    for (sregex_iterator nextArg(line.begin(), line.end(), argMatcher); nextArg != end; ++nextArg) {
+                        string arg = nextArg->str();
+                        if (arg.rfind("LOCAL", 0) == 0)
+                            result << ", " << arg;
+                        else {
+                            string type = arg.substr(0, arg.find_last_of(" *&")+1);
+                            prologue << arg << " = *(" << type << " constant*) _mmArgs;\n";
+                            prologue << "_mmArgs += " << sizeof(mm_double4) << ";\n";
+                        }
+                    }
+                ++nextLine;
+                continue;
+            }
             result << "\n";
             if (line[0] == ',')
                 result << ",";
@@ -394,6 +424,11 @@ static string rewriteKernelArgs(const string& source) {
                 result << ",";
             ++nextLine;
         }
+        if (packArgs) {
+            size_t brace = source.find('{', pos);
+            result << source.substr(pos, brace+1-pos) << "\n" << prologue.str();
+            pos = brace+1;
+        }
         ++nextKernel;
     }
     result << source.substr(pos, source.size()-pos);
@@ -431,9 +466,8 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     }
     if (!defines.empty())
         src << endl;
-    src << rewriteKernelArgs(source) << endl;
 
-    // Compile the program.
+    // Compile the program.  If a kernel needs more than 31 buffers, compile it again with its arguments packed.
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
@@ -444,13 +478,19 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     options->setEnableLogging(true);
 #endif
     NS::Error* error = nullptr;
-    MTL::Library* library = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
-    options->release();
+    bool packArgs = false;
+    MTL::Library* library = device->newLibrary(NS::String::string((src.str()+rewriteKernelArgs(source, false)).c_str(), NS::UTF8StringEncoding), options, &error);
     string errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
+    if (library == nullptr && errorString.find("resource location available") != string::npos) {
+        packArgs = true;
+        library = device->newLibrary(NS::String::string((src.str()+rewriteKernelArgs(source, true)).c_str(), NS::UTF8StringEncoding), options, &error);
+        errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
+    }
+    options->release();
     pool->release();
     if (library == nullptr)
         throw OpenMMException("Error compiling program: "+errorString);
-    return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library));
+    return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library, packArgs));
 }
 
 MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
