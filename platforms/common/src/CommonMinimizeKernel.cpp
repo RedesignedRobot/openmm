@@ -83,11 +83,13 @@ void CommonMinimizeKernel::execute(ContextImpl& context, double tolerance, int m
         // Load system and integrator information.
 
         mixedIsDouble = cc.getUseMixedPrecision() || cc.getUseDoublePrecision();
-        if (mixedIsDouble && !cc.getSupports64BitGlobalAtomics()) {
-            throw OpenMMException("Double precision is not supported on devices that do not support 64 bit atomic operations");
-        }
+        twoPassReductions = mixedIsDouble && !cc.getSupports64BitGlobalAtomics();
         elementSize = mixedIsDouble ? sizeof(double) : sizeof(float);
         threadBlockSize = cc.getMaxThreadBlockSize();
+        reductionBlocks = min(cc.getNumThreadBlocks(), max(1, (numVariables+threadBlockSize-1)/threadBlockSize));
+        reductionBlocks = min(reductionBlocks, (int) cc.getEnergyBuffer().getSize()/4);
+        if (twoPassReductions && reductionBlocks == 0)
+            throw OpenMMException("Energy workspace is too small for minimizer reductions");
         pinnedMemory = cc.getPinnedBuffer();
 
         // Initialize all device-side arrays and compile kernels.
@@ -187,6 +189,13 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     defines["LBFGS_SCALE_UP"] = cc.doubleToString(stepScaleUp);
     defines["LBFGS_MIN_STEP"] = cc.doubleToString(minStep);
     defines["LBFGS_MAX_STEP"] = cc.doubleToString(maxStep);
+    if (twoPassReductions) {
+        // Keep the unused atomic helper compilable without 64-bit atomics.
+        defines["SINGLE_BLOCK_REDUCTIONS"] = "";
+        defines["TWO_PASS_REDUCTIONS"] = "";
+        defines["REDUCTION_BLOCKS"] = cc.intToString(reductionBlocks);
+        defines["REDUCTION_STRIDE"] = cc.intToString(numVectors+1);
+    }
 
     ComputeProgram program = cc.compileProgram(CommonKernelSources::minimize, defines);
 
@@ -368,6 +377,26 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchContinueKernel->addArg(gradNorm);
     lineSearchContinueKernel->addArg(lineSearchData);
 
+    if (twoPassReductions) {
+        // Force energy has already been reduced to the host before these
+        // reductions run. Reuse its workspace; the next force evaluation clears
+        // it through the usual autoclear path. This adds no device allocation.
+        if (numConstraints)
+            getConstraintEnergyForcesKernel->addArg(cc.getEnergyBuffer());
+        for (ComputeKernel kernel : {getScaleKernel, reinitializeDirKernel,
+                updateDirAlphaKernel, scaleDirKernel, updateDirBetaKernel, lineSearchSetupKernel,
+                lineSearchStepKernel, lineSearchDotKernel}) {
+            kernel->addArg(cc.getEnergyBuffer());
+        }
+        finishReductionKernel = program->createKernel("finishReduction");
+        finishReductionKernel->addArg(cc.getEnergyBuffer());
+        finishReductionKernel->addArg(returnValue);
+        finishReductionKernel->addArg(scale);
+        finishReductionKernel->addArg(alpha);
+        finishReductionKernel->addArg(lineSearchData);
+        finishReductionKernel->addArg(gradNorm);
+    }
+
     downloadStartEvent = cc.createEvent();
     downloadFinishEvent = cc.createEvent();
     downloadQueue = cc.createQueue();
@@ -405,12 +434,12 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
         // Prepare for a line search.
 
         energyStart = energy;
-        lineSearchSetupKernel->execute(numVariables);
+        executeReduction(lineSearchSetupKernel, numVariables);
 
         // Take line search steps.
 
         for (int count = 0;; count++) {
-            lineSearchStepKernel->execute(numVariables);
+            executeReduction(lineSearchStepKernel, numVariables);
 
             if (count) {
                 int hostReturnFlag = downloadReturnFlagFinish();
@@ -482,7 +511,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
             getScaleKernel->execute(threadBlockSize, threadBlockSize);
         }
         else {
-            getScaleKernel->execute(numVariables);
+            executeReduction(getScaleKernel, numVariables);
         }
 
         int limit = min(numVectors, iteration++);
@@ -493,7 +522,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
         reinitializeDirKernel->setArg(8, vectorIndex);
         reinitializeDirKernel->setArg(9, (int) largeGrad);
-        reinitializeDirKernel->execute(numVariables);
+        executeReduction(reinitializeDirKernel, numVariables);
 
         for (int vector = 0; vector < limit; vector++) {
             if (vector && --vectorIndex < 0) {
@@ -502,12 +531,12 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
             if (vector < limit - 1) {
                 updateDirAlphaKernel->setArg(7, vectorIndex);
-                updateDirAlphaKernel->execute(numVariables);
+                executeReduction(updateDirAlphaKernel, numVariables);
             }
         }
 
         scaleDirKernel->setArg(7, vectorIndex);
-        scaleDirKernel->execute(numVariables);
+        executeReduction(scaleDirKernel, numVariables);
 
         for (int vector = 0; vector < limit - 1; vector++) {
             // scaleDirKernel puts its first result in alpha[numVectors], so for the
@@ -515,7 +544,7 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
             updateDirBetaKernel->setArg(7, vectorIndex);
             updateDirBetaKernel->setArg(8, vector ? vectorIndex : numVectors);
-            updateDirBetaKernel->execute(numVariables);
+            executeReduction(updateDirBetaKernel, numVariables);
 
             if (++vectorIndex >= numVectors) {
                 vectorIndex -= numVectors;
@@ -559,7 +588,7 @@ void CommonMinimizeKernel::evaluateGpu(ContextImpl& context) {
         else {
             getConstraintEnergyForcesKernel->setArg(8, (float) kRestraint);
         }
-        getConstraintEnergyForcesKernel->execute(numConstraints);
+        executeReduction(getConstraintEnergyForcesKernel, numConstraints);
     }
 
     // Convert the forces from fixed to floating point format.  If they are too
@@ -749,6 +778,16 @@ double CommonMinimizeKernel::downloadGradNormSync() {
     }
 }
 
+void CommonMinimizeKernel::executeReduction(ComputeKernel& kernel, int numThreads) {
+    if (twoPassReductions) {
+        kernel->execute(reductionBlocks*threadBlockSize, threadBlockSize);
+        finishReductionKernel->execute(2*threadBlockSize, threadBlockSize);
+    }
+    else {
+        kernel->execute(numThreads);
+    }
+}
+
 void CommonMinimizeKernel::runLineSearchKernels() {
     if (mixedIsDouble) {
         lineSearchDotKernel->setArg(6, isfinite(energy) ? energy - energyStart : (double) std::numeric_limits<float>::max());
@@ -756,6 +795,6 @@ void CommonMinimizeKernel::runLineSearchKernels() {
     else {
         lineSearchDotKernel->setArg(6, isfinite((float) energy) ? (float) (energy - energyStart) : std::numeric_limits<float>::max());
     }
-    lineSearchDotKernel->execute(numVariables);
+    executeReduction(lineSearchDotKernel, numVariables);
     lineSearchContinueKernel->execute(1);
 }
