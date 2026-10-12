@@ -1531,6 +1531,39 @@ void testComputedValues(int mode) {
     }
 }
 
+void testComputedValuesWithoutGlobals() {
+    // Computed values that depend only on per-particle parameters, with no global parameters.
+
+    int numParticles = 10;
+    System system;
+    VerletIntegrator integrator(0.01);
+    CustomNonbondedForce* nb1 = new CustomNonbondedForce("4*eps*((sigma/r)^12-(sigma/r)^6); sigma=0.5*(sigma1+sigma2); eps=sqrt(eps1*eps2); sigma1=0.5*(sigmaA1+sigmaB1); sigma2=0.5*(sigmaA2+sigmaB2)");
+    CustomNonbondedForce* nb2 = new CustomNonbondedForce("4*eps*((sigma/r)^12-(sigma/r)^6); sigma=0.5*(sigma1+sigma2); eps=sqrt(eps1*eps2)");
+    nb2->addComputedValue("sigma", "0.5*(sigmaA+sigmaB)");
+    for (int model = 0; model < 2; model++) {
+        CustomNonbondedForce* force = (model == 0 ? nb1 : nb2);
+        force->addPerParticleParameter("sigmaA");
+        force->addPerParticleParameter("sigmaB");
+        force->addPerParticleParameter("eps");
+        force->setForceGroup(model);
+        for (int i = 0; i < numParticles; i++)
+            force->addParticle({0.2+0.01*i, 0.3-0.01*i, 1.0+0.1*i});
+        system.addForce(force);
+    }
+    vector<Vec3> positions(numParticles);
+    for (int i = 0; i < numParticles; i++) {
+        system.addParticle(1.0);
+        positions[i] = Vec3(0.3*i, 0.1*(i%3), 0.05*(i%2));
+    }
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    State state1 = context.getState(State::Energy | State::Forces, false, 1<<0);
+    State state2 = context.getState(State::Energy | State::Forces, false, 1<<1);
+    ASSERT_EQUAL_TOL(state1.getPotentialEnergy(), state2.getPotentialEnergy(), 1e-5);
+    for (int i = 0; i < numParticles; i++)
+        ASSERT_EQUAL_VEC(state1.getForces()[i], state2.getForces()[i], 1e-5);
+}
+
 void testParallelComputation() {
     System system;
     const int numParticles = 200;
@@ -1619,6 +1652,7 @@ int main(int argc, char* argv[]) {
         testComputedValues(0); // No cutoff
         testComputedValues(1); // Cutoff, periodic
         testComputedValues(2); // Interaction groups
+        testComputedValuesWithoutGlobals();
         runPlatformTests();
     }
     catch(const exception& e) {
