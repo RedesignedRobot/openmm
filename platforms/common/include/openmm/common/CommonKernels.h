@@ -969,11 +969,19 @@ public:
      * @param integrator the LangevinMiddleIntegrator this kernel is being used for
      */
     double computeKineticEnergy(ContextImpl& context, const LangevinMiddleIntegrator& integrator);
-private:
+protected:
+    /**
+     * Update the positions and velocities, and enforce the constraints.
+     *
+     * @param tol    the constraint tolerance
+     */
+    virtual void integrate(double tol);
     ComputeContext& cc;
+    ComputeArray params;
+private:
     double prevTemp, prevFriction, prevStepSize;
     bool hasInitializedKernels;
-    ComputeArray params, oldDelta;
+    ComputeArray oldDelta;
     ComputeKernel kernel1, kernel2, kernel3;
 };
 
