@@ -1,3 +1,11 @@
+#ifdef TWO_PASS_REDUCTIONS
+#define INIT_REDUCTION if (LOCAL_ID == 0) { partials[2*REDUCTION_BLOCKS+GROUP_ID] = -1; partials[3*REDUCTION_BLOCKS+GROUP_ID] = -1; }
+#define REDUCTION_ADD(target, value, destination, slot) { partials[(slot)*REDUCTION_BLOCKS+GROUP_ID] = (value); partials[((slot)+2)*REDUCTION_BLOCKS+GROUP_ID] = (destination); }
+#else
+#define INIT_REDUCTION
+#define REDUCTION_ADD(target, value, destination, slot) atomicAddMixed(target, value)
+#endif
+
 #define LS_DOT_START 0
 #define LS_DOT 1
 #define LS_STEP 2
@@ -122,7 +130,11 @@ DEVICE mixed reduceMax(mixed value, LOCAL_ARG volatile mixed* temp) {
 }
 
 DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
-#if defined(__CUDA_ARCH__) || defined(USE_HIP)
+#if defined(SINGLE_BLOCK_REDUCTIONS)
+
+    *target += value;
+
+#elif defined(__CUDA_ARCH__) || defined(USE_HIP)
 
     // Do atomic addition of floating-point values directly
     atomicAdd(target, value);
@@ -257,7 +269,12 @@ KERNEL void getConstraintEnergyForces(
     const int numPadded,
     const int numConstraints,
     const mixed kRestraint
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     const mixed scale = 0x100000000;
@@ -288,7 +305,7 @@ KERNEL void getConstraintEnergyForces(
     energy = reduceAdd(energy, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(returnValue, energy);
+        REDUCTION_ADD(returnValue, energy, 0, 0);
     }
 }
 
@@ -430,7 +447,12 @@ KERNEL void getScale(
     const int numVariables,
     const int end,
     const int largeGrad
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     // This kernel is expected to be executed in a single thread block if
     // largeGrad is non-zero (if we are using the fallback for large values).
 
@@ -477,8 +499,8 @@ KERNEL void getScale(
         gradGrad = reduceAdd(gradGrad, temp);
 
         if (LOCAL_ID == 0) {
-            atomicAddMixed(&scale[end], xGrad);
-            atomicAddMixed(returnValue, gradGrad);
+            REDUCTION_ADD(&scale[end], xGrad, REDUCTION_STRIDE+end, 0);
+            REDUCTION_ADD(returnValue, gradGrad, 0, 1);
         }
     }
 
@@ -501,7 +523,12 @@ KERNEL void reinitializeDir(
     const int numVariables,
     const int vectorIndex,
     const int largeGrad
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag) {
@@ -525,7 +552,7 @@ KERNEL void reinitializeDir(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex], vectorAlpha / scale[vectorIndex]);
+        REDUCTION_ADD(&alpha[vectorIndex], vectorAlpha / scale[vectorIndex], 2*REDUCTION_STRIDE+vectorIndex, 0);
     }
 }
 
@@ -538,7 +565,12 @@ KERNEL void updateDirAlpha(
     GLOBAL const int* RESTRICT returnFlag,
     const int numVariables,
     const int vectorIndex1
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag) {
@@ -558,7 +590,7 @@ KERNEL void updateDirAlpha(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex2], vectorAlpha / scale[vectorIndex2]);
+        REDUCTION_ADD(&alpha[vectorIndex2], vectorAlpha / scale[vectorIndex2], 2*REDUCTION_STRIDE+vectorIndex2, 0);
     }
 }
 
@@ -571,7 +603,12 @@ KERNEL void scaleDir(
     GLOBAL const mixed* RESTRICT returnValue,
     const int numVariables,
     const int vectorIndex
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag) {
@@ -593,7 +630,7 @@ KERNEL void scaleDir(
         // Store the result in an extra slot alpha[NUM_VECTORS] instead of using
         // alpha[vectorIndex] since other blocks might still need to read it.
 
-        atomicAddMixed(&alpha[NUM_VECTORS], (GLOBAL_ID == 0 ? innerScale : 0) - vectorBeta / scale[vectorIndex]);
+        REDUCTION_ADD(&alpha[NUM_VECTORS], (GLOBAL_ID == 0 ? innerScale : 0) - vectorBeta / scale[vectorIndex], 2*REDUCTION_STRIDE+NUM_VECTORS, 0);
     }
 }
 
@@ -607,7 +644,12 @@ KERNEL void updateDirBeta(
     const int numVariables,
     const int vectorIndex1,
     const int vectorIndexAlpha
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag) {
@@ -627,7 +669,7 @@ KERNEL void updateDirBeta(
     vectorBeta = reduceAdd(vectorBeta, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex2], -vectorBeta / scale[vectorIndex2]);
+        REDUCTION_ADD(&alpha[vectorIndex2], -vectorBeta / scale[vectorIndex2], 2*REDUCTION_STRIDE+vectorIndex2, 0);
     }
 }
 
@@ -669,7 +711,12 @@ KERNEL void lineSearchSetup(
     GLOBAL mixed* RESTRICT gradNorm,
     GLOBAL mixed* RESTRICT lineSearchData,
     const int numVariables
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     for (int i = GLOBAL_ID; i < numVariables; i += GLOBAL_SIZE) {
@@ -687,7 +734,7 @@ KERNEL void lineSearchSetup(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&lineSearchData[LS_DOT_START], result);
+        REDUCTION_ADD(&lineSearchData[LS_DOT_START], result, 3*REDUCTION_STRIDE+LS_DOT_START, 0);
     }
 
     if (GLOBAL_ID == 0) {
@@ -707,7 +754,12 @@ KERNEL void lineSearchStep(
     GLOBAL mixed* RESTRICT lineSearchData,
     GLOBAL mixed* RESTRICT lineSearchDataBackup,
     const int numVariables
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag == LS_FAIL) {
@@ -727,7 +779,7 @@ KERNEL void lineSearchStep(
         norm = reduceAdd(norm, temp);
 
         if (LOCAL_ID == 0) {
-            atomicAddMixed(gradNorm, norm);
+            REDUCTION_ADD(gradNorm, norm, 4*REDUCTION_STRIDE, 0);
         }
 
         return;
@@ -768,7 +820,12 @@ KERNEL void lineSearchDot(
     GLOBAL const mixed* RESTRICT returnValue,
     const int numVariables,
     mixed deltaEnergy
+#ifdef TWO_PASS_REDUCTIONS
+    , GLOBAL mixed* RESTRICT partials
+#endif
 ) {
+    INIT_REDUCTION
+
     LOCAL volatile mixed temp[TEMP_SIZE];
 
     if (*returnFlag == LS_FAIL) {
@@ -798,7 +855,7 @@ KERNEL void lineSearchDot(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&lineSearchData[LS_DOT], result);
+        REDUCTION_ADD(&lineSearchData[LS_DOT], result, 3*REDUCTION_STRIDE+LS_DOT, 0);
     }
 }
 
@@ -839,3 +896,31 @@ KERNEL void lineSearchContinue(
         *returnFlag = LS_SUCCEED;
     }
 }
+
+#ifdef TWO_PASS_REDUCTIONS
+// A dispatch boundary makes every block's partial visible. Each group owns one
+// output, so even devices without global 64-bit atomics can reduce in parallel.
+KERNEL void finishReduction(GLOBAL const mixed* RESTRICT partials,
+        GLOBAL mixed* RESTRICT result, GLOBAL mixed* RESTRICT scale, GLOBAL mixed* RESTRICT alpha,
+        GLOBAL mixed* RESTRICT lineSearchData, GLOBAL mixed* RESTRICT gradNorm) {
+    LOCAL mixed temp[TEMP_SIZE];
+    int offset = GROUP_ID*REDUCTION_BLOCKS;
+    mixed targetValue = partials[2*REDUCTION_BLOCKS+offset];
+    int target = (int) targetValue;
+    mixed sum = 0;
+    for (int i = LOCAL_ID; i < REDUCTION_BLOCKS; i += LOCAL_SIZE)
+        if (partials[2*REDUCTION_BLOCKS+offset+i] >= 0)
+            sum += partials[offset+i];
+    sum = reduceAdd(sum, temp);
+    if (LOCAL_ID == 0 && target >= 0) {
+        int index = target%REDUCTION_STRIDE;
+        switch (target/REDUCTION_STRIDE) {
+            case 0: result[index] += sum; break;
+            case 1: scale[index] += sum; break;
+            case 2: alpha[index] += sum; break;
+            case 3: lineSearchData[index] += sum; break;
+            case 4: gradNorm[index] += sum; break;
+        }
+    }
+}
+#endif
