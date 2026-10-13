@@ -74,7 +74,9 @@ void MetalUpdateStateDataKernel::setVelocities(ContextImpl& context, const std::
 }
 
 void MetalCalcNonbondedForceKernel::initialize(const System& system, const NonbondedForce& force) {
-    commonInitialize(system, force, !mc.getPlatformData().useCpuPme, false, mc.getPlatformData().deterministicForces, mc.getPlatformData().useCpuPme);
+    // With LJPME, spreading the dispersion grid in the order sorted for the charge grid costs less than sorting the
+    // atoms again (and the charge grid sort can then skip every other step, as it does without LJPME).
+    commonInitialize(system, force, !mc.getPlatformData().useCpuPme, false, mc.getPlatformData().deterministicForces, mc.getPlatformData().useCpuPme, false);
 }
 
 void MetalCalcConstantPotentialForceKernel::initialize(const System& system, const ConstantPotentialForce& force) {
