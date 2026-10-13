@@ -230,6 +230,11 @@ KERNEL void computeNonbonded(
         return; // There wasn't enough memory for the neighbor list.
     int pos = (int) (warp*(mm_long)numTiles/totalWarps);
     int end = (int) ((warp+1)*(mm_long)numTiles/totalWarps);
+
+    // Each warp takes a contiguous range of tiles, and findBlocksWithInteractions stores an x block's tiles in
+    // contiguous chunks, so the forces on the x atoms can stay in registers until x changes.  That saves three 64 bit
+    // atomic adds per tile.  They are summed in fixed point, so the result is identical to writing every tile separately.
+    mm_long xForceX = 0, xForceY = 0, xForceZ = 0;
 #else
     int pos = (int) (startTileIndex+warp*numTileIndices/totalWarps);
     int end = (int) (startTileIndex+(warp+1)*numTileIndices/totalWarps);
@@ -395,9 +400,21 @@ KERNEL void computeNonbonded(
 
             // Write results.
 #ifdef INCLUDE_FORCES
+#ifdef USE_NEIGHBOR_LIST
+            xForceX += realToFixedPoint(force.x);
+            xForceY += realToFixedPoint(force.y);
+            xForceZ += realToFixedPoint(force.z);
+            if (pos+1 == end || tiles[pos+1] != x) {
+                ATOMIC_ADD(&forceBuffers[atom1], static_cast<mm_ulong>(xForceX));
+                ATOMIC_ADD(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<mm_ulong>(xForceY));
+                ATOMIC_ADD(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<mm_ulong>(xForceZ));
+                xForceX = xForceY = xForceZ = 0;
+            }
+#else
             ATOMIC_ADD(&forceBuffers[atom1], static_cast<mm_ulong>(realToFixedPoint(force.x)));
             ATOMIC_ADD(&forceBuffers[atom1+PADDED_NUM_ATOMS], static_cast<mm_ulong>(realToFixedPoint(force.y)));
             ATOMIC_ADD(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], static_cast<mm_ulong>(realToFixedPoint(force.z)));
+#endif
 #ifdef USE_NEIGHBOR_LIST
             unsigned int atom2 = atomIndices[LOCAL_ID];
 #else
