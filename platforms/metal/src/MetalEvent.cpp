@@ -29,7 +29,9 @@
 using namespace OpenMM;
 
 MetalEvent::MetalEvent(MetalContext& context) : context(context), event(nullptr), currentBuffer(nullptr), value(0) {
-    event = context.getDevice().newSharedEvent();
+    // Only command buffers wait on this event (wait() blocks on the command buffer), so it doesn't need to be a
+    // MTLSharedEvent. A queue waiting on a MTLSharedEvent starts 80 to 170 us after the signal, on a MTLEvent within 12 us.
+    event = context.getDevice().newEvent();
     if (event == nullptr)
         throw OpenMMException("Error creating Metal event");
 }
