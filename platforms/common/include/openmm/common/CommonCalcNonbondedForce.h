@@ -57,8 +57,10 @@ public:
      * @param deviceIsCpu  whether the device this calculation is running on is a CPU
      * @param useFixedPointChargeSpreading  whether PME charge spreading should be done in fixed point or floating point
      * @param useCpuPme    whether to perform the PME reciprocal space calculation on the CPU
+     * @param sortDispersionAtoms  with LJPME, whether to sort atoms again by dispersion grid index every step, or to
+     *                     reuse the order sorted for the charge grid
      */
-    void commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue, bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme);
+    void commonInitialize(const System& system, const NonbondedForce& force, bool usePmeQueue, bool deviceIsCpu, bool useFixedPointChargeSpreading, bool useCpuPme, bool sortDispersionAtoms=true);
     /**
      * Execute the kernel to calculate the forces and/or energy.
      *
@@ -168,7 +170,7 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
-    bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme;
+    bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme, sortDispersionAtoms;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;
