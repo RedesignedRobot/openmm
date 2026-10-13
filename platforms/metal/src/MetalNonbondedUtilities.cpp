@@ -530,9 +530,13 @@ ComputeKernel MetalNonbondedUtilities::createInteractionKernel(const string& sou
     }
     replacements["LOAD_ATOM1_PARAMETERS"] = load1.str();
 
+    // The neighbor list pads tiles with atom index NUM_ATOMS, which equals PADDED_NUM_ATOMS when the
+    // number of atoms is a multiple of the tile size.  Clamp the index so the load stays in bounds.
+    // Those interactions are excluded, so the value read doesn't matter.
+
     stringstream load2g;
     for (const ComputeParameterInfo& param : params)
-        load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[atom2];\n";
+        load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[min(atom2, PADDED_NUM_ATOMS-1)];\n";
     replacements["LOAD_ATOM2_PARAMETERS_FROM_GLOBAL"] = load2g.str();
 
     stringstream initDerivs;
