@@ -65,6 +65,14 @@ public:
      */
     void execute(int threads, int blockSize=-1);
     /**
+     * Execute this kernel with as many thread blocks as it takes to cover the requested threads.  Unlike execute(),
+     * this does not limit the number of thread blocks to what the context uses by default.
+     *
+     * @param threads      the number of threads to use
+     * @param blockSize    the number of threads in each thread block
+     */
+    void executeFlat(int threads, int blockSize);
+    /**
      * Set the amount of local (i.e. threadgroup) memory that should be dynamically allocated to each group when this
      * kernel is invoked.
      *
@@ -107,6 +115,7 @@ protected:
      */
     void setPrimitiveArg(int index, const void* value, int size);
 private:
+    void dispatch(int gridSize, int blockSize);
     MetalContext& context;
     MTL::ComputePipelineState* pipeline;
     std::string name;

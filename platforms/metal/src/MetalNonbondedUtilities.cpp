@@ -25,6 +25,7 @@
 #include "MetalNonbondedUtilities.h"
 #include "MetalArray.h"
 #include "MetalContext.h"
+#include "MetalKernel.h"
 #include "MetalKernelSources.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/common/CommonKernelUtilities.h"
@@ -54,8 +55,8 @@ MetalNonbondedUtilities::MetalNonbondedUtilities(MetalContext& context) : contex
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
-    numForceThreadBlocks = 6*context.getNumGPUCores();
-    forceThreadBlockSize = 256;
+    numForceThreadBlocks = 40*context.getNumGPUCores();
+    forceThreadBlockSize = 64;
 
     // When building the neighbor list, we can optionally use large blocks (1024 atoms) to
     // accelerate the process.  This makes building the neighbor list faster, but it prevents
@@ -319,7 +320,7 @@ void MetalNonbondedUtilities::computeInteractions(int forceGroups, bool includeF
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         if (useCutoff)
             setPeriodicBoxArgs(context, kernel, 9);
-        kernel->execute(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        dynamic_cast<MetalKernel&>(*kernel).executeFlat(numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
     }
     if (useNeighborList && numTiles > 0) {
         event->wait();

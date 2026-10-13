@@ -49,6 +49,16 @@ int MetalKernel::getMaxBlockSize() const {
 }
 
 void MetalKernel::execute(int threads, int blockSize) {
+    if (blockSize == -1)
+        blockSize = MetalContext::ThreadBlockSize;
+    dispatch(min((threads+blockSize-1)/blockSize, context.getNumThreadBlocks()), blockSize);
+}
+
+void MetalKernel::executeFlat(int threads, int blockSize) {
+    dispatch((threads+blockSize-1)/blockSize, blockSize);
+}
+
+void MetalKernel::dispatch(int gridSize, int blockSize) {
     MetalQueue& queue = dynamic_cast<MetalQueue&>(*context.getCurrentQueue());
     MTL::ComputeCommandEncoder& encoder = queue.getEncoder();
     encoder.setComputePipelineState(pipeline);
@@ -62,9 +72,6 @@ void MetalKernel::execute(int threads, int blockSize) {
     }
     if (dynamicLocal > 0)
         encoder.setThreadgroupMemoryLength(dynamicLocal, 0);
-    if (blockSize == -1)
-        blockSize = MetalContext::ThreadBlockSize;
-    int gridSize = min((threads+blockSize-1)/blockSize, context.getNumThreadBlocks());
     encoder.dispatchThreadgroups(MTL::Size(gridSize, 1, 1), MTL::Size(blockSize, 1, 1));
 }
 
