@@ -61,7 +61,7 @@ void MetalKernel::execute(int threads, int blockSize) {
             encoder.setBytes(&primitiveArgs[i], primitiveArgSizes[i], i);
     }
     if (dynamicLocal > 0)
-        encoder.setThreadgroupMemoryLength(dynamicLocal, 0);
+        encoder.setThreadgroupMemoryLength((dynamicLocal+15)&~15, 0); // Metal requires a multiple of 16 bytes
     if (blockSize == -1)
         blockSize = MetalContext::ThreadBlockSize;
     int gridSize = min((threads+blockSize-1)/blockSize, context.getNumThreadBlocks());
