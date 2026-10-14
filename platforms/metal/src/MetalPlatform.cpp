@@ -39,17 +39,20 @@
 #include <cctype>
 #include <sstream>
 #include <cstdio>
+#include <sys/sysctl.h>
 
 using namespace OpenMM;
 using namespace std;
 
 #ifdef OPENMM_COMMON_BUILDING_STATIC_LIBRARY
 extern "C" void registerMetalPlatform() {
-    Platform::registerPlatform(new MetalPlatform());
+    if (MetalPlatform::isPlatformSupported())
+        Platform::registerPlatform(new MetalPlatform());
 }
 #else
 extern "C" void registerPlatforms() {
-    Platform::registerPlatform(new MetalPlatform());
+    if (MetalPlatform::isPlatformSupported())
+        Platform::registerPlatform(new MetalPlatform());
 }
 #endif
 
@@ -113,6 +116,20 @@ double MetalPlatform::getSpeed() const {
 
 bool MetalPlatform::supportsDoublePrecision() const {
     return false;
+}
+
+bool MetalPlatform::isPlatformSupported() {
+    // Kernels are compiled at run time as MSL 3.2, which needs macOS 15 (Darwin 24) or later.
+    // The library can be built for older versions, so check at run time.
+
+    char str[256];
+    size_t size = sizeof(str);
+    if (sysctlbyname("kern.osrelease", str, &size, NULL, 0) != 0)
+        return false;
+    int major;
+    if (sscanf(str, "%d", &major) != 1)
+        return false;
+    return (major >= 24);
 }
 
 const string& MetalPlatform::getPropertyValue(const Context& context, const string& property) const {
