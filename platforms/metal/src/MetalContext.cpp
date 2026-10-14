@@ -106,7 +106,9 @@ MetalContext::MetalContext(const System& system, const string& precision, MetalP
 
     numGpuCores = -1;
     io_iterator_t iterator;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"), &iterator) == KERN_SUCCESS) {
+    // MACH_PORT_NULL selects the default main port.  It is what kIOMainPortDefault is defined as, but that name
+    // needs the macOS 12 SDK.
+    if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("AGXAccelerator"), &iterator) == KERN_SUCCESS) {
         io_object_t entry;
         while ((entry = IOIteratorNext(iterator)) != 0) {
             CFTypeRef value = IORegistryEntryCreateCFProperty(entry, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
