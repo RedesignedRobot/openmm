@@ -2,7 +2,7 @@
  * Perform the first step of Langevin integration.
  */
 
-KERNEL void integrateDrudeLangevinPart1(GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed4* RESTRICT posDelta,
+KERNEL void integrateDrudeLangevinPart1(GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, GLOBAL mixed4s* RESTRICT posDelta,
         GLOBAL const int* RESTRICT normalParticles, GLOBAL const int2* RESTRICT pairParticles, GLOBAL const mixed2* RESTRICT dt, mixed vscale, mixed fscale,
         mixed noisescale, mixed vscaleDrude, mixed fscaleDrude, mixed noisescaleDrude, GLOBAL const float4* RESTRICT random, unsigned int startRandomIndex) {
     mixed stepSize = dt[0].y;
@@ -69,7 +69,7 @@ KERNEL void integrateDrudeLangevinPart1(GLOBAL mixed4* RESTRICT velm, GLOBAL con
  * Perform the second step of Langevin integration.
  */
 
-KERNEL void integrateDrudeLangevinPart2(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL const mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT velm, GLOBAL const mixed2* RESTRICT dt) {
+KERNEL void integrateDrudeLangevinPart2(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL const mixed4s* RESTRICT posDelta, GLOBAL mixed4s* RESTRICT velm, GLOBAL const mixed2* RESTRICT dt) {
 #ifdef SUPPORTS_DOUBLE_PRECISION
     double invStepSize = 1.0/dt[0].y;
 #else
@@ -108,7 +108,7 @@ KERNEL void integrateDrudeLangevinPart2(GLOBAL real4* RESTRICT posq, GLOBAL real
 /**
  * Apply hard wall constraints
  */
-KERNEL void applyHardWallConstraints(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT velm,
+KERNEL void applyHardWallConstraints(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT velm,
         GLOBAL const int2* RESTRICT pairParticles, GLOBAL const mixed2* RESTRICT dt, mixed maxDrudeDistance, mixed hardwallscaleDrude) {
     mixed stepSize = dt[0].y;
     for (int i = GLOBAL_ID; i < NUM_PAIRS; i += GLOBAL_SIZE) {

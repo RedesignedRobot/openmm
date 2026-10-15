@@ -32,8 +32,9 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name, bool packArgs) :
-        context(context), pipeline(pipeline), name(name), dynamicLocal(0), packArgs(packArgs) {
+MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name, bool packArgs,
+        const vector<BufferLayout>& layouts) : context(context), pipeline(pipeline), name(name), dynamicLocal(0), packArgs(packArgs),
+        layouts(layouts) {
 }
 
 MetalKernel::~MetalKernel() {
@@ -53,6 +54,12 @@ void MetalKernel::execute(int threads, int blockSize) {
     MTL::ComputeCommandEncoder& encoder = queue.getEncoder();
     encoder.setComputePipelineState(pipeline);
     int numArgs = arrayArgs.size();
+    for (int i = 0; i < numArgs && i < layouts.size(); i++) {
+        // A float pair array read as doubles, or the reverse, would give garbage, so catch a kernel that was missed.
+        if (arrayArgs[i] != NULL && layouts[i] != AnyLayout && arrayArgs[i]->getPairStorage() != (layouts[i] == PairLayout))
+            throw OpenMMException("Kernel "+name+" argument "+to_string(i)+": array "+arrayArgs[i]->getName()+
+                    (arrayArgs[i]->getPairStorage() ? " stores float pairs, but the argument isn't mixed4s" : " doesn't store float pairs, but the argument is mixed4s"));
+    }
     if (packArgs) {
         // There are too many arguments to pass individually, so we need to pack all of them into a single argument.
 

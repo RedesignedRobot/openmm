@@ -33,6 +33,9 @@ using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system) {
         ccmaConvergedBuffer.initialize<int>(context, 1, "ccmaConvergedBuffer");
+        // posDelta shares kernels and raw copies with velm, so it stores float pairs too.  The zeros the base class
+        // uploaded read the same either way.
+        context.unwrap(posDelta).setPairStorage(context.getUseMixedPrecision());
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {

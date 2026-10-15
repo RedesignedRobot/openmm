@@ -537,12 +537,14 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
         src << "typedef double2 mixed2;\n";
         src << "typedef double3 mixed3;\n";
         src << "typedef double4 mixed4;\n";
+        src << "typedef double4 mixed4s;\n";
     }
     else {
         src << "typedef float mixed;\n";
         src << "typedef float2 mixed2;\n";
         src << "typedef float3 mixed3;\n";
         src << "typedef float4 mixed4;\n";
+        src << "typedef float4 mixed4s;\n";
     }
     src << "typedef unsigned int tileflags;\n";
     src << HipKernelSources::common << endl;

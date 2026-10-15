@@ -2,7 +2,7 @@
  * Apply the Andersen thermostat to adjust particle velocities.
  */
 
-KERNEL void applyAndersenThermostat(int numAtoms, float collisionFrequency, float kT, GLOBAL mixed4* velm, real stepSize, GLOBAL const float4* RESTRICT random,
+KERNEL void applyAndersenThermostat(int numAtoms, float collisionFrequency, float kT, GLOBAL mixed4s* velm, real stepSize, GLOBAL const float4* RESTRICT random,
         unsigned int randomIndex, GLOBAL const int* RESTRICT atomGroups) {
     float collisionProbability = (float) (1-EXP(-collisionFrequency*stepSize));
     float randomRange = (float) erf(collisionProbability/SQRT(2.0f));

@@ -46,7 +46,13 @@ public:
      * @param name         the name of the kernel function
      * @param packArgs     whether this kernel needs to have all its arguments packed into a single argument
      */
-    MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const std::string& name, bool packArgs);
+    /**
+     * How a buffer argument reads memory: as ordinary values, as float pairs (a mixed4s buffer in mixed precision),
+     * or as raw 32 bit words that work with either, as the clear kernels do.
+     */
+    enum BufferLayout {PlainLayout, PairLayout, AnyLayout};
+    MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const std::string& name, bool packArgs,
+            const std::vector<BufferLayout>& layouts = std::vector<BufferLayout>());
     ~MetalKernel();
     /**
      * Get the name of this kernel.
@@ -116,6 +122,7 @@ private:
     std::vector<MetalArray*> arrayArgs;
     int dynamicLocal;
     bool packArgs;
+    std::vector<BufferLayout> layouts;
 };
 
 } // namespace OpenMM

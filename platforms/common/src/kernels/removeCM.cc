@@ -2,7 +2,7 @@
  * Calculate the center of mass momentum.
  */
 
-KERNEL void calcCenterOfMassMomentum(int numAtoms, GLOBAL const mixed4* RESTRICT velm, GLOBAL float4* RESTRICT cmMomentum) {
+KERNEL void calcCenterOfMassMomentum(int numAtoms, GLOBAL const mixed4s* RESTRICT velm, GLOBAL float4* RESTRICT cmMomentum) {
     LOCAL float4 temp[64];
     float4 cm = make_float4(0);
     for (int index = GLOBAL_ID; index < numAtoms; index += GLOBAL_SIZE) {
@@ -42,7 +42,7 @@ KERNEL void calcCenterOfMassMomentum(int numAtoms, GLOBAL const mixed4* RESTRICT
  * Remove center of mass motion.
  */
 
-KERNEL void removeCenterOfMassMomentum(int numAtoms, GLOBAL mixed4* RESTRICT velm, GLOBAL const float4* RESTRICT cmMomentum) {
+KERNEL void removeCenterOfMassMomentum(int numAtoms, GLOBAL mixed4s* RESTRICT velm, GLOBAL const float4* RESTRICT cmMomentum) {
     // First sum all of the momenta that were calculated by individual groups.
 
     LOCAL float4 temp[64];

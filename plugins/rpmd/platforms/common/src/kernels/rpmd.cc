@@ -188,7 +188,7 @@ KERNEL void advanceVelocities(GLOBAL mixed4* velm, GLOBAL mm_long* force, mixed 
 /**
  * Copy a set of positions and velocities from the integrator's arrays to the context.
  */
-KERNEL void copyDataToContext(GLOBAL mixed4* srcVel, GLOBAL mixed4* dstVel, GLOBAL mixed4* srcPos, GLOBAL real4* dstPos, GLOBAL int* order, int copy) {
+KERNEL void copyDataToContext(GLOBAL mixed4* srcVel, GLOBAL mixed4s* dstVel, GLOBAL mixed4* srcPos, GLOBAL real4* dstPos, GLOBAL int* order, int copy) {
     const int base = copy*PADDED_NUM_ATOMS;
     for (int particle = GLOBAL_ID; particle < NUM_ATOMS; particle += GLOBAL_SIZE) {
         int index = base+order[particle];
@@ -203,7 +203,7 @@ KERNEL void copyDataToContext(GLOBAL mixed4* srcVel, GLOBAL mixed4* dstVel, GLOB
 /**
  * Copy a set of positions, velocities, and forces from the context to the integrator's arrays.
  */
-KERNEL void copyDataFromContext(GLOBAL mm_long* srcForce, GLOBAL mm_long* dstForce, GLOBAL mixed4* srcVel, GLOBAL mixed4* dstVel,
+KERNEL void copyDataFromContext(GLOBAL mm_long* srcForce, GLOBAL mm_long* dstForce, GLOBAL mixed4s* srcVel, GLOBAL mixed4* dstVel,
         GLOBAL real4* srcPos, GLOBAL mixed4* dstPos, GLOBAL int* order, int copy) {
     const int base = copy*PADDED_NUM_ATOMS;
     for (int particle = GLOBAL_ID; particle < NUM_ATOMS; particle += GLOBAL_SIZE) {

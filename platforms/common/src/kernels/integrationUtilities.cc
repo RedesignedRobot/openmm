@@ -107,7 +107,7 @@ inline DEVICE void storePos(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT 
  * The peripheral atoms a cluster lacks get zeros.
  */
 inline DEVICE void loadShakeCluster(int4 atoms, GLOBAL const real4* RESTRICT oldPos, GLOBAL const real4* RESTRICT posqCorrection,
-        GLOBAL const mixed4* RESTRICT values, PRIVATE mixed4* pos, PRIVATE mixed4* value) {
+        GLOBAL const mixed4s* RESTRICT values, PRIVATE mixed4* pos, PRIVATE mixed4* value) {
     pos[0] = loadPos(oldPos, posqCorrection, atoms.x);
     value[0] = values[atoms.x];
     pos[1] = loadPos(oldPos, posqCorrection, atoms.y);
@@ -129,7 +129,7 @@ inline DEVICE void loadShakeCluster(int4 atoms, GLOBAL const real4* RESTRICT old
 /**
  * Store the displacements or velocities of the atoms in a SHAKE cluster.
  */
-inline DEVICE void storeShakeCluster(int4 atoms, GLOBAL mixed4* RESTRICT values, PRIVATE const mixed4* value) {
+inline DEVICE void storeShakeCluster(int4 atoms, GLOBAL mixed4s* RESTRICT values, PRIVATE const mixed4* value) {
     values[atoms.x] = value[0];
     values[atoms.y] = value[1];
     if (atoms.z != -1)
@@ -256,7 +256,7 @@ DEVICE void applyShakeToCluster(int4 atoms, float4 params, mixed tol, PRIVATE co
  * Enforce constraints on SHAKE clusters
  */
 KERNEL void applyShakeToPositions(int numClusters, mixed tol, GLOBAL const real4* RESTRICT oldPos,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL const int4* RESTRICT clusterAtoms, GLOBAL const float4* RESTRICT clusterParams
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL const int4* RESTRICT clusterAtoms, GLOBAL const float4* RESTRICT clusterParams
 #ifdef USE_MIXED_PRECISION
         , GLOBAL const real4* RESTRICT posqCorrection
 #endif
@@ -377,7 +377,7 @@ DEVICE void applyShakeToClusterVelocities(int4 atoms, float4 params, mixed tol, 
  * Enforce velocity constraints on SHAKE clusters
  */
 KERNEL void applyShakeToVelocities(int numClusters, mixed tol, GLOBAL const real4* RESTRICT oldPos,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL const int4* RESTRICT clusterAtoms, GLOBAL const float4* RESTRICT clusterParams
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL const int4* RESTRICT clusterAtoms, GLOBAL const float4* RESTRICT clusterParams
 #ifdef USE_MIXED_PRECISION
         , GLOBAL const real4* RESTRICT posqCorrection
 #endif
@@ -617,7 +617,7 @@ DEVICE void applySettleToCluster(float2 params, mixed3 invMass, PRIVATE const mi
  * Enforce constraints on SETTLE clusters
  */
 KERNEL void applySettleToPositions(int numClusters, mixed tol, GLOBAL const real4* RESTRICT oldPos,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL const mixed4* RESTRICT velm, GLOBAL const int4* RESTRICT clusterAtoms,
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL const mixed4s* RESTRICT velm, GLOBAL const int4* RESTRICT clusterAtoms,
         GLOBAL const float2* RESTRICT clusterParams
 #ifdef USE_MIXED_PRECISION
         , GLOBAL const real4* RESTRICT posqCorrection
@@ -760,7 +760,7 @@ DEVICE void applySettleToClusterVelocities(PRIVATE const mixed4* pos, PRIVATE mi
  * Enforce velocity constraints on SETTLE clusters
  */
 KERNEL void applySettleToVelocities(int numClusters, mixed tol, GLOBAL const real4* RESTRICT oldPos,
-        GLOBAL mixed4* RESTRICT posDelta, GLOBAL mixed4* RESTRICT velm, GLOBAL const int4* RESTRICT clusterAtoms,
+        GLOBAL mixed4s* RESTRICT posDelta, GLOBAL mixed4s* RESTRICT velm, GLOBAL const int4* RESTRICT clusterAtoms,
         GLOBAL const float2* RESTRICT clusterParams
 #ifdef USE_MIXED_PRECISION
         , GLOBAL const real4* RESTRICT posqCorrection
@@ -832,7 +832,7 @@ KERNEL void computeCCMAConstraintDirectionsKernel(GLOBAL const int2* RESTRICT co
  * Compute the force applied by each CCMA position constraint.
  */
 DEVICE void computeCCMAPositionConstraintForce(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
-        GLOBAL const mixed4* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
+        GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         mixed tol, int iteration, LOCAL_ARG int* groupConverged) {
     if (LOCAL_ID == 0)
         *groupConverged = 1;
@@ -862,7 +862,7 @@ DEVICE void computeCCMAPositionConstraintForce(GLOBAL const int2* RESTRICT const
 }
 
 KERNEL void computeCCMAPositionConstraintForceKernel(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
-        GLOBAL const mixed4* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
+        GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         GLOBAL int* RESTRICT converged, GLOBAL int* RESTRICT hostConvergedFlag, mixed tol, int iteration) {
     LOCAL int groupConverged;
     if (converged[1-iteration%2]) {
@@ -883,7 +883,7 @@ KERNEL void computeCCMAPositionConstraintForceKernel(GLOBAL const int2* RESTRICT
  * Compute the force applied by each CCMA velocity constraint.
  */
 DEVICE void computeCCMAVelocityConstraintForce(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
-        GLOBAL const mixed4* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
+        GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         mixed tol, int iteration, LOCAL_ARG int* groupConverged) {
     if (LOCAL_ID == 0)
         *groupConverged = 1;
@@ -905,7 +905,7 @@ DEVICE void computeCCMAVelocityConstraintForce(GLOBAL const int2* RESTRICT const
 }
 
 KERNEL void computeCCMAVelocityConstraintForceKernel(GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL const mixed4* RESTRICT constraintDistance,
-        GLOBAL const mixed4* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
+        GLOBAL const mixed4s* RESTRICT atomPositions, GLOBAL const mixed* RESTRICT reducedMass, GLOBAL mixed* RESTRICT delta1,
         GLOBAL int* RESTRICT converged, GLOBAL int* RESTRICT hostConvergedFlag, mixed tol, int iteration) {
     LOCAL int groupConverged;
     if (converged[1-iteration%2]) {
@@ -952,7 +952,7 @@ KERNEL void multiplyByCCMAConstraintMatrixKernel(GLOBAL const mixed* RESTRICT de
  * Update the atom positions based on CCMA constraint forces.
  */
 DEVICE void updateCCMAAtomPositions(GLOBAL const int* RESTRICT atoms, GLOBAL const int* RESTRICT numAtomConstraints, GLOBAL const int* RESTRICT atomConstraints,
-        GLOBAL const mixed4* RESTRICT constraintDistance, GLOBAL mixed4* RESTRICT atomPositions, GLOBAL const mixed4* RESTRICT velm,
+        GLOBAL const mixed4* RESTRICT constraintDistance, GLOBAL mixed4s* RESTRICT atomPositions, GLOBAL const mixed4s* RESTRICT velm,
         GLOBAL const mixed* RESTRICT delta1, GLOBAL const mixed* RESTRICT delta2, int iteration) {
     mixed damping = (iteration < 2 ? 0.5f : 1.0f);
     for (int i = GLOBAL_ID; i < NUM_CCMA_ATOMS; i += GLOBAL_SIZE) {
@@ -978,7 +978,7 @@ DEVICE void updateCCMAAtomPositions(GLOBAL const int* RESTRICT atoms, GLOBAL con
 }
 
 KERNEL void updateCCMAAtomPositionsKernel(GLOBAL const int* RESTRICT atoms, GLOBAL const int* RESTRICT numAtomConstraints, GLOBAL const int* RESTRICT atomConstraints,
-        GLOBAL const mixed4* RESTRICT constraintDistance, GLOBAL mixed4* RESTRICT atomPositions, GLOBAL const mixed4* RESTRICT velm,
+        GLOBAL const mixed4* RESTRICT constraintDistance, GLOBAL mixed4s* RESTRICT atomPositions, GLOBAL const mixed4s* RESTRICT velm,
         GLOBAL const mixed* RESTRICT delta1, GLOBAL const mixed* RESTRICT delta2, GLOBAL int* RESTRICT converged, int iteration) {
     if (GROUP_ID == 0 && LOCAL_ID == 0)
         converged[1-iteration%2] = 1;
@@ -995,7 +995,7 @@ KERNEL void updateCCMAAtomPositionsKernel(GLOBAL const int* RESTRICT atoms, GLOB
  */
 KERNEL void runCCMA(int constrainVelocities, GLOBAL const int* RESTRICT atoms, GLOBAL const int* RESTRICT numAtomConstraints, GLOBAL const int* RESTRICT atomConstraints,
         GLOBAL const int2* RESTRICT constraintAtoms, GLOBAL mixed4* RESTRICT constraintDistance, GLOBAL const real4* RESTRICT atomPositions,
-        GLOBAL mixed4* RESTRICT velm, GLOBAL mixed4* RESTRICT posDelta, GLOBAL const mixed* RESTRICT reducedMass,
+        GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed4s* RESTRICT posDelta, GLOBAL const mixed* RESTRICT reducedMass,
         GLOBAL mixed* RESTRICT delta1, GLOBAL mixed* RESTRICT delta2, GLOBAL const int* RESTRICT constraintMatrixColumn,
         GLOBAL const mixed* RESTRICT constraintMatrixValue, mixed tol
 #ifdef USE_MIXED_PRECISION
@@ -1354,7 +1354,7 @@ KERNEL void saveDistributedForces(GLOBAL const mm_long* RESTRICT longForces, GLO
 /**
  * Apply a time shift to the velocities before computing kinetic energy.
  */
-KERNEL void timeShiftVelocities(GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, real timeShift) {
+KERNEL void timeShiftVelocities(GLOBAL mixed4s* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, real timeShift) {
     const mixed scale = timeShift/(mixed) 0x100000000;
     for (int index = GLOBAL_ID; index < NUM_ATOMS; index += GLOBAL_SIZE) {
         mixed4 velocity = velm[index];
@@ -1370,7 +1370,7 @@ KERNEL void timeShiftVelocities(GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_lo
 /**
  * Compute the total kinetic energy.
  */
-KERNEL void computeKineticEnergy(GLOBAL mixed4* RESTRICT velm, GLOBAL mixed* result) {
+KERNEL void computeKineticEnergy(GLOBAL mixed4s* RESTRICT velm, GLOBAL mixed* result) {
     LOCAL mixed tempBuffer[KE_WORK_GROUP_SIZE];
     mixed sum = 0;
     for (unsigned int index = LOCAL_ID; index < NUM_ATOMS; index += LOCAL_SIZE) {
