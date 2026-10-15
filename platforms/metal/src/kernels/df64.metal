@@ -264,7 +264,8 @@ inline df64 operator+(df64 a) { return a; }
 
 // An overflowed sum or product returns inf with a zero low part; unguarded, the two-sum makes it NaN.  A program whose
 // mixed values stay finite defines DF64_FINITE to drop these guards: finite results are unchanged, and the guards cost
-// about a fifth of the fused Langevin kernel, whose SHAKE sweeps are a serial chain of these operators.
+// about a fifth of the fused Langevin kernel, whose SHAKE sweeps are a serial chain of these operators.  MetalContext
+// defines it for every mixed program.
 #ifdef DF64_FINITE
 #define DF64_GUARD_OVERFLOW(v)
 #else

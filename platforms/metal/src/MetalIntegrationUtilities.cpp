@@ -171,10 +171,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         int numQuadUnits = numSettle+numShake+numFreeQuads;
         bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
 
-        // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
-        map<string, string> fusedDefines = defines;
-        fusedDefines["DF64_FINITE"] = "";
-        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
+        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, defines);
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
         langevinMiddleKernel = program->createKernel(useQuads ? "integrateLangevinMiddleFusedQuads" : "integrateLangevinMiddleFused");
