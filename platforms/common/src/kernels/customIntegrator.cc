@@ -30,7 +30,7 @@ KERNEL void computeDoubleSum(GLOBAL const double* RESTRICT sumBuffer, GLOBAL dou
 }
 #endif
 
-KERNEL void applyPositionDeltas(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT posDelta) {
+KERNEL void applyPositionDeltas(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4s* RESTRICT posDelta) {
     for (unsigned int index = GLOBAL_ID; index < NUM_ATOMS; index += GLOBAL_SIZE) {
 #ifdef USE_MIXED_PRECISION
         real4 pos1 = posq[index];

@@ -278,6 +278,7 @@ void MetalContext::initialize() {
         else
             ((mm_float4*) pinnedBuffer.data())[i] = mm_float4(0.0f, 0.0f, 0.0f, mass == 0.0 ? 0.0f : (float) (1.0/mass));
     }
+    unwrap(velm).setPairStorage(useMixedPrecision);
     velm.upload(pinnedBuffer.data());
     bonded->initialize(system);
     addAutoclearBuffer(longForceBuffer);
@@ -457,6 +458,8 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     src << "typedef " << mixedType << "2 mixed2;\n";
     src << "typedef " << mixedType << "3 mixed3;\n";
     src << "typedef " << mixedType << "4 mixed4;\n";
+    // mixed4s is the integration state (velm, posDelta) as stored: float pairs in mixed, with no IEEE decode.
+    src << (useMixedPrecision ? "typedef df64s_4 mixed4s;\n" : "typedef float4 mixed4s;\n");
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
     for (auto& pair : defines) {

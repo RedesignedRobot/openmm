@@ -28,6 +28,22 @@
 using namespace OpenMM;
 using namespace std;
 
+/**
+ * Get the layout a buffer argument reads, from its element type.
+ */
+static MetalKernel::BufferLayout getBufferLayout(MTL::BufferBinding* binding) {
+    MTL::DataType type = binding->bufferDataType();
+    if (type == MTL::DataTypeInt || type == MTL::DataTypeUInt)
+        return MetalKernel::AnyLayout;
+    if (type != MTL::DataTypeStruct)
+        return MetalKernel::PlainLayout;
+    // A df64s_4 element is the only struct whose member x is a struct with a member shi.
+    MTL::StructMember* x = binding->bufferStructType()->memberByName(NS::String::string("x", NS::UTF8StringEncoding));
+    if (x == nullptr || x->dataType() != MTL::DataTypeStruct)
+        return MetalKernel::PlainLayout;
+    return (x->structType()->memberByName(NS::String::string("shi", NS::UTF8StringEncoding)) != nullptr ? MetalKernel::PairLayout : MetalKernel::PlainLayout);
+}
+
 MetalProgram::MetalProgram(MetalContext& context, MTL::Library* library, bool packArgs) : context(context),
         library(library), packArgs(packArgs) {
 }
@@ -40,7 +56,24 @@ ComputeKernel MetalProgram::createKernel(const string& name) {
         throw OpenMMException("Error creating kernel "+name+": no such function");
     }
     NS::Error* error = nullptr;
-    MTL::ComputePipelineState* pipeline = context.getDevice().newComputePipelineState(function, &error);
+    MTL::ComputePipelineState* pipeline;
+    vector<MetalKernel::BufferLayout> layouts;
+    if (context.getUseMixedPrecision() && !packArgs) {
+        // Record which buffer arguments read float pairs, so execute() can check the arrays bound to them.  Packed
+        // arguments carry no type information, so those kernels go unchecked.
+        MTL::ComputePipelineReflection* reflection = nullptr;
+        pipeline = context.getDevice().newComputePipelineState(function, MTL::PipelineOptionBindingInfo | MTL::PipelineOptionBufferTypeInfo, &reflection, &error);
+        for (int i = 0; pipeline != nullptr && reflection != nullptr && i < reflection->bindings()->count(); i++) {
+            MTL::Binding* binding = reflection->bindings()->object<MTL::Binding>(i);
+            if (binding->type() != MTL::BindingTypeBuffer)
+                continue;
+            if (binding->index() >= layouts.size())
+                layouts.resize(binding->index()+1, MetalKernel::PlainLayout);
+            layouts[binding->index()] = getBufferLayout((MTL::BufferBinding*) binding);
+        }
+    }
+    else
+        pipeline = context.getDevice().newComputePipelineState(function, &error);
     if (pipeline == nullptr) {
         string message = "Error creating pipeline state for kernel "+name;
         if (error != nullptr)
@@ -50,5 +83,5 @@ ComputeKernel MetalProgram::createKernel(const string& name) {
         throw OpenMMException(message);
     }
     pool->release();
-    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name, packArgs));
+    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name, packArgs, layouts));
 }

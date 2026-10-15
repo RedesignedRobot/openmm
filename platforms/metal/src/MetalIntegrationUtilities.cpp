@@ -36,6 +36,9 @@ MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, cons
         ccmaConvergedBuffer.initialize<int>(context, 1, "ccmaConvergedBuffer");
         for (int i = 0; i < system.getNumParticles(); i++)
             totalMass += system.getParticleMass(i);
+        // posDelta shares kernels and raw copies with velm, so it stores float pairs too.  The zeros the base class
+        // uploaded read the same either way.
+        context.unwrap(posDelta).setPairStorage(context.getUseMixedPrecision());
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {

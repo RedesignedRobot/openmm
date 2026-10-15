@@ -176,12 +176,24 @@ public:
      * @param dest     the destination array to copy to
      */
     void copyTo(ArrayInterface& dest) const;
+    /**
+     * Mark this array of mixed4 values as stored on the device the way the kernels' mixed4s type reads it:
+     * each double as a float pair (hi, lo).  Uploads and downloads convert, so the host still sees doubles.
+     * Copying the array to another one marks the destination too.
+     */
+    void setPairStorage(bool pairs);
+    /**
+     * Get whether this array stores its doubles as float pairs.
+     */
+    bool getPairStorage() const {
+        return pairStorage;
+    }
 private:
     MetalContext* context;
     MTL::Buffer* buffer;
     size_t size;
     int elementSize;
-    bool ownsMemory;
+    bool ownsMemory, pairStorage;
     std::string name;
 };
 
