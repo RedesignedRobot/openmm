@@ -31,8 +31,11 @@
 using namespace OpenMM;
 using namespace std;
 
-MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system) {
+MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system),
+        totalMass(0.0), pendingCMMomentum(NULL), pendingCMGroups(0) {
         ccmaConvergedBuffer.initialize<int>(context, 1, "ccmaConvergedBuffer");
+        for (int i = 0; i < system.getNumParticles(); i++)
+            totalMass += system.getParticleMass(i);
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {
@@ -126,6 +129,15 @@ void MetalIntegrationUtilities::distributeForcesFromVirtualSites() {
     }
 }
 
+bool MetalIntegrationUtilities::canRemoveCenterOfMassMomentum() const {
+    return context.getUseMixedPrecision() && !ccmaConstraintAtoms.isInitialized();
+}
+
+void MetalIntegrationUtilities::removeCenterOfMassMomentum(ComputeArray& cmMomentum, int numGroups) {
+    pendingCMMomentum = &cmMomentum;
+    pendingCMGroups = numGroups;
+}
+
 bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, double tol) {
     if (!context.getUseMixedPrecision() || ccmaConstraintAtoms.isInitialized())
         return false;
@@ -174,6 +186,8 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
         fusedDefines["DF64_FINITE"] = "";
+        // The same constant removeCM.cc gets, so the center of mass velocity comes out the same.
+        fusedDefines["INVERSE_TOTAL_MASS"] = context.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
@@ -201,10 +215,18 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
             langevinMiddleKernel->addArg(freeAtoms);
         else
             langevinMiddleKernel->addArg(nullptr);
+        langevinMiddleKernel->addArg(0); // The center of mass removal will be set just before it is executed.
+        langevinMiddleKernel->addArg(nullptr);
     }
     langevinMiddleKernel->setArg(4, tol);
     langevinMiddleKernel->setArg(9, params);
     langevinMiddleKernel->setArg(12, prepareRandomNumbers(context.getPaddedNumAtoms()));
-    langevinMiddleKernel->execute(numLangevinMiddleThreads);
+    langevinMiddleKernel->setArg(18, pendingCMGroups);
+    if (pendingCMMomentum != NULL)
+        langevinMiddleKernel->setArg(19, *pendingCMMomentum);
+    // The center of mass sum needs threadgroups of 64 threads, as in removeCenterOfMassMomentum.
+    langevinMiddleKernel->execute(numLangevinMiddleThreads, 64);
+    pendingCMMomentum = NULL;
+    pendingCMGroups = 0;
     return true;
 }

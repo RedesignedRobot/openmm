@@ -156,6 +156,37 @@ private:
 };
 
 /**
+ * This kernel is invoked by CMMotionRemover to remove center of mass motion.  When the fused LangevinMiddle kernel runs,
+ * it runs only calcCenterOfMassMomentum, and the fused kernel subtracts the center of mass velocity as it loads the
+ * velocities, which saves the removeCenterOfMassMomentum dispatch and its pass over velm.  That is safe only when
+ * nothing reads or writes the velocities between this force and the integration, so every other force in the System
+ * must be one known not to touch them.
+ */
+class MetalRemoveCMMotionKernel : public RemoveCMMotionKernel {
+public:
+    MetalRemoveCMMotionKernel(std::string name, const Platform& platform, MetalContext& mc) : RemoveCMMotionKernel(name, platform), mc(mc) {
+    }
+    /**
+     * Initialize the kernel, setting up the particle masses.
+     *
+     * @param system     the System this kernel will be applied to
+     * @param force      the CMMotionRemover this kernel will be used for
+     */
+    void initialize(const System& system, const CMMotionRemover& force);
+    /**
+     * Execute the kernel.
+     *
+     * @param context    the context in which to execute this kernel
+     */
+    void execute(ContextImpl& context);
+private:
+    MetalContext& mc;
+    bool otherForcesIgnoreVelocities;
+    ComputeArray cmMomentum;
+    ComputeKernel kernel1, kernel2;
+};
+
+/**
  * This kernel is invoked by CustomCVForce to calculate the forces acting on the system and the energy of the system.
  */
 class MetalCalcCustomCVForceKernel : public CommonCalcCustomCVForceKernel {

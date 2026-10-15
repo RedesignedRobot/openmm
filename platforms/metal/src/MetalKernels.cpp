@@ -24,7 +24,26 @@
 
 #include "MetalKernels.h"
 #include "MetalQueue.h"
+#include "CommonKernelSources.h"
 #include "openmm/internal/ContextImpl.h"
+#include "openmm/common/ContextSelector.h"
+#include "openmm/CMAPTorsionForce.h"
+#include "openmm/CustomAngleForce.h"
+#include "openmm/CustomBondForce.h"
+#include "openmm/CustomCompoundBondForce.h"
+#include "openmm/CustomExternalForce.h"
+#include "openmm/CustomGBForce.h"
+#include "openmm/CustomNonbondedForce.h"
+#include "openmm/CustomTorsionForce.h"
+#include "openmm/GBSAOBCForce.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/LangevinMiddleIntegrator.h"
+#include "openmm/MonteCarloBarostat.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include "openmm/RBTorsionForce.h"
+#include <typeinfo>
 
 using namespace OpenMM;
 using namespace std;
@@ -86,4 +105,65 @@ void MetalCalcConstantPotentialForceKernel::initialize(const System& system, con
 void MetalIntegrateLangevinMiddleStepKernel::integrate(double tol) {
     if (!mc.getIntegrationUtilities().integrateLangevinMiddle(params, tol))
         CommonIntegrateLangevinMiddleStepKernel::integrate(tol);
+}
+
+/**
+ * Get whether a force leaves the velocities alone in updateContextState() and calcForcesAndEnergy().  Unknown forces,
+ * thermostats, other barostats and forces that evaluate an inner Context count as touching them.
+ *
+ * MonteCarloBarostat counts as leaving them alone.  Its trial reads only potential energies, and a rejected trial
+ * restores velm whole, so the velocities the integrator sees are the same whether the center of mass motion comes off
+ * before the trial or inside the integrator.  openmm.app adds the barostat after CMMotionRemover, so without this every
+ * system with one would pay the extra dispatch.  The anisotropic, flexible and membrane barostats stay out: they can
+ * read the kinetic energy.
+ */
+static bool ignoresVelocities(const Force& force) {
+    return typeid(force) == typeid(MonteCarloBarostat) ||
+           dynamic_cast<const HarmonicBondForce*>(&force) != NULL || dynamic_cast<const HarmonicAngleForce*>(&force) != NULL ||
+           dynamic_cast<const PeriodicTorsionForce*>(&force) != NULL || dynamic_cast<const RBTorsionForce*>(&force) != NULL ||
+           dynamic_cast<const CMAPTorsionForce*>(&force) != NULL || dynamic_cast<const NonbondedForce*>(&force) != NULL ||
+           dynamic_cast<const GBSAOBCForce*>(&force) != NULL || dynamic_cast<const CustomBondForce*>(&force) != NULL ||
+           dynamic_cast<const CustomAngleForce*>(&force) != NULL || dynamic_cast<const CustomTorsionForce*>(&force) != NULL ||
+           dynamic_cast<const CustomNonbondedForce*>(&force) != NULL || dynamic_cast<const CustomGBForce*>(&force) != NULL ||
+           dynamic_cast<const CustomExternalForce*>(&force) != NULL || dynamic_cast<const CustomCompoundBondForce*>(&force) != NULL;
+}
+
+void MetalRemoveCMMotionKernel::initialize(const System& system, const CMMotionRemover& force) {
+    ContextSelector selector(mc);
+    // Forces before the remover run their calcForcesAndEnergy() after it too, so every other force has to qualify.
+    otherForcesIgnoreVelocities = true;
+    for (int i = 0; i < system.getNumForces(); i++)
+        if (&system.getForce(i) != &force)
+            otherForcesIgnoreVelocities &= ignoresVelocities(system.getForce(i));
+    int numAtoms = mc.getNumAtoms();
+    cmMomentum.initialize<mm_float4>(mc, mc.getPaddedNumAtoms(), "cmMomentum");
+    double totalMass = 0.0;
+    for (int i = 0; i < numAtoms; i++)
+        totalMass += system.getParticleMass(i);
+    map<string, string> defines;
+    defines["INVERSE_TOTAL_MASS"] = mc.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
+    ComputeProgram program = mc.compileProgram(CommonKernelSources::removeCM, defines);
+    kernel1 = program->createKernel("calcCenterOfMassMomentum");
+    kernel1->addArg(numAtoms);
+    kernel1->addArg(mc.getVelm());
+    kernel1->addArg(cmMomentum);
+    kernel2 = program->createKernel("removeCenterOfMassMomentum");
+    kernel2->addArg(numAtoms);
+    kernel2->addArg(mc.getVelm());
+    kernel2->addArg(cmMomentum);
+}
+
+void MetalRemoveCMMotionKernel::execute(ContextImpl& context) {
+    ContextSelector selector(mc);
+    int numAtoms = mc.getNumAtoms();
+    kernel1->execute(numAtoms, 64);
+    MetalIntegrationUtilities& integration = mc.getIntegrationUtilities();
+    if (otherForcesIgnoreVelocities && integration.canRemoveCenterOfMassMomentum() &&
+            dynamic_cast<LangevinMiddleIntegrator*>(&context.getIntegrator()) != NULL) {
+        // calcCenterOfMassMomentum wrote one partial momentum per thread group.
+        int numGroups = min((numAtoms+63)/64, mc.getNumThreadBlocks());
+        integration.removeCenterOfMassMomentum(cmMomentum, numGroups);
+        return;
+    }
+    kernel2->execute(numAtoms, 64);
 }

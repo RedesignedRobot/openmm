@@ -55,12 +55,29 @@ public:
      * @param tol      the constraint tolerance
      */
     bool integrateLangevinMiddle(ComputeArray& params, double tol);
+    /**
+     * Get whether integrateLangevinMiddle() can remove center of mass motion for a CMMotionRemover.  That holds when
+     * the fused kernel runs: in mixed precision with no constraint going through CCMA.
+     */
+    bool canRemoveCenterOfMassMomentum() const;
+    /**
+     * Remove center of mass motion as part of the next step.  calcCenterOfMassMomentum has already written its partial
+     * momenta, and the next integrateLangevinMiddle() sums them the way removeCenterOfMassMomentum does and subtracts
+     * the center of mass velocity from every atom as it loads it, in place of that kernel.
+     *
+     * @param cmMomentum   the array calcCenterOfMassMomentum wrote one partial momentum per thread group to
+     * @param numGroups    the number of partial momenta, the thread groups calcCenterOfMassMomentum ran with
+     */
+    void removeCenterOfMassMomentum(ComputeArray& cmMomentum, int numGroups);
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
     MetalArray ccmaConvergedBuffer;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
     int numLangevinMiddleThreads;
+    double totalMass;
+    ComputeArray* pendingCMMomentum;
+    int pendingCMGroups;
 };
 
 } // namespace OpenMM

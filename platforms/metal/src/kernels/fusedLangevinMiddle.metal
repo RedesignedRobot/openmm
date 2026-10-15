@@ -1,11 +1,18 @@
 /**
- * Load an atom's position and velocity, and apply the velocity step.
+ * Load an atom's position and velocity, remove the center of mass velocity if asked, and apply the velocity step.
  */
 inline void kickAtom(int atom, GLOBAL const real4* RESTRICT posq, GLOBAL const real4* RESTRICT posqCorrection,
         GLOBAL mixed4* RESTRICT velm, GLOBAL const mm_long* RESTRICT force, int paddedNumAtoms, mixed fscale,
-        PRIVATE mixed4& pos, PRIVATE mixed4& vel) {
+        bool removeCM, float4 cm, PRIVATE mixed4& pos, PRIVATE mixed4& vel) {
     pos = loadPos(posq, posqCorrection, atom);
     vel = velm[atom];
+    if (removeCM) {
+        vel.x -= cm.x;
+        vel.y -= cm.y;
+        vel.z -= cm.z;
+        if (vel.w == 0.0)
+            velm[atom] = vel; // The rest of the step skips massless atoms, but removeCenterOfMassMomentum shifts them too.
+    }
     if (vel.w != 0.0) {
         vel.x += fscale*vel.w*force[atom];
         vel.y += fscale*vel.w*force[atom+paddedNumAtoms];
@@ -44,17 +51,53 @@ inline void finishAtom(int atom, GLOBAL real4* RESTRICT posq, GLOBAL real4* REST
 }
 
 /**
+ * Sum the numCMGroups partial momenta that calcCenterOfMassMomentum wrote, in the order removeCenterOfMassMomentum sums
+ * them, and return the center of mass velocity.  Every thread of the group must call it, with 64 threads per group.
+ */
+inline float4 sumCenterOfMassVelocity(int numCMGroups, GLOBAL const float4* RESTRICT cmMomentum, LOCAL float4* temp) {
+    float4 cm = make_float4(0);
+    for (int index = LOCAL_ID; index < numCMGroups; index += LOCAL_SIZE)
+        cm += cmMomentum[index];
+    temp[LOCAL_ID] = cm;
+    SYNC_THREADS;
+    if (LOCAL_ID < 32)
+        temp[LOCAL_ID] += temp[LOCAL_ID+32];
+    SYNC_THREADS;
+    if (LOCAL_ID < 16)
+        temp[LOCAL_ID] += temp[LOCAL_ID+16];
+    SYNC_THREADS;
+    if (LOCAL_ID < 8)
+        temp[LOCAL_ID] += temp[LOCAL_ID+8];
+    SYNC_THREADS;
+    if (LOCAL_ID < 4)
+        temp[LOCAL_ID] += temp[LOCAL_ID+4];
+    SYNC_THREADS;
+    if (LOCAL_ID < 2)
+        temp[LOCAL_ID] += temp[LOCAL_ID+2];
+    SYNC_THREADS;
+    return make_float4(INVERSE_TOTAL_MASS*(temp[0].x+temp[1].x), INVERSE_TOTAL_MASS*(temp[0].y+temp[1].y), INVERSE_TOTAL_MASS*(temp[0].z+temp[1].z), 0);
+}
+
+/**
  * Take one LangevinMiddleIntegrator step.  Each thread owns a unit: a SETTLE cluster, a SHAKE cluster, or an atom in
  * neither, taken in that order.  It runs the velocity step, the velocity constraints, the position update with the heat
  * bath, the position constraints and the final velocity correction on its atoms in registers, so the displacements
  * never pass through device memory.  Each atom sees the same operations as in integrateLangevinMiddlePart1-3.
+ *
+ * When numCMGroups is nonzero, it also does removeCenterOfMassMomentum's work for a CMMotionRemover: it sums the partial
+ * momenta in cmMomentum as that kernel does and subtracts the center of mass velocity from every atom as it loads it.
+ * That saves removeCenterOfMassMomentum's dispatch and its pass over velm.
  */
 KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUnits, int paddedNumAtoms, mixed tol,
         GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT posqCorrection, GLOBAL mixed4* RESTRICT velm,
         GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
-        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms) {
+        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int numCMGroups,
+        GLOBAL const float4* RESTRICT cmMomentum) {
+    LOCAL float4 temp[64];
+    bool removeCM = (numCMGroups > 0);
+    float4 cm = (removeCM ? sumCenterOfMassVelocity(numCMGroups, cmMomentum, temp) : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
     mixed noisescale = paramBuffer[1];
@@ -79,7 +122,7 @@ KERNEL void integrateLangevinMiddleFused(int numSettle, int numShake, int numUni
             delta[i] = make_mixed4(0);
             oldDelta[i] = make_mixed4(0);
             if (atoms[i] != -1)
-                kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, pos[i], vel[i]);
+                kickAtom(atoms[i], posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos[i], vel[i]);
         }
         if (isSettle)
             applySettleToClusterVelocities(pos, vel);
@@ -122,7 +165,11 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         GLOBAL const mm_long* RESTRICT force, GLOBAL const mixed* RESTRICT paramBuffer, GLOBAL const mixed2* RESTRICT dt,
         GLOBAL const float4* RESTRICT random, unsigned int randomIndex, GLOBAL const int4* RESTRICT settleAtoms,
         GLOBAL const float2* RESTRICT settleParams, GLOBAL const int4* RESTRICT shakeAtoms,
-        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms) {
+        GLOBAL const float4* RESTRICT shakeParams, GLOBAL const int* RESTRICT freeAtoms, int numCMGroups,
+        GLOBAL const float4* RESTRICT cmMomentum) {
+    LOCAL float4 temp[64];
+    bool removeCM = (numCMGroups > 0);
+    float4 cm = (removeCM ? sumCenterOfMassVelocity(numCMGroups, cmMomentum, temp) : make_float4(0));
     mixed fscale = dt[0].y/(mixed) 0x100000000;
     mixed vscale = paramBuffer[0];
     mixed noisescale = paramBuffer[1];
@@ -150,7 +197,7 @@ KERNEL void integrateLangevinMiddleFusedQuads(int numSettle, int numShake, int n
         mixed4 delta = make_mixed4(0);
         mixed4 oldDelta = make_mixed4(0);
         if (atom != -1)
-            kickAtom(atom, posq, posqCorrection, velm, force, paddedNumAtoms, fscale, pos, vel);
+            kickAtom(atom, posq, posqCorrection, velm, force, paddedNumAtoms, fscale, removeCM, cm, pos, vel);
         mixed4 clusterPos[4], clusterVel[4];
         if (isSettle || isShake) {
             for (int i = 0; i < 4; i++) {
