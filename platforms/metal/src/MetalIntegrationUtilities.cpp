@@ -186,9 +186,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         int numQuadUnits = numSettle+numShake+numFreeQuads;
         bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
 
-        // Positions and velocities that overflow are lost either way, so this program drops df64's overflow guards.
         map<string, string> fusedDefines = defines;
-        fusedDefines["DF64_FINITE"] = "";
         // The same constant removeCM.cc gets, so the center of mass velocity comes out the same.
         fusedDefines["INVERSE_TOTAL_MASS"] = context.doubleToString(totalMass == 0 ? 0.0 : 1.0/totalMass);
         ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, fusedDefines);

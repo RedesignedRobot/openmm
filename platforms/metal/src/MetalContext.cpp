@@ -444,9 +444,10 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     if (!compilationDefines.empty())
         src << endl;
     if (useMixedPrecision) {
-        // The program's own defines come after this header, too late for df64 to see.
-        if (defines.find("DF64_FINITE") != defines.end())
-            src << "#define DF64_FINITE\n";
+        // No kernel relies on a df64 sum or product overflowing to inf rather than NaN: integration state that
+        // overflows is lost either way, and the minimizer tests for both.  So every mixed program drops df64's
+        // overflow guards.
+        src << "#define DF64_FINITE\n";
         src << MetalKernelSources::df64 << endl;
     }
     string mixedType = (useMixedPrecision ? "double" : "float");
