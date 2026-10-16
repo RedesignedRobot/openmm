@@ -33,9 +33,51 @@ using namespace std;
 
 MetalIntegrationUtilities::MetalIntegrationUtilities(MetalContext& context, const System& system) : IntegrationUtilities(context, system) {
         ccmaConvergedBuffer.initialize<int>(context, 1, "ccmaConvergedBuffer");
+
+    // In mixed precision, replace the SHAKE and SETTLE kernels with the versions in mixedConstraints.metal.  They
+    // take the same arguments.
+
+    if (context.getUseMixedPrecision() && settleAtoms.isInitialized()) {
+        settlePosKernel = getMixedProgram()->createKernel("applySettleToPositionsMixed");
+        settleVelKernel = getMixedProgram()->createKernel("applySettleToVelocitiesMixed");
+        for (ComputeKernel kernel : {settlePosKernel, settleVelKernel}) {
+            kernel->addArg((int) settleAtoms.getSize());
+            kernel->addArg();
+            kernel->addArg(context.getPosq());
+            kernel->addArg(posDelta);
+            kernel->addArg(context.getVelm());
+            kernel->addArg(settleAtoms);
+            kernel->addArg(settleParams);
+            kernel->addArg(context.getPosqCorrection());
+        }
+    }
+    if (context.getUseMixedPrecision() && shakeAtoms.isInitialized()) {
+        shakePosKernel = getMixedProgram()->createKernel("applyShakeToPositionsMixed");
+        shakeVelKernel = getMixedProgram()->createKernel("applyShakeToVelocitiesMixed");
+        shakePosKernel->addArg((int) shakeAtoms.getSize());
+        shakePosKernel->addArg();
+        shakePosKernel->addArg(context.getPosq());
+        shakePosKernel->addArg(posDelta);
+        shakePosKernel->addArg(shakeAtoms);
+        shakePosKernel->addArg(shakeParams);
+        shakePosKernel->addArg(context.getPosqCorrection());
+        shakeVelKernel->addArg((int) shakeAtoms.getSize());
+        shakeVelKernel->addArg();
+        shakeVelKernel->addArg(context.getPosq());
+        shakeVelKernel->addArg(context.getVelm());
+        shakeVelKernel->addArg(shakeAtoms);
+        shakeVelKernel->addArg(shakeParams);
+        shakeVelKernel->addArg(context.getPosqCorrection());
+    }
 }
 
 MetalIntegrationUtilities::~MetalIntegrationUtilities() {
+}
+
+ComputeProgram MetalIntegrationUtilities::getMixedProgram() {
+    if (!mixedProgram)
+        mixedProgram = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::mixedConstraints+MetalKernelSources::fusedLangevinMiddle, defines);
+    return mixedProgram;
 }
 
 void MetalIntegrationUtilities::applyConstraintsImpl(bool constrainVelocities, double tol) {
@@ -171,7 +213,7 @@ bool MetalIntegrationUtilities::integrateLangevinMiddle(ComputeArray& params, do
         int numQuadUnits = numSettle+numShake+numFreeQuads;
         bool useQuads = (4*numQuadUnits <= context.getNumThreadBlocks()*MetalContext::ThreadBlockSize);
 
-        ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities+MetalKernelSources::fusedLangevinMiddle, defines);
+        ComputeProgram program = getMixedProgram();
         int numUnits = (useQuads ? numQuadUnits : numSettle+numShake+numFree);
         numLangevinMiddleThreads = (useQuads ? 4*numUnits : numUnits);
         langevinMiddleKernel = program->createKernel(useQuads ? "integrateLangevinMiddleFusedQuads" : "integrateLangevinMiddleFused");

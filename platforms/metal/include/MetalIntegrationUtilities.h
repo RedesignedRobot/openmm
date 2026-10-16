@@ -27,6 +27,7 @@
 
 #include "MetalArray.h"
 #include "openmm/System.h"
+#include "openmm/common/ComputeProgram.h"
 #include "openmm/common/IntegrationUtilities.h"
 
 namespace OpenMM {
@@ -57,7 +58,13 @@ public:
     bool integrateLangevinMiddle(ComputeArray& params, double tol);
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
+    /**
+     * Get the program with the mixed precision SHAKE, SETTLE and fused LangevinMiddle kernels, compiling it the first
+     * time.
+     */
+    ComputeProgram getMixedProgram();
     MetalArray ccmaConvergedBuffer;
+    ComputeProgram mixedProgram;
     ComputeKernel langevinMiddleKernel;
     ComputeArray freeAtoms;
     int numLangevinMiddleThreads;
