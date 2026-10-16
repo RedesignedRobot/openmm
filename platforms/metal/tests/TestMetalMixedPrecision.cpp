@@ -47,6 +47,7 @@
 #include <climits>
 #include <cmath>
 #include <iostream>
+#include <memory>
 
 using namespace OpenMM;
 using namespace std;
@@ -332,57 +333,111 @@ void testReorderWrapKeepsPositions() {
         ASSERT_EQUAL_VEC(positions[i], found[i], 1e-12);
 }
 
+CustomIntegrator* createExpressionIntegrator() {
+    // openmmtools-style per-DOF expressions with integer powers, min, abs, step and select, and a kinetic energy sum.
+
+    CustomIntegrator* integrator = new CustomIntegrator(0.002);
+    integrator->addGlobalVariable("a", exp(-0.002));
+    integrator->addGlobalVariable("ke", 0);
+    integrator->addPerDofVariable("x1", 0);
+    integrator->addComputePerDof("x", "x+0.5*dt*v");
+    integrator->addComputePerDof("v", "a*v");
+    integrator->addComputePerDof("x", "x+dt*v*(1+0.1*min(abs(x), 1)^2*step(x)/(1+x^4))");
+    integrator->addComputeSum("ke", "0.5*m*v^2");
+    integrator->addComputePerDof("x1", "select(step(ke-1), x, x1)");
+    return integrator;
+}
+
+CustomIntegrator* createAcceptanceIntegrator() {
+    // A GHMC step with a fixed acceptance threshold in place of the random number.
+
+    CustomIntegrator* integrator = new CustomIntegrator(0.002);
+    integrator->addGlobalVariable("kT", 2.49);
+    integrator->addGlobalVariable("ke", 0);
+    integrator->addGlobalVariable("Eold", 0);
+    integrator->addGlobalVariable("Enew", 0);
+    integrator->addGlobalVariable("accept", 0);
+    integrator->addPerDofVariable("xold", 0);
+    integrator->addComputeSum("ke", "0.5*m*v*v");
+    integrator->addComputeGlobal("Eold", "ke");
+    integrator->addComputePerDof("xold", "x");
+    integrator->addComputePerDof("v", "v*(1-0.01*x^2)");
+    integrator->addComputePerDof("x", "x+dt*v");
+    integrator->addComputeSum("ke", "0.5*m*v^2");
+    integrator->addComputeGlobal("Enew", "ke");
+    integrator->addComputeGlobal("accept", "step(exp(-(Enew-Eold)/kT)-0.9999)");
+    integrator->addComputePerDof("x", "select(accept, x, xold)");
+    return integrator;
+}
+
 void testSupportedIntegratorExpressions() {
-    // openmmtools-style integrators: BAOAB Langevin splitting, and a GHMC step that sums the kinetic
-    // energy and uses integer powers, min, abs, step and select per DOF.
+    // With no forces and no random numbers, a step is pure mixed precision arithmetic, so it must match the
+    // Reference platform's doubles.
 
     System system;
-    CustomExternalForce* force = new CustomExternalForce("x^2+y^2+z^2");
-    system.addForce(force);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 4; i++)
         system.addParticle(1.0+i);
-        force->addParticle(i);
-    }
     vector<Vec3> positions = {Vec3(0.1, 0.2, 0.3), Vec3(-0.3, 0.1, 0.2), Vec3(0.2, -0.1, 0.4), Vec3(0.5, 0.3, -0.2)};
-    CustomIntegrator baoab(0.002);
-    baoab.addGlobalVariable("a", exp(-0.002));
-    baoab.addGlobalVariable("b", sqrt(1-exp(-0.004)));
-    baoab.addGlobalVariable("kT", 2.49);
-    baoab.addPerDofVariable("x1", 0);
-    baoab.addUpdateContextState();
-    baoab.addComputePerDof("v", "v+0.5*dt*f/m");
-    baoab.addComputePerDof("x", "x+0.5*dt*v");
-    baoab.addComputePerDof("v", "a*v+b*sqrt(kT/m)*gaussian");
-    baoab.addComputePerDof("x", "x+0.5*dt*v");
-    baoab.addComputePerDof("x1", "x");
-    baoab.addConstrainPositions();
-    baoab.addComputePerDof("v", "v+0.5*dt*f/m+(x-x1)/dt");
-    CustomIntegrator ghmc(0.002);
-    ghmc.addGlobalVariable("kT", 2.49);
-    ghmc.addGlobalVariable("ke", 0);
-    ghmc.addGlobalVariable("Eold", 0);
-    ghmc.addGlobalVariable("Enew", 0);
-    ghmc.addGlobalVariable("accept", 0);
-    ghmc.addPerDofVariable("xold", 0);
-    ghmc.addComputePerDof("v", "sqrt(kT/m)*gaussian");
-    ghmc.addComputeSum("ke", "0.5*m*v*v");
-    ghmc.addComputeGlobal("Eold", "ke+energy");
-    ghmc.addComputePerDof("xold", "x");
-    ghmc.addComputePerDof("v", "v+0.5*dt*f/m");
-    ghmc.addComputePerDof("x", "x+dt*v*(1+0.1*min(abs(x), 1)^2*step(x)/(1+x^4))");
-    ghmc.addComputePerDof("v", "v+0.5*dt*f/m");
-    ghmc.addComputeSum("ke", "0.5*m*v^2");
-    ghmc.addComputeGlobal("Enew", "ke+energy");
-    ghmc.addComputeGlobal("accept", "step(exp(-(Enew-Eold)/kT)-uniform)");
-    ghmc.addComputePerDof("x", "select(accept, x, xold)");
-    for (CustomIntegrator* integrator : {&baoab, &ghmc}) {
+    vector<Vec3> velocities = {Vec3(1.1, -0.9, 0.35), Vec3(-0.2, 0.4, 0.8), Vec3(0.6, 0.6, -0.1), Vec3(-1.3, 0.05, 0.2)};
+    Platform& reference = Platform::getPlatformByName("Reference");
+    for (int test = 0; test < 2; test++) {
+        unique_ptr<CustomIntegrator> integrator(test == 0 ? createExpressionIntegrator() : createAcceptanceIntegrator());
+        unique_ptr<CustomIntegrator> referenceIntegrator(test == 0 ? createExpressionIntegrator() : createAcceptanceIntegrator());
         Context context(system, *integrator, platform);
-        context.setPositions(positions);
+        Context referenceContext(system, *referenceIntegrator, reference);
+        for (Context* c : {&context, &referenceContext}) {
+            c->setPositions(positions);
+            c->setVelocities(velocities);
+        }
         integrator->step(10);
-        State state = context.getState(State::Positions | State::Energy);
-        ASSERT(isfinite(state.getPotentialEnergy()));
-        for (const Vec3& position : state.getPositions())
-            ASSERT(isfinite(position[0]) && isfinite(position[1]) && isfinite(position[2]));
+        referenceIntegrator->step(10);
+        State state = context.getState(State::Positions | State::Velocities);
+        State expected = referenceContext.getState(State::Positions | State::Velocities);
+        for (int i = 0; i < system.getNumParticles(); i++) {
+            ASSERT_EQUAL_VEC(expected.getPositions()[i], state.getPositions()[i], 1e-10);
+            ASSERT_EQUAL_VEC(expected.getVelocities()[i], state.getVelocities()[i], 1e-10);
+        }
+        ASSERT_EQUAL_TOL(referenceIntegrator->getGlobalVariableByName("ke"), integrator->getGlobalVariableByName("ke"), 1e-10);
+    }
+}
+
+void testFusedLangevinMiddleLargeSystem() {
+    // The fused LangevinMiddle step gives each thread a whole unit once there are more than 16 units per GPU core
+    // (12 thread blocks of 64 threads per core, 4 threads per unit).  20000 waters are above that for up to 104
+    // cores, so this runs integrateLangevinMiddleFused rather than integrateLangevinMiddleFusedQuads.
+
+    const int numMolecules = 20000;
+    const double width = 8.5;
+    System system;
+    system.setDefaultPeriodicBoxVectors(Vec3(width, 0, 0), Vec3(0, width, 0), Vec3(0, 0, width));
+    vector<Vec3> positions;
+    OpenMM_SFMT::SFMT sfmt;
+    init_gen_rand(0, sfmt);
+    for (int i = 0; i < numMolecules; i++) {
+        system.addParticle(16.0);
+        system.addParticle(1.0);
+        system.addParticle(1.0);
+        system.addConstraint(3*i, 3*i+1, 0.1);
+        system.addConstraint(3*i, 3*i+2, 0.1);
+        system.addConstraint(3*i+1, 3*i+2, 0.163);
+        Vec3 pos(width*genrand_real2(sfmt), width*genrand_real2(sfmt), width*genrand_real2(sfmt));
+        positions.push_back(pos);
+        positions.push_back(pos+Vec3(0.1, 0, 0));
+        positions.push_back(pos+Vec3(-0.03334, 0.09428, 0));
+    }
+    LangevinMiddleIntegrator integrator(300.0, 1.0, 0.002);
+    integrator.setConstraintTolerance(1e-10);
+    Context context(system, integrator, platform);
+    context.setPositions(positions);
+    context.setVelocitiesToTemperature(300.0);
+    integrator.step(20);
+    vector<Vec3> pos = context.getState(State::Positions).getPositions();
+    for (int i = 0; i < system.getNumConstraints(); i++) {
+        int particle1, particle2;
+        double distance;
+        system.getConstraintParameters(i, particle1, particle2, distance);
+        Vec3 delta = pos[particle1]-pos[particle2];
+        ASSERT_EQUAL_TOL(distance, sqrt(delta.dot(delta)), 1e-8);
     }
 }
 
@@ -403,6 +458,7 @@ int main(int argc, char* argv[]) {
         testConstantMatchesUploadedValue();
         testReorderWrapKeepsPositions();
         testSupportedIntegratorExpressions();
+        testFusedLangevinMiddleLargeSystem();
     }
     catch(const exception& e) {
         cout << "exception: " << e.what() << endl;
