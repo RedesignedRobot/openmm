@@ -86,10 +86,14 @@ void CommonMinimizeKernel::execute(ContextImpl& context, double tolerance, int m
         twoPassReductions = mixedIsDouble && !cc.getSupports64BitGlobalAtomics();
         elementSize = mixedIsDouble ? sizeof(double) : sizeof(float);
         threadBlockSize = cc.getMaxThreadBlockSize();
-        reductionBlocks = min(cc.getNumThreadBlocks(), max(1, (numVariables+threadBlockSize-1)/threadBlockSize));
-        reductionBlocks = min(reductionBlocks, (int) cc.getEnergyBuffer().getSize()/4);
-        if (twoPassReductions && reductionBlocks == 0)
-            throw OpenMMException("Energy workspace is too small for minimizer reductions");
+        if (twoPassReductions) {
+            // Each block writes two slots, and each slot is a value and its destination.
+            const int partialsPerBlock = 4;
+            reductionBlocks = min(cc.getNumThreadBlocks(), max(1, (numVariables+threadBlockSize-1)/threadBlockSize));
+            reductionBlocks = min(reductionBlocks, (int) cc.getEnergyBuffer().getSize()/partialsPerBlock);
+            if (reductionBlocks == 0)
+                throw OpenMMException("Energy workspace is too small for minimizer reductions");
+        }
         pinnedMemory = cc.getPinnedBuffer();
 
         // Initialize all device-side arrays and compile kernels.
@@ -190,8 +194,6 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     defines["LBFGS_MIN_STEP"] = cc.doubleToString(minStep);
     defines["LBFGS_MAX_STEP"] = cc.doubleToString(maxStep);
     if (twoPassReductions) {
-        // Keep the unused atomic helper compilable without 64-bit atomics.
-        defines["SINGLE_BLOCK_REDUCTIONS"] = "";
         defines["TWO_PASS_REDUCTIONS"] = "";
         defines["REDUCTION_BLOCKS"] = cc.intToString(reductionBlocks);
         defines["REDUCTION_STRIDE"] = cc.intToString(numVectors+1);

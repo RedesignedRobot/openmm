@@ -6,6 +6,14 @@
 #define REDUCTION_ADD(target, value, destination, slot) atomicAddMixed(target, value)
 #endif
 
+// A partial's destination: which result array (one of the TO_* values) and the index in it.
+#define TO_RESULT 0
+#define TO_SCALE 1
+#define TO_ALPHA 2
+#define TO_LINE_SEARCH_DATA 3
+#define TO_GRAD_NORM 4
+#define REDUCTION_TARGET(array, index) ((array)*REDUCTION_STRIDE+(index))
+
 #define LS_DOT_START 0
 #define LS_DOT 1
 #define LS_STEP 2
@@ -129,12 +137,9 @@ DEVICE mixed reduceMax(mixed value, LOCAL_ARG volatile mixed* temp) {
     return temp[0];
 }
 
+#ifndef TWO_PASS_REDUCTIONS
 DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
-#if defined(SINGLE_BLOCK_REDUCTIONS)
-
-    *target += value;
-
-#elif defined(__CUDA_ARCH__) || defined(USE_HIP)
+#if defined(__CUDA_ARCH__) || defined(USE_HIP)
 
     // Do atomic addition of floating-point values directly
     atomicAdd(target, value);
@@ -171,6 +176,7 @@ DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
     #error "Internal error: atomicAddMixed is missing an implementation for this platform"
 #endif
 }
+#endif
 
 KERNEL void recordInitialPos(
     GLOBAL const real4* RESTRICT posq,
@@ -305,7 +311,7 @@ KERNEL void getConstraintEnergyForces(
     energy = reduceAdd(energy, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(returnValue, energy, 0, 0);
+        REDUCTION_ADD(returnValue, energy, REDUCTION_TARGET(TO_RESULT, 0), 0);
     }
 }
 
@@ -499,8 +505,8 @@ KERNEL void getScale(
         gradGrad = reduceAdd(gradGrad, temp);
 
         if (LOCAL_ID == 0) {
-            REDUCTION_ADD(&scale[end], xGrad, REDUCTION_STRIDE+end, 0);
-            REDUCTION_ADD(returnValue, gradGrad, 0, 1);
+            REDUCTION_ADD(&scale[end], xGrad, REDUCTION_TARGET(TO_SCALE, end), 0);
+            REDUCTION_ADD(returnValue, gradGrad, REDUCTION_TARGET(TO_RESULT, 0), 1);
         }
     }
 
@@ -552,7 +558,7 @@ KERNEL void reinitializeDir(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(&alpha[vectorIndex], vectorAlpha / scale[vectorIndex], 2*REDUCTION_STRIDE+vectorIndex, 0);
+        REDUCTION_ADD(&alpha[vectorIndex], vectorAlpha / scale[vectorIndex], REDUCTION_TARGET(TO_ALPHA, vectorIndex), 0);
     }
 }
 
@@ -590,7 +596,7 @@ KERNEL void updateDirAlpha(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(&alpha[vectorIndex2], vectorAlpha / scale[vectorIndex2], 2*REDUCTION_STRIDE+vectorIndex2, 0);
+        REDUCTION_ADD(&alpha[vectorIndex2], vectorAlpha / scale[vectorIndex2], REDUCTION_TARGET(TO_ALPHA, vectorIndex2), 0);
     }
 }
 
@@ -630,7 +636,7 @@ KERNEL void scaleDir(
         // Store the result in an extra slot alpha[NUM_VECTORS] instead of using
         // alpha[vectorIndex] since other blocks might still need to read it.
 
-        REDUCTION_ADD(&alpha[NUM_VECTORS], (GLOBAL_ID == 0 ? innerScale : 0) - vectorBeta / scale[vectorIndex], 2*REDUCTION_STRIDE+NUM_VECTORS, 0);
+        REDUCTION_ADD(&alpha[NUM_VECTORS], (GLOBAL_ID == 0 ? innerScale : 0) - vectorBeta / scale[vectorIndex], REDUCTION_TARGET(TO_ALPHA, NUM_VECTORS), 0);
     }
 }
 
@@ -669,7 +675,7 @@ KERNEL void updateDirBeta(
     vectorBeta = reduceAdd(vectorBeta, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(&alpha[vectorIndex2], -vectorBeta / scale[vectorIndex2], 2*REDUCTION_STRIDE+vectorIndex2, 0);
+        REDUCTION_ADD(&alpha[vectorIndex2], -vectorBeta / scale[vectorIndex2], REDUCTION_TARGET(TO_ALPHA, vectorIndex2), 0);
     }
 }
 
@@ -734,7 +740,7 @@ KERNEL void lineSearchSetup(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(&lineSearchData[LS_DOT_START], result, 3*REDUCTION_STRIDE+LS_DOT_START, 0);
+        REDUCTION_ADD(&lineSearchData[LS_DOT_START], result, REDUCTION_TARGET(TO_LINE_SEARCH_DATA, LS_DOT_START), 0);
     }
 
     if (GLOBAL_ID == 0) {
@@ -779,7 +785,7 @@ KERNEL void lineSearchStep(
         norm = reduceAdd(norm, temp);
 
         if (LOCAL_ID == 0) {
-            REDUCTION_ADD(gradNorm, norm, 4*REDUCTION_STRIDE, 0);
+            REDUCTION_ADD(gradNorm, norm, REDUCTION_TARGET(TO_GRAD_NORM, 0), 0);
         }
 
         return;
@@ -855,7 +861,7 @@ KERNEL void lineSearchDot(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        REDUCTION_ADD(&lineSearchData[LS_DOT], result, 3*REDUCTION_STRIDE+LS_DOT, 0);
+        REDUCTION_ADD(&lineSearchData[LS_DOT], result, REDUCTION_TARGET(TO_LINE_SEARCH_DATA, LS_DOT), 0);
     }
 }
 
@@ -905,8 +911,9 @@ KERNEL void finishReduction(GLOBAL const mixed* RESTRICT partials,
         GLOBAL mixed* RESTRICT lineSearchData, GLOBAL mixed* RESTRICT gradNorm) {
     LOCAL mixed temp[TEMP_SIZE];
     int offset = GROUP_ID*REDUCTION_BLOCKS;
-    mixed targetValue = partials[2*REDUCTION_BLOCKS+offset];
-    int target = (int) targetValue;
+    // Every block of a reduction writes the same destination, because the branch that writes it is uniform across
+    // the kernel, so block 0's copy is the group's.
+    int target = (int) partials[2*REDUCTION_BLOCKS+offset];
     mixed sum = 0;
     for (int i = LOCAL_ID; i < REDUCTION_BLOCKS; i += LOCAL_SIZE)
         if (partials[2*REDUCTION_BLOCKS+offset+i] >= 0)
@@ -915,11 +922,11 @@ KERNEL void finishReduction(GLOBAL const mixed* RESTRICT partials,
     if (LOCAL_ID == 0 && target >= 0) {
         int index = target%REDUCTION_STRIDE;
         switch (target/REDUCTION_STRIDE) {
-            case 0: result[index] += sum; break;
-            case 1: scale[index] += sum; break;
-            case 2: alpha[index] += sum; break;
-            case 3: lineSearchData[index] += sum; break;
-            case 4: gradNorm[index] += sum; break;
+            case TO_RESULT: result[index] += sum; break;
+            case TO_SCALE: scale[index] += sum; break;
+            case TO_ALPHA: alpha[index] += sum; break;
+            case TO_LINE_SEARCH_DATA: lineSearchData[index] += sum; break;
+            case TO_GRAD_NORM: gradNorm[index] += sum; break;
         }
     }
 }
