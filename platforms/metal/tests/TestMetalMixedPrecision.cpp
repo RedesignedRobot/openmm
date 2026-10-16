@@ -283,6 +283,27 @@ void testExpressionConstants() {
     ASSERT_EQUAL_VEC(velocity*0.1+Vec3(1.3, 1.3, 1.3), context.getState(State::Velocities).getVelocities()[0], 1e-12);
 }
 
+void testConstantMatchesUploadedValue() {
+    // This value rounds to an odd float hi with value-hi rounding to exactly half an ulp.  A constant in an
+    // expression must split it the same way as an uploaded value.
+
+    const double value = 1+pow(2.0, -23)+pow(2.0, -24)-pow(2.0, -52);
+    ASSERT_EQUAL(value, 1.000000178813934);
+    System system;
+    system.addParticle(1.0);
+    CustomIntegrator integrator(0.001);
+    integrator.addPerDofVariable("v0", 0);
+    integrator.addPerDofVariable("diff", 1);
+    integrator.addComputePerDof("diff", "1.000000178813934-v0");
+    Context context(system, integrator, platform);
+    context.setPositions({Vec3()});
+    integrator.setPerDofVariableByName("v0", {Vec3(value, value, value)});
+    integrator.step(1);
+    vector<Vec3> diff;
+    integrator.getPerDofVariableByName("diff", diff);
+    ASSERT_EQUAL_VEC(Vec3(0, 0, 0), diff[0], 0);
+}
+
 void testReorderWrapKeepsPositions() {
     // Reordering moves each molecule whose center is outside the periodic box back inside.  In mixed
     // precision that shift must keep the bits stored in posqCorrection.
@@ -379,6 +400,7 @@ int main(int argc, char* argv[]) {
         testIntegrationStep();
         testVariableStep();
         testExpressionConstants();
+        testConstantMatchesUploadedValue();
         testReorderWrapKeepsPositions();
         testSupportedIntegratorExpressions();
     }

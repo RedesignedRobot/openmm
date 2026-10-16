@@ -471,7 +471,14 @@ string MetalContext::doubleToString(double value, bool mixedIsDouble) const {
     float hi = (float) value;
     if (!useMixedPrecision || !mixedIsDouble || hi == value || !isfinite(hi))
         return ComputeContext::doubleToString(value, mixedIsDouble);
-    return "df64("+ComputeContext::doubleToString(hi)+", "+ComputeContext::doubleToString((float) (value-hi))+")";
+    float lo = (float) (value-hi);
+
+    // Split the value the same way df64_from_ieee() does.  When lo rounds to exactly half an ulp of an odd hi,
+    // hi+lo would round away from hi, so move lo one step toward zero.  hi+lo is exact in double.
+
+    if ((float) ((double) hi+lo) != hi)
+        lo = nextafter(lo, 0.0f);
+    return "df64("+ComputeContext::doubleToString(hi)+", "+ComputeContext::doubleToString(lo)+")";
 }
 
 MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
