@@ -1,9 +1,12 @@
 /**
  * Double-float (df64) arithmetic for mixed precision.  Apple GPUs have no 64 bit floating point, so in mixed
- * precision the kernels see double, double2, double3 and double4 as pairs of floats (hi + lo) computed with
- * error-free TwoSum and TwoProd.  Device and constant memory hold IEEE doubles: loads decode them and stores
- * encode them, so host code exchanges plain doubles.  This needs MathModeSafe, or the compiler folds the
- * TwoSum error terms to zero.
+ * precision the mixed types are df64, df642, df643 and df644, each value a pair of floats (hi + lo) computed with
+ * error-free TwoSum and TwoProd, following A. Thall, "Extended-Precision Floating-Point Numbers for GPU
+ * Computation" (https://andrewthall.org/papers/df64_qf128.pdf).  This needs MathModeSafe, or the compiler folds
+ * the TwoSum error terms to zero.
+ *
+ * A df64 in device or constant memory is an IEEE double.  Loads decode it to a canonical pair (hi is the double
+ * rounded to float) and stores encode it, so host code exchanges plain doubles.
  */
 
 #include <metal_stdlib>
@@ -164,19 +167,26 @@ inline df64 df64_from_ieee_slow(uint2 b) {
     return df64(hi, df64_below_tie(hi, df64_round_to_float((rest < 0) != negative, (ulong) abs(rest), e)));
 }
 
+// Double and float exponent biases are 1023 and 127, so a float's biased exponent is the double's minus 896.
+#define DF64_BIAS_DIFFERENCE 896u
+// The fast decode scales the low 29 mantissa bits by the double's ulp, 2^(biased-1075), held as a normal float,
+// which needs biased >= 949.  The largest float exponent, 127, is biased 1150 in double, 949+201.
+#define DF64_DECODE_FAST_MIN 949u
+#define DF64_DECODE_FAST_RANGE 201u
+
 inline df64 df64_from_ieee(uint2 b) {
     uint biased = (b.y >> 20) & 0x7FFu;
-    if (biased - 949u > 201u)
+    if (biased - DF64_DECODE_FAST_MIN > DF64_DECODE_FAST_RANGE)
         return df64_from_ieee_slow(b);
     uint sign = b.y & 0x80000000u;
     uint top = ((b.y & 0xFFFFFu) << 3) | (b.x >> 29);
     uint low = b.x & 0x1FFFFFFFu;
     bool up = low > 0x10000000u || (low == 0x10000000u && (top & 1u));
-    uint hiBits = ((biased - 896u) << 23) + top + (up ? 1u : 0u);
+    uint hiBits = ((biased - DF64_BIAS_DIFFERENCE) << 23) + top + (up ? 1u : 0u);
     if (hiBits >= 0x7F800000u)
         return df64(as_type<float>(sign | 0x7F800000u), 0.0f);
     int rest = up ? (int) low - 0x20000000 : (int) low;
-    float scale = as_type<float>((biased - 948u) << 23);
+    float scale = as_type<float>((biased - (DF64_DECODE_FAST_MIN-1u)) << 23);
     float hi = as_type<float>(sign | hiBits);
     return df64(hi, df64_below_tie(hi, (float) (sign ? -rest : rest) * scale));
 }
@@ -219,6 +229,15 @@ inline uint2 df64_to_ieee_slow(float hi, float lo) {
     return uint2((uint) bits, (uint) (bits >> 32));
 }
 
+// lo is counted in double ulps at hi, 2^(biased-179) for float biased exponent biased: the scale is 2^(179-biased),
+// whose float exponent field is 306-biased (306 = 179+127), or one more when a power of two hi shifts by 30.  That
+// field must stay below 255, and below biased 53 (|hi| < 2^-74) lo can also be subnormal, so the slow path encodes it.
+#define DF64_ENCODE_FAST_MIN 53u
+#define DF64_ENCODE_SCALE_EXPONENT 306u
+// The double's exponent field is the float's plus 896, less the shift, plus 1 because the mantissa's leading bit
+// at bit 52 carries into the field: 924 = 896+29-1 for the usual shift of 29.
+#define DF64_ENCODE_EXPONENT 924u
+
 inline uint2 df64_to_ieee(df64 v) {
     float hi = v.hi;
     float lo = v.lo;
@@ -232,7 +251,7 @@ inline uint2 df64_to_ieee(df64 v) {
     }
     uint loBits = as_type<uint>(lo);
     bool loSubnormal = (loBits & 0x7F800000u) == 0 && (loBits & 0x7FFFFFu) != 0;
-    bool hiTiny = ((as_type<uint>(hi) >> 23) & 0xFFu) < 53u;
+    bool hiTiny = ((as_type<uint>(hi) >> 23) & 0xFFu) < DF64_ENCODE_FAST_MIN;
     float sum = hi + lo;
     bool sumOverflows = !isfinite(sum) && isfinite(hi);
     if (!loSubnormal && !hiTiny && !sumOverflows && lo != 0.0f && sum != hi) {
@@ -247,41 +266,32 @@ inline uint2 df64_to_ieee(df64 v) {
         return uint2(0u, sign | ((hiBits & 0x7FFFFFu) != 0 ? 0x7FF80000u : 0x7FF00000u));
     if ((hiBits & 0x7FFFFFFFu) == 0)
         return uint2(0u, sign);
-    if (biased < 53u || loSubnormal || sumOverflows)
+    if (biased < DF64_ENCODE_FAST_MIN || loSubnormal || sumOverflows)
         return df64_to_ieee_slow(hi, lo);
     uint mh = (hiBits & 0x7FFFFFu) | 0x800000u;
     bool oppositeSigns = lo != 0.0f && (as_type<uint>(lo) & 0x80000000u) != sign;
     uint shift = (mh == 0x800000u && oppositeSigns) ? 30u : 29u;
-    float scale = as_type<float>((306u - biased + shift - 29u) << 23);
+    float scale = as_type<float>((DF64_ENCODE_SCALE_EXPONENT - biased + shift - 29u) << 23);
     float units = rint((sign ? -lo : lo) * scale);
     ulong m = ((ulong) mh << shift) + (ulong) (long) units;
-    ulong bits = ((ulong) (biased + 924u - shift) << 52) + m;
+    ulong bits = ((ulong) (biased + DF64_ENCODE_EXPONENT - shift) << 52) + m;
     return uint2((uint) bits, (uint) (bits >> 32) | sign);
 }
 
 inline df64 operator-(df64 a) { return df64(-a.hi, -a.lo); }
 inline df64 operator+(df64 a) { return a; }
 
-// An overflowed sum or product returns inf with a zero low part; unguarded, the two-sum makes it NaN.  A program whose
-// mixed values stay finite defines DF64_FINITE to drop these guards: finite results are unchanged, and the guards cost
-// about a fifth of the fused Langevin kernel, whose SHAKE sweeps are a serial chain of these operators.
-#ifdef DF64_FINITE
-#define DF64_GUARD_OVERFLOW(v)
-#else
-#define DF64_GUARD_OVERFLOW(v) if (!isfinite(v)) return df64(v, 0.0f);
-#endif
-
+// An overflowed sum or product gives NaN, not inf, because the two-sum of an infinite hi has a NaN error term.
+// Finite results are not affected, and state that overflows is lost either way.
 // One rounding joins the low parts instead of a second two-sum, so the error is about 2^-47 of |x|+|y|.
 inline df64 operator+(df64 x, df64 y) {
     float2 s = df64_two_sum(x.hi, y.hi);
-    DF64_GUARD_OVERFLOW(s.x)
     float2 z = df64_fast_two_sum(s.x, s.y + (x.lo + y.lo));
     return df64(z.x, z.y);
 }
 
 inline df64 operator+(df64 x, float y) {
     float2 s = df64_two_sum(x.hi, y);
-    DF64_GUARD_OVERFLOW(s.x)
     float2 z = df64_fast_two_sum(s.x, x.lo + s.y);
     return df64(z.x, z.y);
 }
@@ -291,14 +301,12 @@ inline df64 operator-(df64 x, float y) { return x + (-y); }
 
 inline df64 operator*(df64 x, df64 y) {
     float2 c = df64_two_prod(x.hi, y.hi);
-    DF64_GUARD_OVERFLOW(c.x)
     float2 z = df64_fast_two_sum(c.x, c.y + fma(x.lo, y.hi, x.hi * y.lo));
     return df64(z.x, z.y);
 }
 
 inline df64 operator*(df64 x, float y) {
     float2 c = df64_two_prod(x.hi, y);
-    DF64_GUARD_OVERFLOW(c.x)
     float2 z = df64_fast_two_sum(c.x, fma(x.lo, y, c.y));
     return df64(z.x, z.y);
 }
@@ -424,6 +432,8 @@ inline df64 rsqrt(df64 x) { return df64(1.0f) / sqrt(x); }
 
 inline df64 ldexp(df64 x, int k) { return df64(ldexp(x.hi, k), ldexp(x.lo, k)); }
 
+// |r| <= ln2/2, so |r/32| < 0.011 and the first dropped term, (r/32)^8/8!, is under 2^-60 of the result.
+// (1+e)^2-1 = e*(e+2), so five such steps undo the division by 32 without forming 1+e.
 inline df64 df64_expm1_reduced(df64 r) {
     r = ldexp(r, -5);
     df64 e = r * (1.0f / 5040.0f) + 1.0f / 720.0f;
@@ -556,30 +566,30 @@ void atomicAdd(device df64* target, df64 value) = delete;
 #define DF64_ASSIGN4(OP) x OP o.x; y OP o.y; z OP o.z; w OP o.w;
 #define DF64_SCALE4(OP) x OP s; y OP s; z OP s; w OP s;
 
-struct df64_2 {
+struct df642 {
     df64 x, y;
-    DF64_VECTOR_ACCESS(df64_2, x(o.x) DF64_COMMA y(o.y), DF64_ASSIGN2, DF64_SCALE2)
-    df64_2(df64 x, df64 y) : x(x), y(y) {}
-    explicit df64_2(df64 s) : x(s), y(s) {}
-    explicit df64_2(float2 v) : x(v.x), y(v.y) {}
+    DF64_VECTOR_ACCESS(df642, x(o.x) DF64_COMMA y(o.y), DF64_ASSIGN2, DF64_SCALE2)
+    df642(df64 x, df64 y) : x(x), y(y) {}
+    explicit df642(df64 s) : x(s), y(s) {}
+    explicit df642(float2 v) : x(v.x), y(v.y) {}
     explicit operator float2() const { return float2(x.hi, y.hi); }
 };
 
-struct df64_3 {
+struct df643 {
     df64 x, y, z;
-    DF64_VECTOR_ACCESS(df64_3, x(o.x) DF64_COMMA y(o.y) DF64_COMMA z(o.z), DF64_ASSIGN3, DF64_SCALE3)
-    df64_3(df64 x, df64 y, df64 z) : x(x), y(y), z(z) {}
-    explicit df64_3(df64 s) : x(s), y(s), z(s) {}
-    explicit df64_3(float3 v) : x(v.x), y(v.y), z(v.z) {}
+    DF64_VECTOR_ACCESS(df643, x(o.x) DF64_COMMA y(o.y) DF64_COMMA z(o.z), DF64_ASSIGN3, DF64_SCALE3)
+    df643(df64 x, df64 y, df64 z) : x(x), y(y), z(z) {}
+    explicit df643(df64 s) : x(s), y(s), z(s) {}
+    explicit df643(float3 v) : x(v.x), y(v.y), z(v.z) {}
     explicit operator float3() const { return float3(x.hi, y.hi, z.hi); }
 };
 
-struct df64_4 {
+struct df644 {
     df64 x, y, z, w;
-    DF64_VECTOR_ACCESS(df64_4, x(o.x) DF64_COMMA y(o.y) DF64_COMMA z(o.z) DF64_COMMA w(o.w), DF64_ASSIGN4, DF64_SCALE4)
-    df64_4(df64 x, df64 y, df64 z, df64 w) : x(x), y(y), z(z), w(w) {}
-    explicit df64_4(df64 s) : x(s), y(s), z(s), w(s) {}
-    explicit df64_4(float4 v) : x(v.x), y(v.y), z(v.z), w(v.w) {}
+    DF64_VECTOR_ACCESS(df644, x(o.x) DF64_COMMA y(o.y) DF64_COMMA z(o.z) DF64_COMMA w(o.w), DF64_ASSIGN4, DF64_SCALE4)
+    df644(df64 x, df64 y, df64 z, df64 w) : x(x), y(y), z(z), w(w) {}
+    explicit df644(df64 s) : x(s), y(s), z(s), w(s) {}
+    explicit df644(float4 v) : x(v.x), y(v.y), z(v.z), w(v.w) {}
     explicit operator float4() const { return float4(x.hi, y.hi, z.hi, w.hi); }
 };
 #undef DF64_VECTOR_ACCESS
@@ -592,43 +602,42 @@ struct df64_4 {
 #undef DF64_SCALE4
 #undef DF64_COMMA
 
-inline df64_2 operator+(df64_2 a, df64_2 b) { return df64_2(a.x + b.x, a.y + b.y); }
-inline df64_2 operator-(df64_2 a, df64_2 b) { return df64_2(a.x - b.x, a.y - b.y); }
-inline df64_2 operator-(df64_2 a) { return df64_2(-a.x, -a.y); }
-inline df64_2 operator*(df64_2 a, df64_2 b) { return df64_2(a.x * b.x, a.y * b.y); }
-inline df64_2 operator*(df64_2 a, df64 s) { return df64_2(a.x * s, a.y * s); }
-inline df64_2 operator*(df64 s, df64_2 a) { return a * s; }
-inline df64_2 operator/(df64_2 a, df64_2 b) { return df64_2(a.x / b.x, a.y / b.y); }
-inline df64_2 operator/(df64_2 a, df64 s) { return df64_2(a.x / s, a.y / s); }
-inline df64_2 operator/(df64 s, df64_2 a) { return df64_2(s / a.x, s / a.y); }
+inline df642 operator+(df642 a, df642 b) { return df642(a.x + b.x, a.y + b.y); }
+inline df642 operator-(df642 a, df642 b) { return df642(a.x - b.x, a.y - b.y); }
+inline df642 operator-(df642 a) { return df642(-a.x, -a.y); }
+inline df642 operator*(df642 a, df642 b) { return df642(a.x * b.x, a.y * b.y); }
+inline df642 operator*(df642 a, df64 s) { return df642(a.x * s, a.y * s); }
+inline df642 operator*(df64 s, df642 a) { return a * s; }
+inline df642 operator/(df642 a, df642 b) { return df642(a.x / b.x, a.y / b.y); }
+inline df642 operator/(df642 a, df64 s) { return df642(a.x / s, a.y / s); }
+inline df642 operator/(df64 s, df642 a) { return df642(s / a.x, s / a.y); }
 
-inline df64_3 operator+(df64_3 a, df64_3 b) { return df64_3(a.x + b.x, a.y + b.y, a.z + b.z); }
-inline df64_3 operator-(df64_3 a, df64_3 b) { return df64_3(a.x - b.x, a.y - b.y, a.z - b.z); }
-inline df64_3 operator-(df64_3 a) { return df64_3(-a.x, -a.y, -a.z); }
-inline df64_3 operator*(df64_3 a, df64_3 b) { return df64_3(a.x * b.x, a.y * b.y, a.z * b.z); }
-inline df64_3 operator*(df64_3 a, df64 s) { return df64_3(a.x * s, a.y * s, a.z * s); }
-inline df64_3 operator*(df64 s, df64_3 a) { return a * s; }
-inline df64_3 operator/(df64_3 a, df64_3 b) { return df64_3(a.x / b.x, a.y / b.y, a.z / b.z); }
-inline df64_3 operator/(df64_3 a, df64 s) { return df64_3(a.x / s, a.y / s, a.z / s); }
-inline df64_3 operator/(df64 s, df64_3 a) { return df64_3(s / a.x, s / a.y, s / a.z); }
-inline df64 dot(df64_3 a, df64_3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-inline df64_3 cross(df64_3 a, df64_3 b) { return df64_3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+inline df643 operator+(df643 a, df643 b) { return df643(a.x + b.x, a.y + b.y, a.z + b.z); }
+inline df643 operator-(df643 a, df643 b) { return df643(a.x - b.x, a.y - b.y, a.z - b.z); }
+inline df643 operator-(df643 a) { return df643(-a.x, -a.y, -a.z); }
+inline df643 operator*(df643 a, df643 b) { return df643(a.x * b.x, a.y * b.y, a.z * b.z); }
+inline df643 operator*(df643 a, df64 s) { return df643(a.x * s, a.y * s, a.z * s); }
+inline df643 operator*(df64 s, df643 a) { return a * s; }
+inline df643 operator/(df643 a, df643 b) { return df643(a.x / b.x, a.y / b.y, a.z / b.z); }
+inline df643 operator/(df643 a, df64 s) { return df643(a.x / s, a.y / s, a.z / s); }
+inline df643 operator/(df64 s, df643 a) { return df643(s / a.x, s / a.y, s / a.z); }
+inline df64 dot(df643 a, df643 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline df643 cross(df643 a, df643 b) { return df643(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 
-inline df64_4 operator+(df64_4 a, df64_4 b) { return df64_4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
-inline df64_4 operator-(df64_4 a, df64_4 b) { return df64_4(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w); }
-inline df64_4 operator-(df64_4 a) { return df64_4(-a.x, -a.y, -a.z, -a.w); }
-inline df64_4 operator*(df64_4 a, df64_4 b) { return df64_4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
-inline df64_4 operator*(df64_4 a, df64 s) { return df64_4(a.x * s, a.y * s, a.z * s, a.w * s); }
-inline df64_4 operator*(df64 s, df64_4 a) { return a * s; }
-inline df64_4 operator/(df64_4 a, df64_4 b) { return df64_4(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
-inline df64_4 operator/(df64_4 a, df64 s) { return df64_4(a.x / s, a.y / s, a.z / s, a.w / s); }
-inline df64_4 operator/(df64 s, df64_4 a) { return df64_4(s / a.x, s / a.y, s / a.z, s / a.w); }
-inline df64 dot(df64_4 a, df64_4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
-inline df64_3 trimTo3(df64_4 v) { return df64_3(v.x, v.y, v.z); }
-inline float3 trimTo3(float4 v) { return v.xyz; }
-inline df64_4 cross(df64_4 a, df64_4 b) { return df64_4(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x, 0.0f); }
+inline df644 operator+(df644 a, df644 b) { return df644(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
+inline df644 operator-(df644 a, df644 b) { return df644(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w); }
+inline df644 operator-(df644 a) { return df644(-a.x, -a.y, -a.z, -a.w); }
+inline df644 operator*(df644 a, df644 b) { return df644(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
+inline df644 operator*(df644 a, df64 s) { return df644(a.x * s, a.y * s, a.z * s, a.w * s); }
+inline df644 operator*(df64 s, df644 a) { return a * s; }
+inline df644 operator/(df644 a, df644 b) { return df644(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
+inline df644 operator/(df644 a, df64 s) { return df644(a.x / s, a.y / s, a.z / s, a.w / s); }
+inline df644 operator/(df64 s, df644 a) { return df644(s / a.x, s / a.y, s / a.z, s / a.w); }
+inline df64 dot(df644 a, df644 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+inline df643 trimTo3(df644 v) { return df643(v.x, v.y, v.z); }
+inline df644 cross(df644 a, df644 b) { return df644(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x, 0.0f); }
 
-df64_3 pow(df64_3, df64_3) = delete;
+df643 pow(df643, df643) = delete;
 
 #define DF64_QUALIFIED_MATH \
     inline df64 sqrt(df64 x) { return ::sqrt(x); } \
@@ -636,9 +645,9 @@ df64_3 pow(df64_3, df64_3) = delete;
     inline df64 exp(df64 x) { return ::exp(x); } \
     inline df64 log(df64 x) { return ::log(x); } \
     inline df64 divide(float x, df64 y) { return x / y; } \
-    inline df64_2 divide(float x, df64_2 y) { return df64(x) / y; } \
-    inline df64_3 divide(float x, df64_3 y) { return df64(x) / y; } \
-    inline df64_4 divide(float x, df64_4 y) { return df64(x) / y; }
+    inline df642 divide(float x, df642 y) { return df64(x) / y; } \
+    inline df643 divide(float x, df643 y) { return df64(x) / y; } \
+    inline df644 divide(float x, df644 y) { return df64(x) / y; }
 namespace metal {
 namespace precise { DF64_QUALIFIED_MATH }
 namespace fast { DF64_QUALIFIED_MATH }
@@ -648,11 +657,13 @@ namespace fast { DF64_QUALIFIED_MATH }
 #undef DF64_INTEGRAL
 #undef DF64_ARITHMETIC
 
+// Common kernels and host code use double, double3 and double4 for higher precision temporaries and sums whenever
+// SUPPORTS_DOUBLE_PRECISION is defined, so these names stand for the df64 types.
 #define SUPPORTS_DOUBLE_PRECISION 1
 #define double df64
-#define double2 df64_2
-#define double3 df64_3
-#define double4 df64_4
-#define make_double2 df64_2
-#define make_double3 df64_3
-#define make_double4 df64_4
+#define double2 df642
+#define double3 df643
+#define double4 df644
+#define make_double2 df642
+#define make_double3 df643
+#define make_double4 df644

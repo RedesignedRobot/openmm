@@ -223,7 +223,8 @@ public:
         return false;
     }
     /**
-     * Get whether the device being used supports double precision math.
+     * Get whether kernels can use the double types.  This is true in mixed precision, where df64 emulates them;
+     * Apple GPUs have no hardware double.
      */
     bool getSupportsDoublePrecision() const {
         return useMixedPrecision;

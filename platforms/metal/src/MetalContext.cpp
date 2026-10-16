@@ -170,12 +170,17 @@ MetalContext::MetalContext(const System& system, const string& precision, MetalP
     compilationDefines["make_real2"] = "make_float2";
     compilationDefines["make_real3"] = "make_float3";
     compilationDefines["make_real4"] = "make_float4";
-    if (useMixedPrecision)
+    if (useMixedPrecision) {
         compilationDefines["USE_MIXED_PRECISION"] = "1";
-    string mixedType = (useMixedPrecision ? "double" : "float");
-    compilationDefines["make_mixed2"] = "make_"+mixedType+"2";
-    compilationDefines["make_mixed3"] = "make_"+mixedType+"3";
-    compilationDefines["make_mixed4"] = "make_"+mixedType+"4";
+        compilationDefines["make_mixed2"] = "df642";
+        compilationDefines["make_mixed3"] = "df643";
+        compilationDefines["make_mixed4"] = "df644";
+    }
+    else {
+        compilationDefines["make_mixed2"] = "make_float2";
+        compilationDefines["make_mixed3"] = "make_float3";
+        compilationDefines["make_mixed4"] = "make_float4";
+    }
 
     // Set defines for applying periodic boundary conditions.
 
@@ -420,21 +425,24 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
     }
     if (!compilationDefines.empty())
         src << endl;
-    if (useMixedPrecision) {
-        // The program's own defines come after this header, too late for df64 to see.
-        if (defines.find("DF64_FINITE") != defines.end())
-            src << "#define DF64_FINITE\n";
+    if (useMixedPrecision)
         src << MetalKernelSources::df64 << endl;
-    }
-    string mixedType = (useMixedPrecision ? "double" : "float");
     src << "typedef float real;\n";
     src << "typedef float2 real2;\n";
     src << "typedef float3 real3;\n";
     src << "typedef float4 real4;\n";
-    src << "typedef " << mixedType << " mixed;\n";
-    src << "typedef " << mixedType << "2 mixed2;\n";
-    src << "typedef " << mixedType << "3 mixed3;\n";
-    src << "typedef " << mixedType << "4 mixed4;\n";
+    if (useMixedPrecision) {
+        src << "typedef df64 mixed;\n";
+        src << "typedef df642 mixed2;\n";
+        src << "typedef df643 mixed3;\n";
+        src << "typedef df644 mixed4;\n";
+    }
+    else {
+        src << "typedef float mixed;\n";
+        src << "typedef float2 mixed2;\n";
+        src << "typedef float3 mixed3;\n";
+        src << "typedef float4 mixed4;\n";
+    }
     src << "typedef unsigned int tileflags;\n";
     src << MetalKernelSources::common << endl;
     for (auto& pair : defines) {

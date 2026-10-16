@@ -76,9 +76,17 @@ typedef unsigned long mm_ulong;
 #define make_float3(x...) float3(x)
 #define make_float4(x...) float4(x)
 
-#ifndef USE_MIXED_PRECISION
-#define trimTo3(v) (v).xyz
-#endif
+inline short3 trimTo3(short4 v) {
+    return make_short3(v.x, v.y, v.z);
+}
+
+inline int3 trimTo3(int4 v) {
+    return make_int3(v.x, v.y, v.z);
+}
+
+inline float3 trimTo3(float4 v) {
+    return make_float3(v.x, v.y, v.z);
+}
 
 // Metal does not support the standard names for single precision math functions.
 
