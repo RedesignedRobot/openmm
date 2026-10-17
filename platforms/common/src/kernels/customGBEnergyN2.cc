@@ -22,6 +22,7 @@ KERNEL void computeN2Energy(
     const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
     const unsigned int tbx = LOCAL_ID - tgx;
     mixed energy = 0;
+    real tileEnergy = 0; // Each tile's energy in real, added to energy once per tile.
     INIT_PARAM_DERIVS
     LOCAL real3 local_pos[LOCAL_BUFFER_SIZE];
     LOCAL real3 local_force[LOCAL_BUFFER_SIZE];
@@ -76,7 +77,7 @@ KERNEL void computeN2Energy(
                         dEdR /= -r;
                     }
                     if (needEnergy)
-                        energy += 0.5f*tempEnergy;
+                        tileEnergy += 0.5f*tempEnergy;
                     delta *= dEdR;
                     force.x -= delta.x;
                     force.y -= delta.y;
@@ -130,7 +131,7 @@ KERNEL void computeN2Energy(
                         dEdR /= -r;
                     }
                     if (needEnergy)
-                        energy += tempEnergy;
+                        tileEnergy += tempEnergy;
                     delta *= dEdR;
                     force.x -= delta.x;
                     force.y -= delta.y;
@@ -163,6 +164,8 @@ KERNEL void computeN2Energy(
             ATOMIC_ADD(&forceBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(local_force[LOCAL_ID].z));
             STORE_DERIVATIVES_2
         }
+        energy += tileEnergy;
+        tileEnergy = 0;
     }
 
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
@@ -276,7 +279,7 @@ KERNEL void computeN2Energy(
                             dEdR /= -r;
                         }
                         if (needEnergy)
-                            energy += tempEnergy;
+                            tileEnergy += tempEnergy;
                         delta *= dEdR;
                         force.x -= delta.x;
                         force.y -= delta.y;
@@ -318,7 +321,7 @@ KERNEL void computeN2Energy(
                             dEdR /= -r;
                         }
                         if (needEnergy)
-                            energy += tempEnergy;
+                            tileEnergy += tempEnergy;
                         delta *= dEdR;
                         force.x -= delta.x;
                         force.y -= delta.y;
@@ -354,6 +357,8 @@ KERNEL void computeN2Energy(
                 STORE_DERIVATIVES_2
             }
         }
+        energy += tileEnergy;
+        tileEnergy = 0;
         pos++;
     }
     energyBuffer[GLOBAL_ID] += energy;
