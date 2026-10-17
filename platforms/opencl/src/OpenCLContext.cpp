@@ -139,8 +139,8 @@ OpenCLContext::OpenCLContext(const System& system, int platformIndex, int device
                 // If they supplied a valid deviceIndex, we only look through that one
                 if (i != deviceIndex && deviceIndex != -1)
                     continue;
-                if (platformVendor == "Apple" && (devices[i].getInfo<CL_DEVICE_TYPE>() == CL_DEVICE_TYPE_CPU))
-                    continue; // The CPU device on OS X won't work correctly.
+                if (platformVendor == "Apple" && deviceIndex == -1 && (devices[i].getInfo<CL_DEVICE_TYPE>() == CL_DEVICE_TYPE_CPU))
+                    continue; // The CPU device on OS X won't work correctly, so it is used only when DeviceIndex names it.
                 if (useMixedPrecision || useDoublePrecision) {
                     bool supportsDouble = (devices[i].getInfo<CL_DEVICE_EXTENSIONS>().find("cl_khr_fp64") != string::npos);
                     if (!supportsDouble)
