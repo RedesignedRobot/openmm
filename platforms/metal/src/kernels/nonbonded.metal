@@ -132,7 +132,12 @@ KERNEL void computeNonbonded(
 #endif
                 real tempEnergy = 0.0f;
                 const real interactionScale = 0.5f;
+                // Relaxed math on the pair interaction only. The program stays MathModeSafe, so the mixed energy,
+                // the df64 operators and the fixed-point force sums outside this block keep safe math.
+                {
+#pragma METAL fp math_mode(relaxed)
                 COMPUTE_INTERACTION
+                }
                 energy += 0.5f*tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -184,7 +189,10 @@ KERNEL void computeNonbonded(
 #endif
                 real tempEnergy = 0.0f;
                 const real interactionScale = 1.0f;
+                {
+#pragma METAL fp math_mode(relaxed)
                 COMPUTE_INTERACTION
+                }
                 energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -337,7 +345,10 @@ KERNEL void computeNonbonded(
 #endif
                     real tempEnergy = 0.0f;
                     const real interactionScale = 1.0f;
+                    {
+#pragma METAL fp math_mode(relaxed)
                     COMPUTE_INTERACTION
+                    }
                     energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -381,7 +392,10 @@ KERNEL void computeNonbonded(
 #endif
                     real tempEnergy = 0.0f;
                     const real interactionScale = 1.0f;
+                    {
+#pragma METAL fp math_mode(relaxed)
                     COMPUTE_INTERACTION
+                    }
                     energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -461,7 +475,10 @@ KERNEL void computeNonbonded(
         bool isExcluded = false;
         real tempEnergy = 0.0f;
         const real interactionScale = 1.0f;
+        {
+#pragma METAL fp math_mode(relaxed)
         COMPUTE_INTERACTION
+        }
         energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
