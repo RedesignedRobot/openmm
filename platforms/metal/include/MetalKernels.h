@@ -102,6 +102,19 @@ public:
      * @param velocities  a vector containg the particle velocities
      */
     void setVelocities(ContextImpl& context, const std::vector<Vec3>& velocities);
+    /**
+     * Write a checkpoint.  In mixed precision velm stores float pairs, which a double can't always hold
+     * exactly, so the pair words go in a block ahead of the common checkpoint.
+     *
+     * @param stream    an output stream the checkpoint data should be written to
+     */
+    void createCheckpoint(ContextImpl& context, std::ostream& stream);
+    /**
+     * Load a checkpoint, restoring velm's pair words when the checkpoint has them.
+     *
+     * @param stream    an input stream the checkpoint data should be read from
+     */
+    void loadCheckpoint(ContextImpl& context, std::istream& stream);
 };
 
 /**

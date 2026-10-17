@@ -116,6 +116,22 @@ void MetalArray::download(void* data, bool blocking) const {
         memcpy(data, buffer->contents(), size*elementSize);
 }
 
+void MetalArray::downloadStored(void* data) const {
+    if (buffer == nullptr)
+        throw OpenMMException("MetalArray has not been initialized");
+    MetalQueue& queue = dynamic_cast<MetalQueue&>(*context->getCurrentQueue());
+    queue.flush(true);
+    memcpy(data, buffer->contents(), size*elementSize);
+}
+
+void MetalArray::uploadStored(const void* data) {
+    if (buffer == nullptr)
+        throw OpenMMException("MetalArray has not been initialized");
+    MetalQueue& queue = dynamic_cast<MetalQueue&>(*context->getCurrentQueue());
+    queue.flush(true);
+    memcpy(buffer->contents(), data, size*elementSize);
+}
+
 void MetalArray::copyTo(ArrayInterface& dest) const {
     if (buffer == nullptr)
         throw OpenMMException("MetalArray has not been initialized");

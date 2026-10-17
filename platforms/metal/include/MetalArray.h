@@ -188,6 +188,14 @@ public:
     bool getPairStorage() const {
         return pairStorage;
     }
+    /**
+     * Copy the array's contents to host memory as the device stores them, with no float pair conversion.
+     */
+    void downloadStored(void* data) const;
+    /**
+     * Copy data that downloadStored() returned back into the array, with no float pair conversion.
+     */
+    void uploadStored(const void* data);
 private:
     MetalContext* context;
     MTL::Buffer* buffer;

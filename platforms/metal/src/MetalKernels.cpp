@@ -92,6 +92,60 @@ void MetalUpdateStateDataKernel::setVelocities(ContextImpl& context, const std::
     queue.flush(true);
 }
 
+// Marks the block of velm pair words that mixed precision checkpoints start with.  The common checkpoint starts
+// with its version, 3, so a checkpoint without the block (written before it existed) still loads.
+static const int METAL_PAIR_BLOCK = 0x4d505231;
+
+void MetalUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
+    MetalArray& velm = dynamic_cast<MetalContext&>(cc).unwrap(cc.getVelm());
+    if (velm.getPairStorage()) {
+        ContextSelector selector(cc);
+        stream.write((char*) &METAL_PAIR_BLOCK, sizeof(int));
+        vector<char> stored(velm.getSize()*velm.getElementSize());
+        velm.downloadStored(stored.data());
+        stream.write(stored.data(), stored.size());
+        stream.write((char*) cc.getAtomIndex().data(), sizeof(int)*cc.getAtomIndex().size());
+    }
+    CommonUpdateStateDataKernel::createCheckpoint(context, stream);
+}
+
+void MetalUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& stream) {
+    MetalArray& velm = dynamic_cast<MetalContext&>(cc).unwrap(cc.getVelm());
+    vector<char> stored;
+    vector<int> storedIndex;
+    if (velm.getPairStorage()) {
+        int marker;
+        stream.read((char*) &marker, sizeof(int));
+        if (marker == METAL_PAIR_BLOCK) {
+            stored.resize(velm.getSize()*velm.getElementSize());
+            stream.read(stored.data(), stored.size());
+            storedIndex.resize(cc.getAtomIndex().size());
+            stream.read((char*) storedIndex.data(), sizeof(int)*storedIndex.size());
+        }
+        else if (!stream.seekg(-(streamoff) sizeof(int), ios::cur))
+            throw OpenMMException("loadCheckpoint: can't rewind the stream to read a checkpoint without velocity pairs");
+    }
+    CommonUpdateStateDataKernel::loadCheckpoint(context, stream);
+    if (stored.empty())
+        return;
+
+    // The common load may have reset the atom order, so move each atom's pair words to where the atom is now.
+
+    ContextSelector selector(cc);
+    const vector<int>& atomIndex = cc.getAtomIndex();
+    if (atomIndex != storedIndex) {
+        int elementSize = velm.getElementSize();
+        vector<int> storedPosition(atomIndex.size());
+        for (int i = 0; i < (int) storedIndex.size(); i++)
+            storedPosition[storedIndex[i]] = i;
+        vector<char> moved(stored);
+        for (int i = 0; i < (int) atomIndex.size(); i++)
+            memcpy(&moved[i*elementSize], &stored[storedPosition[atomIndex[i]]*elementSize], elementSize);
+        stored.swap(moved);
+    }
+    velm.uploadStored(stored.data());
+}
+
 void MetalCalcNonbondedForceKernel::initialize(const System& system, const NonbondedForce& force) {
     // With LJPME, spreading the dispersion grid in the order sorted for the charge grid costs less than sorting the
     // atoms again (and the charge grid sort can then skip every other step, as it does without LJPME).
