@@ -631,6 +631,20 @@ cl::Program OpenCLContext::createProgram(const string source, const map<string, 
     if (!defines.empty())
         src << endl;
     src << source << endl;
+    // Lab patch: dump every program the platform compiles, for the Metal census.
+    if (const char* dumpDir = getenv("OPENMM_DUMP_PROGRAMS")) {
+        static int dumpIndex = 0;
+        char name[32];
+        snprintf(name, sizeof(name), "/%03d", dumpIndex++);
+        ofstream(string(dumpDir)+name+".full.cl") << src.str();
+        ofstream(string(dumpDir)+name+".body.cl") << source << endl;
+        ofstream definesFile(string(dumpDir)+name+".defines");
+        for (auto& pair : compilationDefines)
+            if (defines.find(pair.first) == defines.end())
+                definesFile << "context\t" << pair.first << "\t" << pair.second << endl;
+        for (auto& pair : defines)
+            definesFile << "program\t" << pair.first << "\t" << pair.second << endl;
+    }
     cl::Program::Sources sources({src.str()});
     cl::Program program(context, sources);
     try {

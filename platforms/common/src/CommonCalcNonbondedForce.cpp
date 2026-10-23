@@ -37,8 +37,82 @@
 #include <iterator>
 #include <set>
 
+#include <sys/stat.h>
+#include <fstream>
+#include <iostream>
+#include <iomanip>
+
 using namespace OpenMM;
 using namespace std;
+
+static bool s_hasCapturedPme = false;
+static bool s_capturingNowPme = false;
+static std::string s_captureDirPme = "";
+
+static void writeArrayToFilePme(const std::string& path, ArrayInterface& array) {
+    if (!array.isInitialized() || array.getSize() == 0) {
+        std::ofstream out(path, std::ios::binary);
+        return;
+    }
+    size_t bytes = (size_t) array.getSize() * array.getElementSize();
+    std::vector<char> data(bytes);
+    array.download(data.data(), true);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        std::cerr << "Failed to open " << path << std::endl;
+        return;
+    }
+    out.write(data.data(), bytes);
+}
+
+static void writePmeMetadata(const std::string& path, ComputeContext& cc,
+                             int gridSizeX, int gridSizeY, int gridSizeZ,
+                             int pmeOrder, bool useFixedPointChargeSpreading,
+                             bool usePosqCharges, double alpha, double ewaldSelfEnergy,
+                             double dispersionCoefficient, double totalCharge,
+                             const mm_float4& recip0, const mm_float4& recip1, const mm_float4& recip2,
+                             const std::map<std::string, std::string>& pmeDefines) {
+    Vec3 a, b, c;
+    cc.getPeriodicBoxVectors(a, b, c);
+    mm_float4 box((float) a[0], (float) b[1], (float) c[2], 0.0f);
+    mm_float4 invBox(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f);
+    mm_float4 boxVecX((float) a[0], (float) a[1], (float) a[2], 0.0f);
+    mm_float4 boxVecY((float) b[0], (float) b[1], (float) b[2], 0.0f);
+    mm_float4 boxVecZ((float) c[0], (float) c[1], (float) c[2], 0.0f);
+
+    std::ofstream out(path);
+    out << std::setprecision(12);
+    out << "{\n";
+    out << "  \"stepCount\": " << cc.getStepCount() << ",\n";
+    out << "  \"numAtoms\": " << cc.getNumAtoms() << ",\n";
+    out << "  \"paddedNumAtoms\": " << cc.getPaddedNumAtoms() << ",\n";
+    out << "  \"gridSizeX\": " << gridSizeX << ",\n";
+    out << "  \"gridSizeY\": " << gridSizeY << ",\n";
+    out << "  \"gridSizeZ\": " << gridSizeZ << ",\n";
+    out << "  \"pmeOrder\": " << pmeOrder << ",\n";
+    out << "  \"useFixedPointChargeSpreading\": " << (useFixedPointChargeSpreading ? 1 : 0) << ",\n";
+    out << "  \"usePosqCharges\": " << (usePosqCharges ? 1 : 0) << ",\n";
+    out << "  \"alpha\": " << alpha << ",\n";
+    out << "  \"ewaldSelfEnergy\": " << ewaldSelfEnergy << ",\n";
+    out << "  \"dispersionCoefficient\": " << dispersionCoefficient << ",\n";
+    out << "  \"totalCharge\": " << totalCharge << ",\n";
+    out << "  \"periodicBoxSize\": [" << box.x << ", " << box.y << ", " << box.z << ", " << box.w << "],\n";
+    out << "  \"invPeriodicBoxSize\": [" << invBox.x << ", " << invBox.y << ", " << invBox.z << ", " << invBox.w << "],\n";
+    out << "  \"periodicBoxVecX\": [" << boxVecX.x << ", " << boxVecX.y << ", " << boxVecX.z << ", " << boxVecX.w << "],\n";
+    out << "  \"periodicBoxVecY\": [" << boxVecY.x << ", " << boxVecY.y << ", " << boxVecY.z << ", " << boxVecY.w << "],\n";
+    out << "  \"periodicBoxVecZ\": [" << boxVecZ.x << ", " << boxVecZ.y << ", " << boxVecZ.z << ", " << boxVecZ.w << "],\n";
+    out << "  \"recipBoxVecX\": [" << recip0.x << ", " << recip0.y << ", " << recip0.z << ", " << recip0.w << "],\n";
+    out << "  \"recipBoxVecY\": [" << recip1.x << ", " << recip1.y << ", " << recip1.z << ", " << recip1.w << "],\n";
+    out << "  \"recipBoxVecZ\": [" << recip2.x << ", " << recip2.y << ", " << recip2.z << ", " << recip2.w << "],\n";
+    out << "  \"defines\": {\n";
+    size_t count = 0;
+    for (auto& pair : pmeDefines) {
+        out << "    \"" << pair.first << "\": \"" << pair.second << "\""
+            << (++count < pmeDefines.size() ? "," : "") << "\n";
+    }
+    out << "  }\n";
+    out << "}\n";
+}
 
 class CommonCalcNonbondedForceKernel::ForceInfo : public ComputeForceInfo {
 public:
@@ -963,6 +1037,32 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         // Execute the reciprocal space kernels.
 
         if (hasCoulomb) {
+            const char* capEnv = getenv("OPENMM_CAPTURE_PME_DIR");
+            if (!capEnv)
+                capEnv = getenv("OPENMM_CAPTURE_DIR");
+            bool doCapture = (capEnv != NULL && !s_hasCapturedPme && cc.getStepCount() >= 200);
+            if (doCapture) {
+                s_capturingNowPme = true;
+                s_captureDirPme = capEnv;
+                system(("mkdir -p " + s_captureDirPme).c_str());
+                stepsToSort = 0; // Ensure sort runs!
+
+                writePmeMetadata(s_captureDirPme + "/pme_metadata.json", cc,
+                                 gridSizeX, gridSizeY, gridSizeZ,
+                                 PmeOrder, useFixedPointChargeSpreading,
+                                 usePosqCharges, alpha, ewaldSelfEnergy,
+                                 dispersionCoefficient, totalCharge,
+                                 recipBoxVectorsFloat[0], recipBoxVectorsFloat[1], recipBoxVectorsFloat[2],
+                                 pmeDefines);
+
+                // Initial inputs
+                writeArrayToFilePme(s_captureDirPme + "/posq.bin", cc.getPosq());
+                writeArrayToFilePme(s_captureDirPme + "/charges.bin", charges);
+                writeArrayToFilePme(s_captureDirPme + "/sigmaEpsilon.bin", sigmaEpsilon);
+                writeArrayToFilePme(s_captureDirPme + "/pmeBsplineModuliX.bin", pmeBsplineModuliX);
+                writeArrayToFilePme(s_captureDirPme + "/pmeBsplineModuliY.bin", pmeBsplineModuliY);
+                writeArrayToFilePme(s_captureDirPme + "/pmeBsplineModuliZ.bin", pmeBsplineModuliZ);
+            }
             if (stepsToSort <= 0 || doLJPME) {
                 setPeriodicBoxArgs(cc, pmeGridIndexKernel, 2);
                 if (cc.getUseDoublePrecision()) {
@@ -976,11 +1076,23 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                     pmeGridIndexKernel->setArg(9, recipBoxVectorsFloat[2]);
                 }
                 pmeGridIndexKernel->execute(cc.getNumAtoms());
+                if (s_capturingNowPme) {
+                    writeArrayToFilePme(s_captureDirPme + "/pmeAtomGridIndex_after_findAtomGridIndex.bin", pmeAtomGridIndex);
+                }
                 sort->sort(pmeAtomGridIndex);
+                if (s_capturingNowPme) {
+                    writeArrayToFilePme(s_captureDirPme + "/pmeAtomGridIndex_after_sort.bin", pmeAtomGridIndex);
+                }
                 stepsToSort = (cc.getNumAtoms() > 15000) ? 1 : 3;
             }
             else
                 stepsToSort--;
+            if (s_capturingNowPme) {
+                if (useFixedPointChargeSpreading)
+                    writeArrayToFilePme(s_captureDirPme + "/pmeGrid2_before_gridSpreadCharge.bin", pmeGrid2);
+                else
+                    writeArrayToFilePme(s_captureDirPme + "/pmeGrid1_before_gridSpreadCharge.bin", pmeGrid1);
+            }
             setPeriodicBoxArgs(cc, pmeSpreadChargeKernel, 2);
             if (cc.getUseDoublePrecision()) {
                 pmeSpreadChargeKernel->setArg(7, recipBoxVectors[0]);
@@ -993,9 +1105,22 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeSpreadChargeKernel->setArg(9, recipBoxVectorsFloat[2]);
             }
             pmeSpreadChargeKernel->execute(cc.getNumAtoms());
-            if (useFixedPointChargeSpreading)
+            if (s_capturingNowPme) {
+                if (useFixedPointChargeSpreading)
+                    writeArrayToFilePme(s_captureDirPme + "/pmeGrid2_after_gridSpreadCharge.bin", pmeGrid2);
+                else
+                    writeArrayToFilePme(s_captureDirPme + "/pmeGrid1_after_gridSpreadCharge.bin", pmeGrid1);
+            }
+            if (useFixedPointChargeSpreading) {
                 pmeFinishSpreadChargeKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+                if (s_capturingNowPme) {
+                    writeArrayToFilePme(s_captureDirPme + "/pmeGrid1_after_finishSpreadCharge.bin", pmeGrid1);
+                }
+            }
             fft->execFFT(pmeGrid1, pmeGrid2, true);
+            if (s_capturingNowPme) {
+                writeArrayToFilePme(s_captureDirPme + "/pmeGrid2_after_forwardFFT.bin", pmeGrid2);
+            }
             if (cc.getUseDoublePrecision()) {
                 pmeConvolutionKernel->setArg<mm_double4>(4, recipBoxVectors[0]);
                 pmeConvolutionKernel->setArg<mm_double4>(5, recipBoxVectors[1]);
@@ -1012,10 +1137,21 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeEvalEnergyKernel->setArg<mm_float4>(6, recipBoxVectorsFloat[1]);
                 pmeEvalEnergyKernel->setArg<mm_float4>(7, recipBoxVectorsFloat[2]);
             }
-            if (includeEnergy)
+            if (includeEnergy) {
                 pmeEvalEnergyKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+                if (s_capturingNowPme) {
+                    writeArrayToFilePme(s_captureDirPme + "/pmeEnergyBuffer_after_gridEvaluateEnergy.bin", pmeEnergyBuffer);
+                }
+            }
             pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ);
+            if (s_capturingNowPme) {
+                writeArrayToFilePme(s_captureDirPme + "/pmeGrid2_after_reciprocalConvolution.bin", pmeGrid2);
+            }
             fft->execFFT(pmeGrid2, pmeGrid1, false);
+            if (s_capturingNowPme) {
+                writeArrayToFilePme(s_captureDirPme + "/pmeGrid1_after_inverseFFT.bin", pmeGrid1);
+                writeArrayToFilePme(s_captureDirPme + "/forceBuffers_before_gridInterpolateForce.bin", cc.getLongForceBuffer());
+            }
             setPeriodicBoxArgs(cc, pmeInterpolateForceKernel, 3);
             if (cc.getUseDoublePrecision()) {
                 pmeInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
@@ -1031,6 +1167,12 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);
             else
                 pmeInterpolateForceKernel->execute(cc.getNumAtoms());
+            if (s_capturingNowPme) {
+                writeArrayToFilePme(s_captureDirPme + "/forceBuffers_after_gridInterpolateForce.bin", cc.getLongForceBuffer());
+                s_capturingNowPme = false;
+                s_hasCapturedPme = true;
+                std::cout << "OPENMM_CAPTURE_PME: Successfully captured step " << cc.getStepCount() << " to " << s_captureDirPme << std::endl;
+            }
         }
 
         if (doLJPME && hasLJ) {
